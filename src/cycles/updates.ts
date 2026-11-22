@@ -42,6 +42,7 @@ export async function runUpdateCycle(env: Env, deps: Dependencies): Promise<void
     let failed = 0;
     let incomplete = 0;
     let rateLimited = 0;
+    let partial = 0;
     for (const monitor of vendors) {
       const vendorId = monitor.versionVendor;
       if (!vendorId) continue;
@@ -57,14 +58,18 @@ export async function runUpdateCycle(env: Env, deps: Dependencies): Promise<void
           advisoriesState: "unavailable",
           coverage: "unavailable",
           errorCode: "vendor_check_failed",
+          releasesRateLimited: false,
+          advisoriesRateLimited: false,
           checkedAt: deps.now(),
         };
         log("error", "vendor_check_failed", { monitor: monitor.id });
       }
-      if (outcome.coverage === "unavailable" && outcome.errorCode === "rate_limited")
-        rateLimited += 1;
-      else if (outcome.coverage === "unavailable") failed += 1;
-      if (outcome.coverage === "incomplete") incomplete += 1;
+      if (outcome.coverage !== "complete") {
+        if (outcome.errorCode === "rate_limited") rateLimited += 1;
+        else if (outcome.coverage === "unavailable") failed += 1;
+        else if (outcome.coverage === "incomplete") incomplete += 1;
+        else partial += 1;
+      }
       await recordVendorOutcome(env, outcome);
     }
     await dispatchDue(env, deps, settings);
@@ -76,7 +81,9 @@ export async function runUpdateCycle(env: Env, deps: Dependencies): Promise<void
           ? "rate_limited"
           : incomplete > 0
             ? "coverage_incomplete"
-            : null;
+            : partial > 0
+              ? "coverage_partial"
+              : null;
     await markRun(env.DB, "updates", null, finished, error, error === null ? finished : null);
   } catch {
     await markRun(env.DB, "updates", null, deps.now(), "cycle_failed");
@@ -97,6 +104,8 @@ interface VendorCheckOutcome {
   advisoriesState: SourceState;
   coverage: Coverage;
   errorCode: string | null;
+  releasesRateLimited: boolean;
+  advisoriesRateLimited: boolean;
   checkedAt: number;
 }
 
@@ -163,7 +172,17 @@ async function checkVendor(
     securityStatus === "affected" ||
     ((securityStatus === "review_recommended" || securityStatus === "version_unavailable") &&
       (releaseFresh || advisoryFresh));
-  if (canAlert && fingerprint !== previous?.advisoryFingerprint) {
+  let securityRemindedAt = previous?.securityRemindedAt ?? null;
+  const initialSecurity = canAlert && fingerprint !== previous?.advisoryFingerprint;
+  const remind =
+    !initialSecurity &&
+    securityStatus === "affected" &&
+    fingerprint === previous?.advisoryFingerprint &&
+    settings.reminderSeconds > 0 &&
+    securityRemindedAt !== null &&
+    now - securityRemindedAt >= settings.reminderSeconds * 1000;
+  if (initialSecurity) {
+    securityRemindedAt = now;
     alerts.push(
       ...securityAlerts(
         env,
@@ -175,9 +194,29 @@ async function checkVendor(
         summary,
         advisoryUrl,
         now,
+        "",
+        "security",
+      ),
+    );
+  } else if (remind) {
+    securityRemindedAt = now;
+    alerts.push(
+      ...securityAlerts(
+        env,
+        settings,
+        monitor,
+        securityStatus,
+        fingerprint,
+        installed,
+        `This confirmed finding is still open. ${summary}`,
+        advisoryUrl,
+        now,
+        `remind:${now}:`,
+        "reminder",
       ),
     );
   }
+  if (securityStatus !== "affected") securityRemindedAt = null;
   await writeVersion(
     env.DB,
     monitor.id,
@@ -189,21 +228,29 @@ async function checkVendor(
       advisoryFingerprint:
         securityStatus === "unknown" ? (previous?.advisoryFingerprint ?? fingerprint) : fingerprint,
       noticeFingerprint: notice,
+      securityRemindedAt,
     },
     now,
   );
   for (const alert of alerts) await insertAlert(env.DB, alert, now);
-  const useful = coverage === "complete" || coverage === "partial" || coverage === "policy_only";
   return {
     vendor: vendorId,
     monitorId: monitor.id,
-    succeeded: useful,
+    succeeded: coverage === "complete",
     releasesState: releaseState,
     advisoriesState: advisoryState,
     coverage,
     errorCode: vendorError(coverage, releaseState, advisoryState, releases, advisoryFeed),
+    releasesRateLimited: releases.errorCode === "rate_limited",
+    advisoriesRateLimited: advisoryFeed.errorCode === "rate_limited",
     checkedAt: now,
   };
+}
+
+function sourceFailures(state: SourceState, rateLimited: boolean, previous: number): number {
+  if (state === "fresh") return 0;
+  if (rateLimited) return previous;
+  return previous + 1;
 }
 
 function sourceState<T>(feed: Feed<T>): SourceState {
@@ -257,6 +304,17 @@ async function recordVendorOutcome(env: Env, outcome: VendorCheckOutcome): Promi
     : hardFailure
       ? (previous?.consecutiveFailures ?? 0) + 1
       : (previous?.consecutiveFailures ?? 0);
+  const releasesFailures = sourceFailures(
+    outcome.releasesState,
+    outcome.releasesRateLimited,
+    previous?.releasesFailures ?? 0,
+  );
+  const advisoriesFailures = sourceFailures(
+    outcome.advisoriesState,
+    outcome.advisoriesRateLimited,
+    previous?.advisoriesFailures ?? 0,
+  );
+  const partial = outcome.coverage === "partial" || outcome.coverage === "policy_only";
   await writeVendorCheck(
     env.DB,
     {
@@ -264,6 +322,7 @@ async function recordVendorOutcome(env: Env, outcome: VendorCheckOutcome): Promi
       vendor: outcome.vendor,
       attemptedAt: outcome.checkedAt,
       succeededAt: outcome.succeeded ? outcome.checkedAt : null,
+      partialSucceededAt: partial ? outcome.checkedAt : null,
       releasesCheckedAt: outcome.releasesState === "fresh" ? outcome.checkedAt : null,
       advisoriesCheckedAt: outcome.advisoriesState === "fresh" ? outcome.checkedAt : null,
       releasesStale: outcome.releasesState !== "fresh",
@@ -273,6 +332,8 @@ async function recordVendorOutcome(env: Env, outcome: VendorCheckOutcome): Promi
       coverage: outcome.coverage,
       errorCode: outcome.errorCode,
       consecutiveFailures,
+      releasesFailures,
+      advisoriesFailures,
     },
     outcome.checkedAt,
   );
@@ -426,6 +487,8 @@ function securityAlerts(
   summary: string,
   url: string | null,
   now: number,
+  dedupeSuffix = "",
+  alertClass: AlertDraft["alertClass"] = "security",
 ): AlertDraft[] {
   const severity = status === "affected" ? "critical" : "warning";
   const text = formatSecurityMessage({
@@ -438,13 +501,17 @@ function securityAlerts(
     occurredAt: now,
     classification: status,
   });
-  const drafts = [securityDraft(monitor, severity, fingerprint, "nostr", text)];
+  const drafts = [
+    securityDraft(monitor, severity, fingerprint, "nostr", text, dedupeSuffix, alertClass),
+  ];
   if (
     severity === "critical" &&
     settings.telegramMode === "dual" &&
     telegramChat(readString(env, "TELEGRAM_CHAT_IDS"), monitor.projectId)
   ) {
-    drafts.push(securityDraft(monitor, severity, fingerprint, "telegram", text));
+    drafts.push(
+      securityDraft(monitor, severity, fingerprint, "telegram", text, dedupeSuffix, alertClass),
+    );
   }
   return drafts;
 }
@@ -455,14 +522,16 @@ function securityDraft(
   fingerprint: string,
   destination: "nostr" | "telegram",
   text: string,
+  dedupeSuffix: string,
+  alertClass: AlertDraft["alertClass"],
 ): AlertDraft {
   return {
     id: `alt_${crypto.randomUUID()}`,
-    alertClass: "security",
+    alertClass,
     incidentId: null,
     monitorId: monitor.id,
     projectId: monitor.projectId,
-    dedupeKey: `security:${monitor.id}:${fingerprint}:${destination}`,
+    dedupeKey: `security:${monitor.id}:${fingerprint}:${dedupeSuffix}${destination}`,
     destination,
     severity,
     text,

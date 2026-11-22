@@ -292,6 +292,7 @@ export interface VendorCheckRow {
   vendor: string;
   attemptedAt: number | null;
   succeededAt: number | null;
+  partialSucceededAt: number | null;
   releasesCheckedAt: number | null;
   advisoriesCheckedAt: number | null;
   releasesStale: boolean;
@@ -301,6 +302,8 @@ export interface VendorCheckRow {
   coverage: string;
   errorCode: string | null;
   consecutiveFailures: number;
+  releasesFailures: number;
+  advisoriesFailures: number;
 }
 
 export async function readVendorCheck(
@@ -309,9 +312,9 @@ export async function readVendorCheck(
 ): Promise<VendorCheckRow | null> {
   const row = await db
     .prepare(
-      `SELECT monitor_id, vendor, attempted_at, succeeded_at, releases_checked_at, advisories_checked_at,
-        releases_stale, advisories_stale, releases_state, advisories_state, coverage, error_code,
-        consecutive_failures
+      `SELECT monitor_id, vendor, attempted_at, succeeded_at, partial_succeeded_at, releases_checked_at,
+        advisories_checked_at, releases_stale, advisories_stale, releases_state, advisories_state,
+        coverage, error_code, consecutive_failures, releases_failures, advisories_failures
        FROM vendor_checks WHERE monitor_id = ?`,
     )
     .bind(monitorId)
@@ -320,6 +323,7 @@ export async function readVendorCheck(
       vendor: string;
       attempted_at: number | null;
       succeeded_at: number | null;
+      partial_succeeded_at: number | null;
       releases_checked_at: number | null;
       advisories_checked_at: number | null;
       releases_stale: number;
@@ -329,6 +333,8 @@ export async function readVendorCheck(
       coverage: string;
       error_code: string | null;
       consecutive_failures: number;
+      releases_failures: number;
+      advisories_failures: number;
     }>();
   return row ? vendorCheckFrom(row) : null;
 }
@@ -341,14 +347,15 @@ export async function writeVendorCheck(
   await db
     .prepare(
       `INSERT INTO vendor_checks (
-      monitor_id, vendor, attempted_at, succeeded_at, releases_checked_at, advisories_checked_at,
-      releases_stale, advisories_stale, releases_state, advisories_state, coverage, error_code,
-      consecutive_failures, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      monitor_id, vendor, attempted_at, succeeded_at, partial_succeeded_at, releases_checked_at,
+      advisories_checked_at, releases_stale, advisories_stale, releases_state, advisories_state,
+      coverage, error_code, consecutive_failures, releases_failures, advisories_failures, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(monitor_id) DO UPDATE SET
       vendor = excluded.vendor,
       attempted_at = COALESCE(excluded.attempted_at, vendor_checks.attempted_at),
       succeeded_at = COALESCE(excluded.succeeded_at, vendor_checks.succeeded_at),
+      partial_succeeded_at = COALESCE(excluded.partial_succeeded_at, vendor_checks.partial_succeeded_at),
       releases_checked_at = COALESCE(excluded.releases_checked_at, vendor_checks.releases_checked_at),
       advisories_checked_at = COALESCE(excluded.advisories_checked_at, vendor_checks.advisories_checked_at),
       releases_stale = excluded.releases_stale,
@@ -358,6 +365,8 @@ export async function writeVendorCheck(
       coverage = excluded.coverage,
       error_code = excluded.error_code,
       consecutive_failures = excluded.consecutive_failures,
+      releases_failures = excluded.releases_failures,
+      advisories_failures = excluded.advisories_failures,
       updated_at = excluded.updated_at`,
     )
     .bind(
@@ -365,6 +374,7 @@ export async function writeVendorCheck(
       row.vendor,
       row.attemptedAt,
       row.succeededAt,
+      row.partialSucceededAt,
       row.releasesCheckedAt,
       row.advisoriesCheckedAt,
       row.releasesStale ? 1 : 0,
@@ -374,6 +384,8 @@ export async function writeVendorCheck(
       row.coverage,
       row.errorCode,
       row.consecutiveFailures,
+      row.releasesFailures,
+      row.advisoriesFailures,
       now,
     )
     .run();
@@ -384,6 +396,7 @@ function vendorCheckFrom(row: {
   vendor: string;
   attempted_at: number | null;
   succeeded_at: number | null;
+  partial_succeeded_at: number | null;
   releases_checked_at: number | null;
   advisories_checked_at: number | null;
   releases_stale: number;
@@ -393,12 +406,15 @@ function vendorCheckFrom(row: {
   coverage: string;
   error_code: string | null;
   consecutive_failures: number;
+  releases_failures: number;
+  advisories_failures: number;
 }): VendorCheckRow {
   return {
     monitorId: row.monitor_id,
     vendor: row.vendor,
     attemptedAt: row.attempted_at,
     succeededAt: row.succeeded_at,
+    partialSucceededAt: row.partial_succeeded_at,
     releasesCheckedAt: row.releases_checked_at,
     advisoriesCheckedAt: row.advisories_checked_at,
     releasesStale: row.releases_stale === 1,
@@ -408,6 +424,8 @@ function vendorCheckFrom(row: {
     coverage: row.coverage,
     errorCode: row.error_code,
     consecutiveFailures: row.consecutive_failures,
+    releasesFailures: row.releases_failures,
+    advisoriesFailures: row.advisories_failures,
   };
 }
 
@@ -790,12 +808,13 @@ export interface VersionRow {
   securityStatus: string;
   advisoryFingerprint: string | null;
   noticeFingerprint: string | null;
+  securityRemindedAt: number | null;
 }
 
 export async function readVersion(db: D1Database, monitorId: string): Promise<VersionRow | null> {
   const row = await db
     .prepare(
-      "SELECT installed_version, latest_version, latest_url, security_status, advisory_fingerprint, notice_fingerprint FROM observed_versions WHERE monitor_id = ?",
+      "SELECT installed_version, latest_version, latest_url, security_status, advisory_fingerprint, notice_fingerprint, security_reminded_at FROM observed_versions WHERE monitor_id = ?",
     )
     .bind(monitorId)
     .first<{
@@ -805,6 +824,7 @@ export async function readVersion(db: D1Database, monitorId: string): Promise<Ve
       security_status: string;
       advisory_fingerprint: string | null;
       notice_fingerprint: string | null;
+      security_reminded_at: number | null;
     }>();
   if (!row) return null;
   return {
@@ -814,6 +834,7 @@ export async function readVersion(db: D1Database, monitorId: string): Promise<Ve
     securityStatus: row.security_status,
     advisoryFingerprint: row.advisory_fingerprint,
     noticeFingerprint: row.notice_fingerprint,
+    securityRemindedAt: row.security_reminded_at,
   };
 }
 
@@ -826,8 +847,9 @@ export async function writeVersion(
   await db
     .prepare(
       `INSERT INTO observed_versions (
-      monitor_id, installed_version, latest_version, latest_url, security_status, advisory_fingerprint, notice_fingerprint, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      monitor_id, installed_version, latest_version, latest_url, security_status,
+      advisory_fingerprint, notice_fingerprint, security_reminded_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(monitor_id) DO UPDATE SET
       installed_version = excluded.installed_version,
       latest_version = excluded.latest_version,
@@ -835,6 +857,7 @@ export async function writeVersion(
       security_status = excluded.security_status,
       advisory_fingerprint = excluded.advisory_fingerprint,
       notice_fingerprint = excluded.notice_fingerprint,
+      security_reminded_at = excluded.security_reminded_at,
       updated_at = excluded.updated_at`,
     )
     .bind(
@@ -845,6 +868,7 @@ export async function writeVersion(
       row.securityStatus,
       row.advisoryFingerprint,
       row.noticeFingerprint,
+      row.securityRemindedAt,
       now,
     )
     .run();
@@ -891,6 +915,7 @@ export interface OperationalSnapshot {
   openIncidents: number;
   outbox: Array<{ state: string; count: number }>;
   errors: Array<{ error: string; count: number }>;
+  errorsByMonitor?: Array<{ monitorId: string; error: string; count: number }>;
   runs: Array<{
     name: string;
     startedAt: number | null;
@@ -900,6 +925,8 @@ export interface OperationalSnapshot {
   }>;
   heartbeats: Array<{ monitorId: string; receivedAt: number }>;
   vendorChecks?: VendorCheckRow[];
+  openIncidentMonitorIds?: string[];
+  outboxByMonitor?: Array<{ monitorId: string; state: string; count: number }>;
 }
 
 export async function operationalSnapshot(db: D1Database): Promise<OperationalSnapshot> {
@@ -908,18 +935,20 @@ export async function operationalSnapshot(db: D1Database): Promise<OperationalSn
       .prepare("SELECT monitor_id, status, last_check_at FROM monitor_state")
       .all<{ monitor_id: string; status: string; last_check_at: number | null }>(),
     db
-      .prepare("SELECT COUNT(*) AS count FROM incidents WHERE status = 'open'")
-      .first<{ count: number }>(),
-    db
-      .prepare("SELECT state, COUNT(*) AS count FROM alert_outbox GROUP BY state")
-      .all<{ state: string; count: number }>(),
+      .prepare("SELECT monitor_id FROM incidents WHERE status = 'open'")
+      .all<{ monitor_id: string }>(),
     db
       .prepare(
-        `SELECT last_error AS error, COUNT(*) AS count FROM alert_outbox
-         WHERE state IN ('retrying', 'failed') AND last_error IS NOT NULL
-         GROUP BY last_error`,
+        "SELECT monitor_id, state, COUNT(*) AS count FROM alert_outbox GROUP BY monitor_id, state",
       )
-      .all<{ error: string; count: number }>(),
+      .all<{ monitor_id: string; state: string; count: number }>(),
+    db
+      .prepare(
+        `SELECT monitor_id, last_error AS error, COUNT(*) AS count FROM alert_outbox
+         WHERE state IN ('retrying', 'failed') AND last_error IS NOT NULL
+         GROUP BY monitor_id, last_error`,
+      )
+      .all<{ monitor_id: string; error: string; count: number }>(),
     db
       .prepare(
         "SELECT job_name, last_started_at, last_finished_at, last_success_at, last_error FROM scheduler_runs",
@@ -936,9 +965,9 @@ export async function operationalSnapshot(db: D1Database): Promise<OperationalSn
       .all<{ monitor_id: string; received_at: number }>(),
     db
       .prepare(
-        `SELECT monitor_id, vendor, attempted_at, succeeded_at, releases_checked_at, advisories_checked_at,
-          releases_stale, advisories_stale, releases_state, advisories_state, coverage, error_code,
-          consecutive_failures
+        `SELECT monitor_id, vendor, attempted_at, succeeded_at, partial_succeeded_at, releases_checked_at,
+          advisories_checked_at, releases_stale, advisories_stale, releases_state, advisories_state,
+          coverage, error_code, consecutive_failures, releases_failures, advisories_failures
          FROM vendor_checks`,
       )
       .all<{
@@ -946,6 +975,7 @@ export async function operationalSnapshot(db: D1Database): Promise<OperationalSn
         vendor: string;
         attempted_at: number | null;
         succeeded_at: number | null;
+        partial_succeeded_at: number | null;
         releases_checked_at: number | null;
         advisories_checked_at: number | null;
         releases_stale: number;
@@ -955,16 +985,34 @@ export async function operationalSnapshot(db: D1Database): Promise<OperationalSn
         coverage: string;
         error_code: string | null;
         consecutive_failures: number;
+        releases_failures: number;
+        advisories_failures: number;
       }>(),
   ]);
+  const outboxByMonitor = outbox.results.map((row) => ({
+    monitorId: row.monitor_id,
+    state: row.state,
+    count: row.count,
+  }));
+  const outboxTotals = new Map<string, number>();
+  for (const row of outboxByMonitor) {
+    outboxTotals.set(row.state, (outboxTotals.get(row.state) ?? 0) + row.count);
+  }
   return {
     states: states.results.map((row) => ({
       monitorId: row.monitor_id,
       status: row.status,
       lastCheckAt: row.last_check_at,
     })),
-    openIncidents: open?.count ?? 0,
-    outbox: outbox.results.map((row) => ({ state: row.state, count: row.count })),
+    openIncidents: open.results.length,
+    openIncidentMonitorIds: open.results.map((row) => row.monitor_id),
+    outbox: [...outboxTotals].map(([state, count]) => ({ state, count })),
+    outboxByMonitor,
+    errorsByMonitor: errors.results.map((row) => ({
+      monitorId: row.monitor_id,
+      error: row.error,
+      count: row.count,
+    })),
     errors: errors.results.map((row) => ({ error: row.error, count: row.count })),
     runs: runs.results.map((row) => ({
       name: row.job_name,

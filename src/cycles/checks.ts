@@ -55,7 +55,8 @@ export async function runCheckCycle(env: Env, deps: Dependencies): Promise<void>
     }));
     for (const item of settled) {
       if (item.status === "rejected") {
-        log("error", "probe_rejected", { monitor: "unknown" });
+        cycleError = cycleError ?? "probe_failed";
+        log("error", "probe_failed", {});
         continue;
       }
       try {

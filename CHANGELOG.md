@@ -20,6 +20,9 @@ This is a release candidate. It is not a published GitHub release and it has not
 - Treat a publish-gateway deep probe as degraded when only some configured relays open.
 - Report a software release when the advisory feed is down, and keep verified vendor affected-range alerts usable during a GitHub outage.
 - Report incomplete security coverage when the installed version is unknown instead of calling that check successful.
+- Keep the last complete security check when only one GitHub feed is fresh. A source that stays down past a two-hour or three-attempt grace degrades `/v1/status`.
+- Ignore disabled monitors, their old incidents, and their dead letters when calculating current health. A stale sample for an enabled monitor is visible on its own.
+- Repeat critical outages and confirmed vulnerabilities every four hours in the staging and production templates until acknowledgement, recovery, silence, or clearance.
 
 ## 0.1.0
 
