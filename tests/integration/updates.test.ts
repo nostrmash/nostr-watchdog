@@ -7,7 +7,12 @@ import { hubReleases } from "../fixtures/releases";
 import { bind, jsonResponse } from "../helpers";
 
 afterEach(() => {
-  bind({ ENABLE_SFS_ALBY: "false", ENABLE_SFS_BTCPAY: "false", ALERTS_ENABLED: "true" });
+  bind({
+    ENABLE_SFS_ALBY: "false",
+    ENABLE_SFS_BTCPAY: "false",
+    ALERTS_ENABLED: "true",
+    CRITICAL_REMINDER_SECONDS: "0",
+  });
 });
 
 function github(releases: unknown, advisories: unknown, status = 200) {
@@ -228,6 +233,60 @@ describe("update cycle", () => {
     const vendor = await vendorRow("sfs-alby-hub");
     expect(vendor?.releases_state).toBe("cached");
   });
+
+  it("does not refresh a complete security check while one feed stays down", async () => {
+    const start = 1_880_000_000_000;
+    await prepare("sfs-alby-hub", "smartflowsocial", "1.2.0", start);
+    bind({ ENABLE_SFS_ALBY: "true", ENABLE_SFS_BTCPAY: "false", ALERTS_ENABLED: "false" });
+    await runUpdateCycle(env, splitFeeds(release("v1.9.0"), githubAffected, start));
+    const complete = await vendorTimes("sfs-alby-hub");
+    expect(complete?.succeeded_at).toBe(start);
+    expect(complete?.coverage).toBe("complete");
+    for (let hour = 1; hour <= 3; hour += 1) {
+      await runUpdateCycle(env, splitFeeds(release("v1.9.0"), 500, start + hour * 3_600_000));
+    }
+    const stalled = await vendorTimes("sfs-alby-hub");
+    expect(stalled?.succeeded_at).toBe(start);
+    expect(stalled?.advisories_failures).toBe(3);
+    expect(stalled?.releases_failures).toBe(0);
+    expect(stalled?.coverage).toBe("partial");
+    expect(stalled?.partial_succeeded_at).toBe(start + 3 * 3_600_000);
+    const run = await env.DB.prepare(
+      "SELECT last_success_at, last_error FROM scheduler_runs WHERE job_name = 'updates'",
+    ).first<{ last_success_at: number | null; last_error: string | null }>();
+    expect(run?.last_success_at).toBe(start);
+    expect(run?.last_error).toBe("coverage_partial");
+    const before = (await alerts("sfs-alby-hub")).length;
+    await runUpdateCycle(env, splitFeeds(release("v1.9.0"), githubAffected, start + 4 * 3_600_000));
+    const recovered = await vendorTimes("sfs-alby-hub");
+    expect(recovered?.succeeded_at).toBe(start + 4 * 3_600_000);
+    expect(recovered?.advisories_failures).toBe(0);
+    expect(recovered?.coverage).toBe("complete");
+    expect(await alerts("sfs-alby-hub")).toHaveLength(before);
+  });
+
+  it("repeats one confirmed finding after the reminder interval without duplicating it inside that interval", async () => {
+    const start = 1_890_000_000_000;
+    await prepare("sfs-alby-hub", "smartflowsocial", "1.2.0", start);
+    bind({
+      ENABLE_SFS_ALBY: "true",
+      ENABLE_SFS_BTCPAY: "false",
+      ALERTS_ENABLED: "false",
+      CRITICAL_REMINDER_SECONDS: "3600",
+    });
+    await runUpdateCycle(env, splitFeeds(release("v1.9.0"), githubAffected, start));
+    await runUpdateCycle(env, splitFeeds(release("v1.9.0"), githubAffected, start + 3_600_000));
+    await runUpdateCycle(
+      env,
+      splitFeeds(release("v1.9.0"), githubAffected, start + 3_600_000 + 1_000),
+    );
+    const rows = await alerts("sfs-alby-hub");
+    expect(rows.filter((row) => row.alert_class === "security")).toHaveLength(1);
+    expect(rows.filter((row) => row.alert_class === "reminder")).toHaveLength(1);
+    expect(rows.find((row) => row.alert_class === "reminder")?.payload_text).toContain(
+      "still open",
+    );
+  });
 });
 
 function release(tag: string, body = "Bug fixes") {
@@ -295,6 +354,21 @@ async function alerts(id: string) {
     .bind(id)
     .all<{ alert_class: string; severity: string; payload_text: string }>();
   return rows.results;
+}
+
+async function vendorTimes(id: string) {
+  return env.DB.prepare(
+    `SELECT succeeded_at, partial_succeeded_at, releases_failures, advisories_failures, coverage
+     FROM vendor_checks WHERE monitor_id = ?`,
+  )
+    .bind(id)
+    .first<{
+      succeeded_at: number | null;
+      partial_succeeded_at: number | null;
+      releases_failures: number;
+      advisories_failures: number;
+      coverage: string;
+    }>();
 }
 
 async function vendorRow(id: string) {

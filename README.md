@@ -78,6 +78,7 @@ Husky runs lint-staged before each commit.
 | [docs/configuration.md](docs/configuration.md) | Projects, monitors, secrets, and thresholds                   |
 | [docs/deployment.md](docs/deployment.md)       | Plan, D1, environments, deploy, and rollback                  |
 | [docs/operations.md](docs/operations.md)       | Routes, test alerts, and the rollout checklist                |
+| [docs/acceptance.md](docs/acceptance.md)       | Staging checks that automated tests cannot prove              |
 | [docs/security.md](docs/security.md)           | SSRF limits, credentials, heartbeats, and dependency licenses |
 | [docs/integrations.md](docs/integrations.md)   | How any application exposes readiness and a signed heartbeat  |
 | [CONTRIBUTING.md](CONTRIBUTING.md)             | Local checks and pull requests                                |

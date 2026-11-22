@@ -201,6 +201,9 @@ describe("operational status", () => {
           coverage: "unavailable",
           errorCode: "unavailable",
           consecutiveFailures: 3,
+          partialSucceededAt: null,
+          releasesFailures: 3,
+          advisoriesFailures: 3,
         },
       ],
     });
@@ -238,6 +241,9 @@ describe("operational status", () => {
           coverage: "incomplete",
           errorCode: "coverage_incomplete",
           consecutiveFailures: 0,
+          partialSucceededAt: null,
+          releasesFailures: 0,
+          advisoriesFailures: 0,
         },
       ],
     });
@@ -266,5 +272,165 @@ describe("operational status", () => {
       ],
     });
     expect(staleSuccess.status).toBe("unhealthy");
+  });
+
+  it("keeps a fresh partial security check healthy and degrades it after the source grace", () => {
+    bind({
+      ENABLE_SFS_ALBY: "true",
+      ALERTS_ENABLED: "true",
+      SFS_BOT_NSEC: "nsec-test",
+      ADMIN_NPUB: "npub-test",
+      BOOTSTRAP_RELAYS: "wss://relay.example",
+    });
+    const base = {
+      ...empty(),
+      states: [{ monitorId: "sfs-alby-hub", status: "healthy", lastCheckAt: NOW }],
+      runs: [
+        {
+          name: "checks",
+          startedAt: NOW - 10_000,
+          finishedAt: NOW - 1_000,
+          successAt: NOW - 1_000,
+          error: null,
+        },
+        {
+          name: "updates",
+          startedAt: NOW - 30 * 60_000,
+          finishedAt: NOW - 30 * 60_000,
+          successAt: NOW - 30 * 60_000,
+          error: "coverage_partial",
+        },
+      ],
+    };
+    const withinGrace = derive({
+      ...base,
+      vendorChecks: [
+        {
+          monitorId: "sfs-alby-hub",
+          vendor: "getAlby/hub",
+          attemptedAt: NOW - 30 * 60_000,
+          succeededAt: NOW - 30 * 60_000,
+          partialSucceededAt: NOW - 30 * 60_000,
+          releasesCheckedAt: NOW - 30 * 60_000,
+          advisoriesCheckedAt: NOW - 30 * 60_000,
+          releasesStale: false,
+          advisoriesStale: true,
+          releasesState: "fresh",
+          advisoriesState: "unavailable",
+          coverage: "partial",
+          errorCode: "unavailable",
+          consecutiveFailures: 0,
+          releasesFailures: 0,
+          advisoriesFailures: 1,
+        },
+      ],
+    });
+    expect(withinGrace.status).toBe("healthy");
+    const persistent = derive({
+      ...base,
+      runs: [
+        base.runs[0]!,
+        {
+          name: "updates",
+          startedAt: NOW - 3 * 3_600_000,
+          finishedAt: NOW - 1_000,
+          successAt: NOW - 3 * 3_600_000,
+          error: "coverage_partial",
+        },
+      ],
+      vendorChecks: [
+        {
+          monitorId: "sfs-alby-hub",
+          vendor: "getAlby/hub",
+          attemptedAt: NOW - 1_000,
+          succeededAt: NOW - 3 * 3_600_000,
+          partialSucceededAt: NOW - 1_000,
+          releasesCheckedAt: NOW - 1_000,
+          advisoriesCheckedAt: NOW - 3 * 3_600_000,
+          releasesStale: false,
+          advisoriesStale: true,
+          releasesState: "fresh",
+          advisoriesState: "unavailable",
+          coverage: "partial",
+          errorCode: "unavailable",
+          consecutiveFailures: 0,
+          releasesFailures: 0,
+          advisoriesFailures: 3,
+        },
+      ],
+    });
+    expect(persistent.status).toBe("degraded");
+    expect(persistent.body.securityChecks).toMatchObject([
+      { advisoriesFailures: 3, coverage: "partial" },
+    ]);
+  });
+
+  it("ignores disabled-monitor history and reports a stale enabled result on its own", () => {
+    bind({
+      ENABLE_SFS_WEB: "true",
+      ALERTS_ENABLED: "true",
+      SFS_BOT_NSEC: "nsec-test",
+      ADMIN_NPUB: "npub-test",
+      BOOTSTRAP_RELAYS: "wss://relay.example",
+    });
+    const historical = derive({
+      ...empty(),
+      states: [{ monitorId: "sfs-web", status: "healthy", lastCheckAt: NOW }],
+      runs: [
+        {
+          name: "checks",
+          startedAt: NOW - 10_000,
+          finishedAt: NOW - 1_000,
+          successAt: NOW - 1_000,
+          error: null,
+        },
+      ],
+      openIncidents: 4,
+      openIncidentMonitorIds: ["sfs-alby-hub", "sfs-btcpay"],
+      outbox: [{ state: "failed", count: 2 }],
+      outboxByMonitor: [{ monitorId: "sfs-alby-hub", state: "failed", count: 2 }],
+      vendorChecks: [
+        {
+          monitorId: "sfs-alby-hub",
+          vendor: "getAlby/hub",
+          attemptedAt: NOW,
+          succeededAt: null,
+          partialSucceededAt: null,
+          releasesCheckedAt: null,
+          advisoriesCheckedAt: null,
+          releasesStale: true,
+          advisoriesStale: true,
+          releasesState: "unavailable",
+          advisoriesState: "unavailable",
+          coverage: "unavailable",
+          errorCode: "unavailable",
+          consecutiveFailures: 9,
+          releasesFailures: 9,
+          advisoriesFailures: 9,
+        },
+      ],
+    });
+    expect(historical.status).toBe("healthy");
+    expect(historical.body.deadLetters).toBe(0);
+    expect(historical.body.inactiveDeadLetters).toBe(2);
+    expect(historical.body.openIncidents).toBe(0);
+    expect(historical.body.inactiveOpenIncidents).toBe(2);
+    expect(historical.body.securityChecks).toEqual([]);
+    const staleResult = derive({
+      ...empty(),
+      states: [{ monitorId: "sfs-web", status: "healthy", lastCheckAt: NOW - 10 * 60_000 }],
+      runs: [
+        {
+          name: "checks",
+          startedAt: NOW - 10_000,
+          finishedAt: NOW - 1_000,
+          successAt: NOW - 1_000,
+          error: null,
+        },
+      ],
+    });
+    expect(staleResult.status).toBe("degraded");
+    expect(staleResult.body.staleMonitorResults).toBe(1);
+    expect(staleResult.body.monitors).toMatchObject({ healthy: 1 });
   });
 });

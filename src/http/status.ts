@@ -3,7 +3,7 @@ import { PROJECTS } from "../config/projects";
 import { projectRecipient } from "../config/projects";
 import type { Settings } from "../config/settings";
 import { readString } from "../runtime";
-import type { OperationalSnapshot } from "../state/store";
+import type { OperationalSnapshot, VendorCheckRow } from "../state/store";
 
 export type WatchdogStatus =
   | "healthy"
@@ -16,6 +16,7 @@ export type WatchdogStatus =
 
 const UPDATE_OVERDUE_MS = 2 * 3_600_000;
 const UPDATE_UNHEALTHY_MS = 6 * 3_600_000;
+const SOURCE_FAILURE_GRACE = 3;
 
 const KNOWN_ERRORS = [
   "sender_key_missing",
@@ -42,9 +43,11 @@ export function deriveOperationalStatus(input: {
   snapshot: OperationalSnapshot;
 }): { status: WatchdogStatus; httpStatus: number; body: Record<string, unknown> } {
   const enabled = enabledMonitors(input.env);
+  const enabledIds = new Set(enabled.map((monitor) => monitor.id));
   const counts = { healthy: 0, degraded: 0, down: 0, unknown: 0, misconfigured: 0 };
   let staleHeartbeats = 0;
   let missingHeartbeats = 0;
+  let staleMonitorResults = 0;
   for (const monitor of enabled) {
     const state = input.snapshot.states.find((item) => item.monitorId === monitor.id);
     const status = state?.status;
@@ -57,6 +60,10 @@ export function deriveOperationalStatus(input: {
     ) {
       counts[status] += 1;
     } else counts.unknown += 1;
+    const resultLimit = Math.max(input.settings.schedulerStaleSeconds, monitor.intervalSeconds * 3);
+    if (!state?.lastCheckAt || input.now - state.lastCheckAt > resultLimit * 1000) {
+      staleMonitorResults += 1;
+    }
     if (monitor.kind === "signed_heartbeat") {
       const beat = input.snapshot.heartbeats.find((item) => item.monitorId === monitor.id);
       if (!beat) missingHeartbeats += 1;
@@ -68,13 +75,16 @@ export function deriveOperationalStatus(input: {
     checks: runOf(input.snapshot, "checks"),
     updates: runOf(input.snapshot, "updates"),
   };
-  const outbox = Object.fromEntries(input.snapshot.outbox.map((row) => [row.state, row.count]));
-  const pending = outbox.queued ?? 0;
-  const retrying = outbox.retrying ?? 0;
-  const deadLetters = outbox.failed ?? 0;
+  const delivery = deliveryCounts(input.snapshot, enabledIds);
+  const pending = delivery.counts.queued ?? 0;
+  const retrying = delivery.counts.retrying ?? 0;
+  const deadLetters = delivery.counts.failed ?? 0;
+  const incidents = incidentCounts(input.snapshot, enabledIds);
   const errors: Record<string, number> = {};
-  for (const row of input.snapshot.errors) {
-    if ((KNOWN_ERRORS as readonly string[]).includes(row.error)) errors[row.error] = row.count;
+  for (const row of activeErrors(input.snapshot, enabledIds)) {
+    if ((KNOWN_ERRORS as readonly string[]).includes(row.error)) {
+      errors[row.error] = (errors[row.error] ?? 0) + row.count;
+    }
   }
   const checkAge = runs.checks.finishedAt === null ? null : input.now - runs.checks.finishedAt;
   const schedulerStale =
@@ -87,19 +97,21 @@ export function deriveOperationalStatus(input: {
     enabled.map((monitor) => monitor.projectId),
   );
   const versionMonitors = enabled.filter((monitor) => monitor.versionVendor);
-  const vendorChecks = input.snapshot.vendorChecks ?? [];
+  const vendorChecks = (input.snapshot.vendorChecks ?? []).filter((row) =>
+    enabledIds.has(row.monitorId),
+  );
   const updateAge = runs.updates.successAt === null ? null : input.now - runs.updates.successAt;
   const updatesRequired = versionMonitors.length > 0;
   const updateOverdue = updatesRequired && (updateAge === null || updateAge > UPDATE_OVERDUE_MS);
   const updateUnhealthy = updatesRequired && updateAge !== null && updateAge > UPDATE_UNHEALTHY_MS;
   const updateFailed =
-    updatesRequired && runs.updates.error !== null && runs.updates.error !== "disabled";
+    updatesRequired &&
+    runs.updates.error !== null &&
+    runs.updates.error !== "disabled" &&
+    runs.updates.error !== "coverage_partial" &&
+    runs.updates.error !== "rate_limited";
   const vendorFailing = vendorChecks.some((row) => row.consecutiveFailures >= 3);
-  const vendorStale = vendorChecks.some(
-    (row) =>
-      (row.releasesStale || row.advisoriesStale) &&
-      (row.succeededAt === null || input.now - row.succeededAt > UPDATE_OVERDUE_MS),
-  );
+  const sourceGap = vendorChecks.some((row) => sourceOverdue(row, input.now));
   const coverageGap = vendorChecks.some(
     (row) => row.coverage === "incomplete" || row.coverage === "unavailable",
   );
@@ -110,10 +122,11 @@ export function deriveOperationalStatus(input: {
     (schedulerStale && !checkUnhealthy) ||
     schedulerFailed ||
     repeatedDeliveryFailures ||
+    staleMonitorResults > 0 ||
     (updateOverdue && !updateUnhealthy) ||
     updateFailed ||
     vendorFailing ||
-    vendorStale ||
+    sourceGap ||
     coverageGap;
   let status: WatchdogStatus = "healthy";
   if (!input.settings.enabled) status = "disabled";
@@ -168,11 +181,19 @@ export function deriveOperationalStatus(input: {
       coverage: row.coverage,
       errorCode: row.errorCode,
       consecutiveFailures: row.consecutiveFailures,
+      releasesFailures: row.releasesFailures,
+      advisoriesFailures: row.advisoriesFailures,
+      partialSucceededAt: row.partialSucceededAt
+        ? new Date(row.partialSucceededAt).toISOString()
+        : null,
     })),
-    openIncidents: input.snapshot.openIncidents,
+    openIncidents: incidents.active,
+    inactiveOpenIncidents: incidents.inactive,
+    staleMonitorResults,
     pendingAlerts: pending,
     retryingAlerts: retrying,
     deadLetters,
+    inactiveDeadLetters: delivery.inactiveDeadLetters,
     heartbeats: { stale: staleHeartbeats, missing: missingHeartbeats },
     delivery: {
       destinationsConfigured: destinations.configured,
@@ -180,6 +201,60 @@ export function deriveOperationalStatus(input: {
     },
   };
   return { status, httpStatus: status === "healthy" ? 200 : 503, body };
+}
+
+function sourceOverdue(row: VendorCheckRow, now: number): boolean {
+  return (
+    feedOverdue(row.releasesStale, row.releasesCheckedAt, row.releasesFailures, now) ||
+    feedOverdue(row.advisoriesStale, row.advisoriesCheckedAt, row.advisoriesFailures, now)
+  );
+}
+
+function feedOverdue(
+  stale: boolean,
+  checkedAt: number | null,
+  failures: number,
+  now: number,
+): boolean {
+  if (!stale) return false;
+  if (failures >= SOURCE_FAILURE_GRACE) return true;
+  if (checkedAt === null) return false;
+  return now - checkedAt > UPDATE_OVERDUE_MS;
+}
+
+function deliveryCounts(snapshot: OperationalSnapshot, enabledIds: Set<string>) {
+  if (!snapshot.outboxByMonitor) {
+    return {
+      counts: Object.fromEntries(snapshot.outbox.map((row) => [row.state, row.count])),
+      inactiveDeadLetters: 0,
+    };
+  }
+  const counts: Record<string, number> = {};
+  let inactiveDeadLetters = 0;
+  for (const row of snapshot.outboxByMonitor) {
+    if (!enabledIds.has(row.monitorId)) {
+      if (row.state === "failed") inactiveDeadLetters += row.count;
+      continue;
+    }
+    counts[row.state] = (counts[row.state] ?? 0) + row.count;
+  }
+  return { counts, inactiveDeadLetters };
+}
+
+function incidentCounts(snapshot: OperationalSnapshot, enabledIds: Set<string>) {
+  if (!snapshot.openIncidentMonitorIds) return { active: snapshot.openIncidents, inactive: 0 };
+  let active = 0;
+  let inactive = 0;
+  for (const id of snapshot.openIncidentMonitorIds) {
+    if (enabledIds.has(id)) active += 1;
+    else inactive += 1;
+  }
+  return { active, inactive };
+}
+
+function activeErrors(snapshot: OperationalSnapshot, enabledIds: Set<string>) {
+  if (!snapshot.errorsByMonitor) return snapshot.errors;
+  return snapshot.errorsByMonitor.filter((row) => enabledIds.has(row.monitorId));
 }
 
 function runOf(snapshot: OperationalSnapshot, name: string) {
