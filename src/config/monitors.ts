@@ -1,0 +1,152 @@
+import { readString } from "../runtime";
+import type { MonitorDefinition } from "../types";
+
+const common = {
+  intervalSeconds: 60,
+  failureThreshold: 2,
+  recoveryThreshold: 2,
+};
+
+export const MONITORS: MonitorDefinition[] = [
+  {
+    ...common,
+    id: "sfs-web",
+    projectId: "smartflowsocial",
+    kind: "http_json",
+    displayName: "SmartFlowSocial app readiness",
+    enableVar: "ENABLE_SFS_WEB",
+    severity: "critical",
+    incidentOnDegraded: false,
+    runbookPath: "/smartflowsocial/web",
+    http: {
+      urlVar: "SFS_WEB_READY_URL",
+      expectedPath: "/healthcheck",
+      headers: { accept: "application/json" },
+      expectedStatuses: [200],
+      predicates: [{ pointer: "/status", equals: "ok" }],
+      maxBytes: 16_384,
+    },
+  },
+  {
+    ...common,
+    id: "sfs-worker",
+    projectId: "smartflowsocial",
+    kind: "signed_heartbeat",
+    displayName: "SmartFlowSocial worker loop",
+    enableVar: "ENABLE_SFS_WORKER",
+    severity: "critical",
+    incidentOnDegraded: true,
+    runbookPath: "/smartflowsocial/worker",
+  },
+  {
+    ...common,
+    id: "sfs-blossom",
+    projectId: "smartflowsocial",
+    kind: "http_json",
+    displayName: "Blossom gateway readiness",
+    enableVar: "ENABLE_SFS_BLOSSOM",
+    severity: "critical",
+    incidentOnDegraded: false,
+    runbookPath: "/smartflowsocial/blossom",
+    http: {
+      urlVar: "SFS_BLOSSOM_READY_URL",
+      expectedPath: "/ready",
+      headers: {},
+      expectedStatuses: [200],
+      predicates: [{ pointer: "/status", equals: "ready" }],
+      maxBytes: 16_384,
+    },
+  },
+  {
+    ...common,
+    id: "sfs-blastr",
+    projectId: "smartflowsocial",
+    kind: "http_json",
+    displayName: "Blastr readiness",
+    enableVar: "ENABLE_SFS_BLASTR",
+    severity: "warning",
+    incidentOnDegraded: false,
+    runbookPath: "/smartflowsocial/blastr",
+    http: {
+      urlVar: "SFS_BLASTR_READY_URL",
+      expectedPath: "/ready",
+      headers: {},
+      expectedStatuses: [200],
+      predicates: [{ pointer: "/status", equals: "ok" }],
+      maxBytes: 16_384,
+    },
+  },
+  {
+    ...common,
+    id: "sfs-alby-hub",
+    projectId: "smartflowsocial",
+    kind: "alby_hub",
+    displayName: "Alby Hub",
+    enableVar: "ENABLE_SFS_ALBY",
+    severity: "critical",
+    incidentOnDegraded: true,
+    runbookPath: "/smartflowsocial/alby-hub",
+    versionVendor: "getAlby/hub",
+  },
+  {
+    ...common,
+    id: "sfs-btcpay",
+    projectId: "smartflowsocial",
+    kind: "btcpay",
+    displayName: "BTCPay Server",
+    enableVar: "ENABLE_SFS_BTCPAY",
+    severity: "critical",
+    incidentOnDegraded: true,
+    runbookPath: "/smartflowsocial/btcpay",
+    versionVendor: "btcpayserver/btcpayserver",
+  },
+  {
+    ...common,
+    id: "nostrmash-api",
+    projectId: "nostrmash",
+    kind: "http_json",
+    displayName: "NostrMash API readiness",
+    enableVar: "ENABLE_NOSTRMASH_API",
+    severity: "critical",
+    incidentOnDegraded: false,
+    runbookPath: "/nostrmash/api",
+    http: {
+      urlVar: "NOSTRMASH_API_READY_URL",
+      expectedPath: "/ready",
+      headers: {},
+      expectedStatuses: [200],
+      predicates: [{ pointer: "/status", equals: "ready" }],
+      maxBytes: 8_192,
+    },
+  },
+  {
+    ...common,
+    id: "nostrmash-ingestor",
+    projectId: "nostrmash",
+    kind: "signed_heartbeat",
+    displayName: "NostrMash ingestor loop",
+    enableVar: "ENABLE_NOSTRMASH_INGESTOR",
+    severity: "critical",
+    incidentOnDegraded: true,
+    runbookPath: "/nostrmash/ingestor",
+  },
+  {
+    ...common,
+    id: "nostrmash-worker",
+    projectId: "nostrmash",
+    kind: "signed_heartbeat",
+    displayName: "NostrMash worker loop",
+    enableVar: "ENABLE_NOSTRMASH_WORKER",
+    severity: "critical",
+    incidentOnDegraded: true,
+    runbookPath: "/nostrmash/worker",
+  },
+];
+
+export function monitorById(id: string): MonitorDefinition | null {
+  return MONITORS.find((monitor) => monitor.id === id) ?? null;
+}
+
+export function enabledMonitors(env: Env): MonitorDefinition[] {
+  return MONITORS.filter((monitor) => readString(env, monitor.enableVar) === "true");
+}

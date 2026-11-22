@@ -1,0 +1,21 @@
+# Copy to .dev.vars for `wrangler dev`. Leave unused secrets empty.
+# Never commit .dev.vars. These are names only.
+
+OPERATOR_TOKEN=
+STATUS_SIGNING_SECRET=
+SFS_BOT_NSEC=
+NOSTRMASH_BOT_NSEC=
+HEARTBEAT_KEYS=
+HEARTBEAT_KEYS_PREVIOUS=
+ALBY_AUTH_TOKEN=
+BTCPAY_API_KEY=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_IDS=
+GITHUB_TOKEN=
+
+# Optional non-secret overrides. Real service URLs stay out of git.
+# ADMIN_NPUB=npub1...
+# PROJECT_RECIPIENTS={"smartflowsocial":"npub1...","nostrmash":"npub1..."}
+# BOOTSTRAP_RELAYS=wss://relay.example,wss://relay-two.example
+# ENABLE_SFS_WEB=false
+# SFS_WEB_READY_URL=https://app.example/healthcheck
