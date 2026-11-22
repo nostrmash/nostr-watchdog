@@ -1,0 +1,231 @@
+import type { NostrEvent } from "nostr-tools/pure";
+
+import {
+  buildGiftWrap,
+  discoverInbox,
+  publishGiftWrap,
+  recipientPubkey,
+  senderKeyFromNsec,
+  workersRelayConnect,
+} from "../alerts/nip17";
+import { sendTelegram, telegramChat } from "../alerts/telegram";
+import { PROJECTS } from "../config/projects";
+import { projectRecipient } from "../config/projects";
+import type { Settings } from "../config/settings";
+import type { Dependencies } from "../deps";
+import { log, readString } from "../runtime";
+import {
+  claimOutbox,
+  finishDelivery,
+  insertAlert,
+  relayCache,
+  saveEnvelope,
+  saveRelayCache,
+} from "../state/store";
+import type { AlertDraft, OutboxRow, ProjectId } from "../types";
+
+const MAX_ATTEMPTS = 8;
+
+export async function dispatchDue(env: Env, deps: Dependencies, settings: Settings): Promise<void> {
+  if (!settings.alertsEnabled) return;
+  const now = deps.now();
+  const rows = await claimOutbox(env.DB, now, now + 30_000);
+  for (const row of rows) {
+    try {
+      await deliver(env, deps, settings, row);
+    } catch {
+      await finishDelivery(env.DB, {
+        id: row.id,
+        state: nextState(row.attempt_count + 1),
+        attemptCount: row.attempt_count + 1,
+        nextAttemptAt: now + backoff(row.attempt_count + 1),
+        error: "delivery_failed",
+        now,
+      });
+      log("error", "delivery_failed", { alert: row.id, destination: row.destination });
+    }
+  }
+}
+
+export async function deliver(
+  env: Env,
+  deps: Dependencies,
+  settings: Settings,
+  row: OutboxRow,
+): Promise<OutboxRow["state"]> {
+  const now = deps.now();
+  const attempt = row.attempt_count + 1;
+  if (row.destination === "telegram") {
+    const chat = telegramChat(readString(env, "TELEGRAM_CHAT_IDS"), row.project_id);
+    const sent = chat
+      ? await sendTelegram({
+          token: readString(env, "TELEGRAM_BOT_TOKEN"),
+          chatId: chat,
+          text: row.payload_text,
+          fetch: deps.fetch,
+          timeoutMs: settings.timeoutMs,
+        })
+      : "failed";
+    const state = sent === "accepted" ? "relay_accepted" : nextState(attempt);
+    await finishDelivery(env.DB, {
+      id: row.id,
+      state,
+      attemptCount: attempt,
+      nextAttemptAt: now + backoff(attempt),
+      error: sent === "accepted" ? null : "telegram_failed",
+      now,
+    });
+    return state;
+  }
+  const outcome = await deliverNostr(env, deps, settings, row);
+  const state = outcome.accepted ? "relay_accepted" : nextState(attempt, outcome.terminal === true);
+  await finishDelivery(env.DB, {
+    id: row.id,
+    state,
+    attemptCount: attempt,
+    nextAttemptAt: now + backoff(attempt),
+    error: outcome.error,
+    now,
+  });
+  if (
+    !outcome.accepted &&
+    settings.telegramMode === "nostr_fallback" &&
+    row.severity === "critical"
+  ) {
+    await enqueueFallback(env, row, now);
+  }
+  return state;
+}
+
+async function deliverNostr(
+  env: Env,
+  deps: Dependencies,
+  settings: Settings,
+  row: OutboxRow,
+): Promise<{ accepted: boolean; error: string | null; terminal?: boolean }> {
+  if (!isProject(row.project_id))
+    return { accepted: false, error: "project_invalid", terminal: true };
+  const project = PROJECTS[row.project_id];
+  const nsec = readString(env, project.senderSecret);
+  if (nsec === "") return { accepted: false, error: "sender_key_missing", terminal: true };
+  let secret: Uint8Array;
+  try {
+    secret = senderKeyFromNsec(nsec);
+  } catch {
+    return { accepted: false, error: "sender_key_invalid", terminal: true };
+  }
+  const recipientRaw = projectRecipient(env, project.id);
+  if (!recipientRaw) return { accepted: false, error: "recipient_missing", terminal: true };
+  let recipient: string;
+  try {
+    recipient = recipientPubkey(recipientRaw);
+  } catch {
+    return { accepted: false, error: "recipient_invalid", terminal: true };
+  }
+  const now = deps.now();
+  const cached = await relayCache(env.DB, recipient, now);
+  let relays = cached && !cached.negative ? cached.relays : null;
+  if (cached?.negative)
+    return { accepted: false, error: "recipient_inbox_missing", terminal: true };
+  const connect = deps.connectRelay ?? workersRelayConnect(deps.fetch, settings.timeoutMs);
+  if (!relays) {
+    if (settings.bootstrap.length === 0)
+      return { accepted: false, error: "bootstrap_relays_missing", terminal: true };
+    const found = await discoverInbox({
+      author: recipient,
+      bootstrap: settings.bootstrap,
+      connect,
+      timeoutMs: settings.timeoutMs,
+    });
+    if (found.relays.length === 0) {
+      if (found.definitiveEmpty) {
+        await saveRelayCache(
+          env.DB,
+          recipient,
+          [],
+          true,
+          now,
+          now + Math.min(settings.relayTtlSeconds, 300) * 1000,
+        );
+        return { accepted: false, error: "recipient_inbox_missing", terminal: true };
+      }
+      return { accepted: false, error: "inbox_discovery_failed" };
+    }
+    relays = found.relays;
+    await saveRelayCache(
+      env.DB,
+      recipient,
+      relays,
+      false,
+      now,
+      now + settings.relayTtlSeconds * 1000,
+    );
+  }
+  const event = await envelopeFor(env, row, secret, recipient, project.contactName);
+  if (!event) return { accepted: false, error: "envelope_invalid", terminal: true };
+  const published = await publishGiftWrap({
+    event,
+    relays,
+    connect,
+    timeoutMs: settings.timeoutMs,
+  });
+  if (published.accepted.length === 0) return { accepted: false, error: "relay_rejected" };
+  return { accepted: true, error: published.failed.length > 0 ? "partial_relay_acceptance" : null };
+}
+
+async function envelopeFor(
+  env: Env,
+  row: OutboxRow,
+  secret: Uint8Array,
+  recipient: string,
+  title: string,
+): Promise<NostrEvent | null> {
+  if (row.envelope_json) {
+    try {
+      const parsed = JSON.parse(row.envelope_json) as NostrEvent;
+      if (parsed.kind !== 1059 || typeof parsed.id !== "string") return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+  const event = buildGiftWrap({
+    senderSecret: secret,
+    recipient,
+    message: row.payload_text,
+    title,
+    createdAt: Math.floor(row.created_at / 1000),
+  });
+  await saveEnvelope(env.DB, row.id, JSON.stringify(event), Date.now());
+  return event;
+}
+
+async function enqueueFallback(env: Env, row: OutboxRow, now: number): Promise<void> {
+  if (!isProject(row.project_id)) return;
+  const chat = telegramChat(readString(env, "TELEGRAM_CHAT_IDS"), row.project_id);
+  if (!chat || readString(env, "TELEGRAM_BOT_TOKEN") === "") return;
+  const alert: AlertDraft = {
+    id: `alt_${crypto.randomUUID()}`,
+    alertClass: row.alert_class as AlertDraft["alertClass"],
+    incidentId: row.incident_id,
+    monitorId: row.monitor_id,
+    projectId: row.project_id,
+    dedupeKey: `fallback:${row.dedupe_key}`,
+    destination: "telegram",
+    severity: "critical",
+    text: row.payload_text,
+  };
+  await insertAlert(env.DB, alert, now);
+}
+
+function nextState(attempt: number, terminal = false): "retrying" | "failed" {
+  return terminal || attempt >= MAX_ATTEMPTS ? "failed" : "retrying";
+}
+
+function backoff(attempt: number): number {
+  return Math.min(3_600_000, 30_000 * 2 ** Math.max(0, attempt - 1));
+}
+
+function isProject(value: string): value is ProjectId {
+  return value === "smartflowsocial" || value === "nostrmash";
+}

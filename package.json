@@ -1,0 +1,42 @@
+{
+  "name": "nostr-watchdog",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Unlicense",
+  "type": "module",
+  "packageManager": "pnpm@12.21.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tests/tsconfig.json",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "cf-typegen": "wrangler types",
+    "migrate:local": "wrangler d1 migrations apply nostr-watchdog --local",
+    "migrate:staging": "wrangler d1 migrations apply nostr-watchdog-staging --env staging --remote",
+    "migrate:production": "wrangler d1 migrations apply nostr-watchdog --env production --remote",
+    "deploy:staging": "wrangler deploy --env staging",
+    "deploy:production": "wrangler deploy --env production",
+    "build": "wrangler deploy --dry-run --outdir dist --env=",
+    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build"
+  },
+  "dependencies": {
+    "nostr-tools": "^2.26.1"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.6.1",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "22.19.1",
+    "eslint": "^10.15.0",
+    "prettier": "^3.10.1",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.73.0",
+    "vitest": "~4.1.12",
+    "wrangler": "^4.166.0"
+  }
+}
