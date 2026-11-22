@@ -13,6 +13,9 @@ This is a release candidate. It is not a published GitHub release and it has not
 - Treat public-only BTCPay health as incomplete coverage. Keep Alby Hub monitoring read-only.
 - Add disabled-by-default read and publish gateway monitors. Add retention for closed incidents, accepted alerts, and dead letters.
 - Keep TypeScript on 6.0.3, which is the newest stable release `typescript-eslint` 8.73 supports. Do not take the TypeScript 7 Dependabot update until the linter supports it.
+- Report `alerts_disabled` when monitoring is on and `ALERTS_ENABLED=false`. HTTP 200 remains reserved for `healthy`.
+- Record per-vendor update success separately from the hourly cron finishing. A failed or stale vendor check degrades `/v1/status` and does not replace the last verified advisory.
+- Add optional `STATUS_READ_TOKEN` for an external status probe, and optional `/health/deep` monitors for the read and publish gateways.
 
 ## 0.1.0
 

@@ -87,7 +87,7 @@ function healthz(env: Env): Response {
 }
 
 async function status(request: Request, env: Env, deps: Dependencies): Promise<Response> {
-  const auth = await authorize(request, env);
+  const auth = await authorize(request, env, "status");
   if (auth !== "ok") return authResponse(auth);
   try {
     const settings = loadSettings(env);
@@ -337,12 +337,19 @@ async function incidentAction(
   return json({ id, monitorId: incident.monitorId, status: "silenced" });
 }
 
-async function authorize(request: Request, env: Env): Promise<"ok" | "missing" | "rejected"> {
-  const configured = readString(env, "OPERATOR_TOKEN");
-  if (configured === "") return "missing";
+async function authorize(
+  request: Request,
+  env: Env,
+  scope: "operator" | "status" = "operator",
+): Promise<"ok" | "missing" | "rejected"> {
+  const operator = readString(env, "OPERATOR_TOKEN");
+  const reader = scope === "status" ? readString(env, "STATUS_READ_TOKEN") : "";
+  if (operator === "" && reader === "") return "missing";
   const header = request.headers.get("authorization") ?? "";
   const token = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
-  return (await secretsEqual(configured, token)) ? "ok" : "rejected";
+  if (operator !== "" && (await secretsEqual(operator, token))) return "ok";
+  if (reader !== "" && (await secretsEqual(reader, token))) return "ok";
+  return "rejected";
 }
 
 function authResponse(result: "missing" | "rejected"): Response {

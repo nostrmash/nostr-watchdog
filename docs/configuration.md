@@ -44,18 +44,19 @@ The tree ships sample monitors with every enable flag set to `false`. Their URLs
 
 ## Secrets
 
-| Name                      | When you need it               | Purpose                                                          |
-| ------------------------- | ------------------------------ | ---------------------------------------------------------------- |
-| `OPERATOR_TOKEN`          | operator routes                | Bearer token for diagnostics, status, silence, and ack           |
-| `STATUS_SIGNING_SECRET`   | a signed status body           | HMAC key for `X-Watchdog-Signature` on `GET /v1/status`          |
-| sender `nsec` bindings    | sending for that project       | Dedicated bot key. One binding per project                       |
-| `HEARTBEAT_KEYS`          | a heartbeat monitor is enabled | JSON object of monitor id to a secret of at least 32 characters  |
-| `HEARTBEAT_KEYS_PREVIOUS` | key rotation                   | Same shape. Use `{}` when nothing is rotating                    |
-| `ALBY_AUTH_TOKEN`         | an `alby_hub` monitor          | Read-only Hub JWT. Empty until then                              |
-| `BTCPAY_API_KEY`          | version and processor detail   | Separate read-only Greenfield key. Empty skips server info       |
-| `TELEGRAM_BOT_TOKEN`      | Telegram                       | Bot token. Empty disables Telegram                               |
-| `TELEGRAM_CHAT_IDS`       | Telegram                       | JSON object of project id to a numeric chat id                   |
-| `GITHUB_TOKEN`            | optional                       | Raises the GitHub API rate limit. Empty uses the anonymous limit |
+| Name                      | When you need it               | Purpose                                                                                  |
+| ------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------- |
+| `OPERATOR_TOKEN`          | operator routes                | Bearer token for diagnostics, status, silence, and ack                                   |
+| `STATUS_READ_TOKEN`       | `GET /v1/status` only          | Optional bearer for an external uptime check. It cannot ack, retry, or send a test alert |
+| `STATUS_SIGNING_SECRET`   | a signed status body           | HMAC key for `X-Watchdog-Signature` on `GET /v1/status`                                  |
+| sender `nsec` bindings    | sending for that project       | Dedicated bot key. One binding per project                                               |
+| `HEARTBEAT_KEYS`          | a heartbeat monitor is enabled | JSON object of monitor id to a secret of at least 32 characters                          |
+| `HEARTBEAT_KEYS_PREVIOUS` | key rotation                   | Same shape. Use `{}` when nothing is rotating                                            |
+| `ALBY_AUTH_TOKEN`         | an `alby_hub` monitor          | Read-only Hub JWT. Empty until then                                                      |
+| `BTCPAY_API_KEY`          | version and processor detail   | Separate read-only Greenfield key. Empty skips server info                               |
+| `TELEGRAM_BOT_TOKEN`      | Telegram                       | Bot token. Empty disables Telegram                                                       |
+| `TELEGRAM_CHAT_IDS`       | Telegram                       | JSON object of project id to a numeric chat id                                           |
+| `GITHUB_TOKEN`            | optional                       | Raises the GitHub API rate limit. Empty uses the anonymous limit                         |
 
 `secrets.required` makes Wrangler refuse to start when a name is missing. An empty value is still present. Heartbeats fail closed when `HEARTBEAT_KEYS` is empty. Vendor calls that need a token report `misconfigured` instead of healthy.
 

@@ -11,9 +11,11 @@ import {
   installedVersion,
   markRun,
   readUpstream,
+  readVendorCheck,
   readVersion,
   releaseLease,
   writeUpstream,
+  writeVendorCheck,
   writeVersion,
 } from "../state/store";
 import type { AdvisoryRef, SecurityStatus } from "../updates/advisories";
@@ -36,16 +38,39 @@ export async function runUpdateCycle(env: Env, deps: Dependencies): Promise<void
   if (!(await acquireLease(env.DB, "updates", owner, started + 10 * 60_000, started))) return;
   try {
     await markRun(env.DB, "updates", started, null, null);
-    for (const monitor of enabledMonitors(env)) {
-      if (!monitor.versionVendor) continue;
+    const vendors = enabledMonitors(env).filter((monitor) => monitor.versionVendor);
+    let failed = 0;
+    for (const monitor of vendors) {
+      const vendorId = monitor.versionVendor;
+      if (!vendorId) continue;
+      let outcome: VendorCheckOutcome;
       try {
-        await checkVendor(env, deps, settings, monitor, monitor.versionVendor);
+        outcome = await checkVendor(env, deps, settings, monitor, vendorId);
       } catch {
+        outcome = {
+          vendor: vendorId,
+          monitorId: monitor.id,
+          succeeded: false,
+          releasesFresh: false,
+          advisoriesFresh: false,
+          errorCode: "vendor_check_failed",
+          checkedAt: deps.now(),
+        };
         log("error", "vendor_check_failed", { monitor: monitor.id });
       }
+      if (!outcome.succeeded) failed += 1;
+      await recordVendorOutcome(env, outcome);
     }
     await dispatchDue(env, deps, settings);
-    await markRun(env.DB, "updates", null, deps.now(), null);
+    const finished = deps.now();
+    await markRun(
+      env.DB,
+      "updates",
+      null,
+      finished,
+      failed > 0 ? "vendor_checks_failed" : null,
+      failed > 0 ? null : finished,
+    );
   } catch {
     await markRun(env.DB, "updates", null, deps.now(), "cycle_failed");
     log("error", "updates_failed", {});
@@ -54,36 +79,58 @@ export async function runUpdateCycle(env: Env, deps: Dependencies): Promise<void
   }
 }
 
+interface VendorCheckOutcome {
+  vendor: VendorId;
+  monitorId: string;
+  succeeded: boolean;
+  releasesFresh: boolean;
+  advisoriesFresh: boolean;
+  errorCode: string | null;
+  checkedAt: number;
+}
+
+interface Feed<T> {
+  value: T | null;
+  fresh: boolean;
+  errorCode: string | null;
+}
+
 async function checkVendor(
   env: Env,
   deps: Dependencies,
   settings: Settings,
   monitor: MonitorDefinition,
   vendorId: VendorId,
-): Promise<void> {
+): Promise<VendorCheckOutcome> {
   const vendor = VENDORS[vendorId];
   const now = deps.now();
   const installed = await installedVersion(env.DB, monitor.id);
   const releases = await loadReleases(env, deps, settings, vendorId, vendor, now);
   const advisoryFeed = await loadAdvisories(env, deps, settings, vendorId, vendor, now);
   const previous = await readVersion(env.DB, monitor.id);
-  const latest = releases ? latestStable(releases) : null;
-  const comparison = installed && latest ? updateAvailable(installed, latest.tag) : null;
+  const latest = releases.value ? latestStable(releases.value) : null;
+  const comparison =
+    releases.fresh && installed && latest ? updateAvailable(installed, latest.tag) : null;
   const assessment = assessSecurity({
     vendorId,
     installed,
-    advisories: advisoryFeed.advisories,
-    releases,
+    advisories: advisoryFeed.value,
+    releases: releases.value,
   });
-  const securityStatus: SecurityStatus = assessment.status;
+  const fresh = releases.fresh && advisoryFeed.fresh;
+  const keepPrevious = !fresh && previous && assessment.status === "unknown";
+  const securityStatus: SecurityStatus = keepPrevious
+    ? (previous.securityStatus as SecurityStatus)
+    : assessment.status;
   const alerts: AlertDraft[] = [];
   let notice = previous?.noticeFingerprint ?? null;
-  if (comparison === true && latest && previous?.latest !== latest.tag) {
+  if (fresh && comparison === true && latest && previous?.latest !== latest.tag) {
     alerts.push(versionAlert(monitor, installed ?? "", latest.tag, latest.url, now));
     notice = `update:${latest.tag}`;
   }
   const severity = alertSeverity(assessment.status);
   if (
+    fresh &&
     severity &&
     assessment.status !== "unknown" &&
     assessment.fingerprint !== previous?.advisoryFingerprint
@@ -110,14 +157,75 @@ async function checkVendor(
       latest: latest?.tag ?? previous?.latest ?? null,
       latestUrl: latest?.url ?? previous?.latestUrl ?? null,
       securityStatus,
-      advisoryFingerprint: advisoryFeed.failed
-        ? (previous?.advisoryFingerprint ?? null)
-        : assessment.fingerprint,
+      advisoryFingerprint: advisoryFeed.fresh
+        ? assessment.fingerprint
+        : (previous?.advisoryFingerprint ?? null),
       noticeFingerprint: notice,
     },
     now,
   );
-  for (const alert of alerts) await insertAlert(env.DB, alert, now);
+  if (fresh) {
+    for (const alert of alerts) await insertAlert(env.DB, alert, now);
+  }
+  const errorCode = fresh
+    ? installed
+      ? null
+      : "version_unavailable"
+    : (releases.errorCode ?? advisoryFeed.errorCode ?? "unavailable");
+  return {
+    vendor: vendorId,
+    monitorId: monitor.id,
+    succeeded: fresh,
+    releasesFresh: releases.fresh,
+    advisoriesFresh: advisoryFeed.fresh,
+    errorCode,
+    checkedAt: now,
+  };
+}
+
+async function recordVendorOutcome(env: Env, outcome: VendorCheckOutcome): Promise<void> {
+  const previous = await readVendorCheck(env.DB, outcome.monitorId);
+  const rateLimited = outcome.errorCode === "rate_limited";
+  const consecutiveFailures = outcome.succeeded
+    ? 0
+    : rateLimited
+      ? (previous?.consecutiveFailures ?? 0)
+      : (previous?.consecutiveFailures ?? 0) + 1;
+  await writeVendorCheck(
+    env.DB,
+    {
+      monitorId: outcome.monitorId,
+      vendor: outcome.vendor,
+      attemptedAt: outcome.checkedAt,
+      succeededAt: outcome.succeeded ? outcome.checkedAt : null,
+      releasesCheckedAt: outcome.releasesFresh ? outcome.checkedAt : null,
+      advisoriesCheckedAt: outcome.advisoriesFresh ? outcome.checkedAt : null,
+      releasesStale: !outcome.releasesFresh,
+      advisoriesStale: !outcome.advisoriesFresh,
+      errorCode: outcome.errorCode,
+      consecutiveFailures,
+    },
+    outcome.checkedAt,
+  );
+  if (!outcome.succeeded && !rateLimited && consecutiveFailures === 3) {
+    const monitor = enabledMonitors(env).find((item) => item.id === outcome.monitorId);
+    if (!monitor) return;
+    await insertAlert(
+      env.DB,
+      {
+        id: `alt_${crypto.randomUUID()}`,
+        alertClass: "integrity",
+        incidentId: null,
+        monitorId: monitor.id,
+        projectId: monitor.projectId,
+        dedupeKey: `integrity:${monitor.id}:vendor:${previous?.succeededAt ?? 0}`,
+        destination: "nostr",
+        severity: "warning",
+        text: `${PROJECTS[monitor.projectId].displayName} ${monitor.displayName} security checks failed ${consecutiveFailures} times (${outcome.errorCode ?? "unavailable"}). Cached advisories were kept.`,
+      },
+      outcome.checkedAt,
+    );
+  }
 }
 
 async function loadReleases(
@@ -127,10 +235,12 @@ async function loadReleases(
   vendorId: string,
   vendor: { owner: string; repo: string },
   now: number,
-): Promise<ReleaseRef[] | null> {
+): Promise<Feed<ReleaseRef[]>> {
   const key = `releases:${vendorId}`;
   const cache = await readUpstream(env.DB, key);
-  if (cache?.rateLimitedUntil && cache.rateLimitedUntil > now) return asReleases(cache.payload);
+  if (cache?.rateLimitedUntil && cache.rateLimitedUntil > now) {
+    return { value: asReleases(cache.payload), fresh: false, errorCode: "rate_limited" };
+  }
   const fetched = await fetchReleases({
     apiBase: settings.githubApi,
     owner: vendor.owner,
@@ -140,7 +250,9 @@ async function loadReleases(
     fetch: deps.fetch,
     timeoutMs: settings.timeoutMs,
   });
-  if (fetched.kind === "not_modified") return asReleases(cache?.payload);
+  if (fetched.kind === "not_modified") {
+    return { value: asReleases(cache?.payload), fresh: cache?.payload != null, errorCode: null };
+  }
   if (fetched.kind === "rate_limited") {
     await writeUpstream(env.DB, key, {
       etag: cache?.etag ?? null,
@@ -148,16 +260,18 @@ async function loadReleases(
       fetchedAt: cache?.fetchedAt ?? now,
       rateLimitedUntil: fetched.retryAt,
     });
-    return asReleases(cache?.payload);
+    return { value: asReleases(cache?.payload), fresh: false, errorCode: "rate_limited" };
   }
-  if (fetched.kind !== "ok" || !fetched.releases) return asReleases(cache?.payload);
+  if (fetched.kind !== "ok" || !fetched.releases) {
+    return { value: asReleases(cache?.payload), fresh: false, errorCode: "unavailable" };
+  }
   await writeUpstream(env.DB, key, {
     etag: fetched.etag,
     payload: fetched.releases,
     fetchedAt: now,
     rateLimitedUntil: null,
   });
-  return fetched.releases;
+  return { value: fetched.releases, fresh: true, errorCode: null };
 }
 
 async function loadAdvisories(
@@ -167,11 +281,12 @@ async function loadAdvisories(
   vendorId: string,
   vendor: { owner: string; repo: string },
   now: number,
-): Promise<{ advisories: AdvisoryRef[] | null; failed: boolean }> {
+): Promise<Feed<AdvisoryRef[]>> {
   const key = `advisories:${vendorId}`;
   const cache = await readUpstream(env.DB, key);
-  if (cache?.rateLimitedUntil && cache.rateLimitedUntil > now)
-    return { advisories: asAdvisories(cache.payload), failed: false };
+  if (cache?.rateLimitedUntil && cache.rateLimitedUntil > now) {
+    return { value: asAdvisories(cache.payload), fresh: false, errorCode: "rate_limited" };
+  }
   const fetched = await fetchAdvisories({
     apiBase: settings.githubApi,
     owner: vendor.owner,
@@ -181,8 +296,9 @@ async function loadAdvisories(
     fetch: deps.fetch,
     timeoutMs: settings.timeoutMs,
   });
-  if (fetched.kind === "not_modified")
-    return { advisories: asAdvisories(cache?.payload), failed: false };
+  if (fetched.kind === "not_modified") {
+    return { value: asAdvisories(cache?.payload), fresh: cache?.payload != null, errorCode: null };
+  }
   if (fetched.kind === "rate_limited") {
     await writeUpstream(env.DB, key, {
       etag: cache?.etag ?? null,
@@ -190,17 +306,18 @@ async function loadAdvisories(
       fetchedAt: cache?.fetchedAt ?? now,
       rateLimitedUntil: fetched.retryAt,
     });
-    return { advisories: asAdvisories(cache?.payload), failed: cache?.payload == null };
+    return { value: asAdvisories(cache?.payload), fresh: false, errorCode: "rate_limited" };
   }
-  if (fetched.kind !== "ok" || !fetched.advisories)
-    return { advisories: asAdvisories(cache?.payload), failed: true };
+  if (fetched.kind !== "ok" || !fetched.advisories) {
+    return { value: asAdvisories(cache?.payload), fresh: false, errorCode: "unavailable" };
+  }
   await writeUpstream(env.DB, key, {
     etag: fetched.etag,
     payload: fetched.advisories,
     fetchedAt: now,
     rateLimitedUntil: null,
   });
-  return { advisories: fetched.advisories, failed: false };
+  return { value: fetched.advisories, fresh: true, errorCode: null };
 }
 
 function versionAlert(

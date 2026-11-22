@@ -2,17 +2,17 @@
 
 ## Routes
 
-| Route                                     | Auth            | Returns                                                                                                                                                              |
-| ----------------------------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /healthz`                            | none            | `status`, service name, and whether the cron flag is on. No D1 read. HTTP 200 means the process answered                                                             |
-| `GET /v1/status`                          | operator bearer | Operational contract `watchdog-status-v1`. HTTP 200 only when `status` is `healthy`. Other states return 503. The body is signed when `STATUS_SIGNING_SECRET` is set |
-| `GET /v1/outbox/failed`                   | operator bearer | Up to 50 dead letters. Payload text is truncated. It is the plaintext the Worker stored, not the gift wrap                                                           |
-| `POST /v1/outbox/:id/retry`               | operator bearer | Requeues one `failed` row and keeps its signed envelope. The id matches `alt_` plus hex                                                                              |
-| `POST /v1/heartbeats/:monitorId`          | HMAC            | `{ "status": "ok" }` or a generic error                                                                                                                              |
-| `POST /v1/diagnostics/test-alert`         | operator bearer | Sends one NIP-17 test for a JSON body `{"projectId":"<id>"}`. Three per project per hour                                                                             |
-| `GET /v1/diagnostics/relays?project=<id>` | operator bearer | Discovered inbox relay URLs and a non-secret error code                                                                                                              |
-| `POST /v1/incidents/:id/ack`              | operator bearer | Stops reminders for that open incident                                                                                                                               |
-| `POST /v1/incidents/:id/silence`          | operator bearer | Optional JSON `{ "minutes": 60 }`. Stops reminders until then                                                                                                        |
+| Route                                     | Auth                         | Returns                                                                                                                                                              |
+| ----------------------------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /healthz`                            | none                         | `status`, service name, and whether the cron flag is on. No D1 read. HTTP 200 means the process answered                                                             |
+| `GET /v1/status`                          | operator or read-only bearer | Operational contract `watchdog-status-v1`. HTTP 200 only when `status` is `healthy`. Other states return 503. The body is signed when `STATUS_SIGNING_SECRET` is set |
+| `GET /v1/outbox/failed`                   | operator bearer              | Up to 50 dead letters. Payload text is truncated. It is the plaintext the Worker stored, not the gift wrap                                                           |
+| `POST /v1/outbox/:id/retry`               | operator bearer              | Requeues one `failed` row and keeps its signed envelope. The id matches `alt_` plus hex                                                                              |
+| `POST /v1/heartbeats/:monitorId`          | HMAC                         | `{ "status": "ok" }` or a generic error                                                                                                                              |
+| `POST /v1/diagnostics/test-alert`         | operator bearer              | Sends one NIP-17 test for a JSON body `{"projectId":"<id>"}`. Three per project per hour                                                                             |
+| `GET /v1/diagnostics/relays?project=<id>` | operator bearer              | Discovered inbox relay URLs and a non-secret error code                                                                                                              |
+| `POST /v1/incidents/:id/ack`              | operator bearer              | Stops reminders for that open incident                                                                                                                               |
+| `POST /v1/incidents/:id/silence`          | operator bearer              | Optional JSON `{ "minutes": 60 }`. Stops reminders until then                                                                                                        |
 
 Query strings are rejected except on the relay diagnostic. There is no browser UI.
 
@@ -20,14 +20,15 @@ Query strings are rejected except on the relay diagnostic. There is no browser U
 
 `status` in the body is one of:
 
-| Value            | Meaning                                                                                                                                     |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `healthy`        | Monitoring is on, at least one monitor is enabled, required alert destinations are present, and the check cycle is current                  |
-| `disabled`       | `WATCHDOG_ENABLED=false`                                                                                                                    |
-| `not_configured` | Monitoring is on and every monitor is disabled                                                                                              |
-| `misconfigured`  | Alerts are on without a sender, recipient, or bootstrap relays, or an enabled monitor is `misconfigured`                                    |
-| `degraded`       | The last check is older than `SCHEDULER_STALE_SECONDS`, the last check failed, a dead letter exists, or more than three alerts are retrying |
-| `unhealthy`      | No completed check, or the last check is older than three times `SCHEDULER_STALE_SECONDS`                                                   |
+| Value             | Meaning                                                                                                                                             |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `healthy`         | Monitoring is on, alerts are on, required destinations are present, the check cycle is current, and every enabled vendor check succeeded recently   |
+| `alerts_disabled` | Monitoring is otherwise healthy, but `ALERTS_ENABLED=false`. Failures can still be recorded. This is not a fully operating watchdog                 |
+| `disabled`        | `WATCHDOG_ENABLED=false`                                                                                                                            |
+| `not_configured`  | Monitoring is on and every monitor is disabled                                                                                                      |
+| `misconfigured`   | Alerts are on without a sender, recipient, or bootstrap relays, or an enabled monitor is `misconfigured`                                            |
+| `degraded`        | The check cycle is slightly stale or failed, delivery is retrying or dead-lettered, or a required security-update check is overdue or failing       |
+| `unhealthy`       | No completed check, the last check is older than three times `SCHEDULER_STALE_SECONDS`, or the last successful vendor cycle is older than six hours |
 
 Customer `down` and `degraded` monitors stay in the body and in incidents. They do not by themselves change this status, so a service outage and a stopped watchdog are separate pages. The body also reports monitor counts, cycle age, open incidents, pending and retrying alerts, dead letters, stale or missing heartbeats, and recent delivery error codes. It does not include secrets.
 

@@ -2,6 +2,7 @@
 # Never commit .dev.vars. These are names only.
 
 OPERATOR_TOKEN=
+STATUS_READ_TOKEN=
 STATUS_SIGNING_SECRET=
 SFS_BOT_NSEC=
 NOSTRMASH_BOT_NSEC=

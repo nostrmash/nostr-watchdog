@@ -35,7 +35,7 @@ wrangler d1 migrations apply nostr-watchdog-staging --env staging --remote
 wrangler d1 migrations apply nostr-watchdog --env production --remote
 ```
 
-`pnpm migrate:staging` and `pnpm migrate:production` are the same remote commands. They are not run by CI. `0002_hardening.sql` adds columns and replaces the one-open-incident index with one open incident per monitor and kind. It applies to an empty database and to a database that already has `0001_init.sql`. It does not require deleting production data. Do not run it twice by hand: D1 records applied migrations.
+`pnpm migrate:staging` and `pnpm migrate:production` are the same remote commands. They are not run by CI. `0002_hardening.sql` adds columns and replaces the one-open-incident index with one open incident per monitor and kind. `0003_vendor_checks.sql` adds `scheduler_runs.last_success_at` and the `vendor_checks` table. Both apply to an empty database and to a database that already has `0001_init.sql`. They do not delete rows. Apply `0003` before deploying the code that reads those columns. Do not run a migration twice by hand: D1 records applied migrations. The ids in `wrangler.jsonc` are placeholders until you paste the ids these commands return. Do not invent ids.
 
 ## Secrets and environments
 
@@ -43,6 +43,7 @@ Use a different sender key, operator token, and heartbeat secret in each environ
 
 ```sh
 wrangler secret put OPERATOR_TOKEN --env staging
+wrangler secret put STATUS_READ_TOKEN --env staging
 wrangler secret put SFS_BOT_NSEC --env staging
 # repeat for every name in docs/configuration.md, then again for production
 ```
@@ -64,7 +65,7 @@ Deploy production only after staging has been checked:
 pnpm deploy:production
 ```
 
-To stop probes without deleting the Worker, set `WATCHDOG_ENABLED` to `false` and deploy again. To keep recording incidents but stop delivery, set `ALERTS_ENABLED` to `false`. To stop one service, set its enable flag to `false`. A disabled monitor is skipped, and a skipped check does not close an open incident. Silence that incident from the operator route if reminders should stop.
+To stop probes without deleting the Worker, set `WATCHDOG_ENABLED` to `false` and deploy again. To keep recording incidents but stop delivery, set `ALERTS_ENABLED` to `false`. `/v1/status` then reports `alerts_disabled` and returns HTTP 503. To stop one service, set its enable flag to `false`. A disabled monitor is skipped, and a skipped check does not close an open incident. Silence that incident from the operator route if reminders should stop.
 
 `wrangler rollback --env staging` or `wrangler rollback --env production` restores the previous Worker version. It does not roll back D1 rows. Old outbox rows can still be delivered if they are `queued` or `retrying` and alerts are enabled.
 
@@ -74,4 +75,4 @@ The hour cron requests releases and advisories for each enabled monitor that nam
 
 ## An external checker
 
-Run one HTTPS check from outside Cloudflare against `GET /v1/status` with the operator bearer token. Page when the response is not HTTP 200. That covers the Worker being unreachable, monitoring disabled, no monitors enabled, a stale scheduler, dead letters, and missing alert configuration. `/healthz` only answers whether the isolate is up. Verifying `X-Watchdog-Signature` is optional and catches a proxy that replaces the body. This repository does not ship that second checker. A hosted uptime probe is enough. Do not point it at a customer service to test an outage.
+Run one HTTPS check from outside Cloudflare against `GET /v1/status`. Prefer `STATUS_READ_TOKEN` for that probe. It can read status and cannot acknowledge incidents, retry alerts, or send diagnostics. `OPERATOR_TOKEN` also works and should stay with the operator. Page when the response is not HTTP 200. That covers the Worker being unreachable, monitoring disabled, alerts disabled, no monitors enabled, a stale scheduler, a stale security-update cycle, dead letters, and missing alert configuration. A customer service being down does not by itself make this status non-200. `/healthz` only answers whether the isolate is up. Verifying `X-Watchdog-Signature` is optional and catches a proxy that replaces the body. This repository does not ship that second checker. A hosted uptime probe is enough. Do not point it at a customer service to test an outage.
