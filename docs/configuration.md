@@ -78,6 +78,9 @@ Rotation: copy the current JSON to `HEARTBEAT_KEYS_PREVIOUS`, put the new JSON i
 | `FAILURE_THRESHOLD`          | empty                    | Empty uses each monitor's own threshold, which defaults to 2                                        |
 | `RECOVERY_THRESHOLD`         | empty                    | Empty uses 2                                                                                        |
 | `CRITICAL_REMINDER_SECONDS`  | `0`                      | `0` disables reminders. Otherwise the gap between critical outage reminders                         |
+| `UNKNOWN_THRESHOLD`          | `5`                      | Consecutive `unknown` samples before one monitoring-integrity warning. Clamped to 2–100             |
+| `DELIVERY_CLAIM_MS`          | `120000`                 | Outbox claim lease. Clamped to 30–300 seconds. Extended again before publish                        |
+| `SCHEDULER_STALE_SECONDS`    | `180`                    | Age of the last check cycle before `/v1/status` becomes degraded. Three times that is unhealthy     |
 | `RELAY_LIST_TTL_SECONDS`     | `3600`                   | Kind 10050 cache lifetime                                                                           |
 | `HEARTBEAT_MAX_SKEW_SECONDS` | `300`                    | Accepted clock skew for signed heartbeats                                                           |
 | `HEARTBEAT_STALE_SECONDS`    | `180`                    | Age after which a heartbeat or loop timestamp is down                                               |
@@ -106,7 +109,7 @@ The adapter does not log node internals.
 
 ## BTCPay Server
 
-`GET /api/v1/health` is called without a key. `synchronized: true` and no key is healthy, and the summary says server info was not checked. `synchronized: false` is degraded.
+`GET /api/v1/health` is called without a key. `synchronized: true` and no key is `degraded` with `coverage_incomplete`: the public endpoint answered, and version and processor status were not checked. `synchronized: false` is degraded. A public-only check is not full monitoring.
 
 With `BTCPAY_API_KEY`, the Worker also calls `GET /api/v1/server/info`. Create that key as its own read-only credential. Do not reuse a key that can create invoices or move funds.
 

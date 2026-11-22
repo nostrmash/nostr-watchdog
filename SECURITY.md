@@ -31,4 +31,4 @@ We acknowledge and triage as quickly as we can, then coordinate disclosure with 
 
 ## Dependencies
 
-Dependabot opens weekly pull requests for npm and GitHub Actions. Production dependencies are also audited at high severity in CI. Review changelog notes before merging a dependency update. Major upgrades need an explicit look at breaking changes.
+Dependabot opens weekly pull requests for npm and GitHub Actions. TypeScript updates at 6.1.0 or newer are ignored until `typescript-eslint` declares support. Production dependencies are also audited at high severity in CI. Review changelog notes before merging a dependency update. Major upgrades need an explicit look at breaking changes. A grouped development update that fails lint should stay unmerged.
