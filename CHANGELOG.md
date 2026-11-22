@@ -16,6 +16,10 @@ This is a release candidate. It is not a published GitHub release and it has not
 - Report `alerts_disabled` when monitoring is on and `ALERTS_ENABLED=false`. HTTP 200 remains reserved for `healthy`.
 - Record per-vendor update success separately from the hourly cron finishing. A failed or stale vendor check degrades `/v1/status` and does not replace the last verified advisory.
 - Add optional `STATUS_READ_TOKEN` for an external status probe, and optional `/health/deep` monitors for the read and publish gateways.
+- Send gateway deep probes with separate bearer secrets, and do not follow redirects on those requests.
+- Treat a publish-gateway deep probe as degraded when only some configured relays open.
+- Report a software release when the advisory feed is down, and keep verified vendor affected-range alerts usable during a GitHub outage.
+- Report incomplete security coverage when the installed version is unknown instead of calling that check successful.
 
 ## 0.1.0
 

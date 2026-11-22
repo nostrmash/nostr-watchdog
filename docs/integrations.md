@@ -64,7 +64,7 @@ The BullMQ process in `worker.ts` can emit a heartbeat for monitor `sfs-worker`.
 | `WATCHDOG_URL`         | Full `https` URL, including `/v1/heartbeats/sfs-worker`             |
 | `WATCHDOG_HMAC_SECRET` | The `HEARTBEAT_KEYS` value for `sfs-worker`, at least 32 characters |
 
-Unset either value and the worker does not call the watchdog. Every 30 seconds it reads waiting, active, delayed, and completed counts for the existing queues. An empty backlog is `idle: true`. A backlog uses the completed count as `progress`. The send times out after 3 seconds, retries once, and does not throw. There is no second background service and no event-ingestion API. User-facing DMs stay in SmartFlowSocial.
+Unset either value and the worker does not call the watchdog. Every 30 seconds it inspects the existing queues. Future-dated delayed jobs are not backlog. An empty queue is idle. Progress counts completions in that process, not BullMQ's retained completed-job count. A failed queue read sends nothing. The send times out after 3 seconds, retries once, and does not throw. There is no second background service and no event-ingestion API. User-facing DMs stay in SmartFlowSocial.
 
 Blossom `/ready` already reports database, storage, pending commits, dead letters, and policy. Blastr `/ready` reports whether its database, KV, and queue binding exist. The Worker uses those routes. Blastr cannot see queue depth from `/ready`, and an empty-queue heartbeat would look like a stall, so neither service gained a heartbeat.
 
@@ -72,13 +72,13 @@ Blossom `/ready` already reports database, storage, pending commits, dead letter
 
 `GET /health` and `GET /ready` remain the HTTP monitors. The worker and ingestor optionally post heartbeats when `WATCHDOG_URL` and `WATCHDOG_HMAC_SECRET` are set in that process. The worker URL path is `/v1/heartbeats/nostrmash-worker`. The ingestor path is `/v1/heartbeats/nostrmash-ingestor`. The secret matches that monitor id in `HEARTBEAT_KEYS`.
 
-The worker heartbeat's `loopAt` is the last claim-loop iteration. `idle` is true when the last claim succeeded, the queue was empty, and no job is in flight. Completing a job changes `progress`. Repeated claim failures or jobs that do not finish are not idle. The ingestor heartbeat's `progress` is the valid-event count. `idle` stays true when at least one relay is connected, including a quiet relay. It is false when relays are configured and none are healthy. A quiet network is not by itself a failed ingestion process.
+The worker heartbeat's `loopAt` is the last claim-loop iteration. `idle` is true only after that loop has successfully claimed an empty queue and nothing is in flight. A claim error is not idle. Completing a job changes `progress`. The ingestor does not send a sample until the relay manager has reported state. `idle` is true when at least one configured relay is connected, including a quiet relay. It is false when no relays are configured or every configured relay is disconnected. A quiet connected relay is not a failed ingestor. A failed heartbeat send does not stop ingestion.
 
 ## Read and publish gateways
 
 `nostrmash-read-gateway` and `nostrmash-publish-gateway` are HTTP monitors. Both stay disabled until their enable flag is `true` and the matching URL is set. Readiness is `GET /health` with `status` equal to `ok`. That does not prove a read or a publish works.
 
-Optional deep monitors use `GET /health/deep` and stay disabled unless `ENABLE_NOSTRMASH_READ_GATEWAY_DEEP` or `ENABLE_NOSTRMASH_PUBLISH_GATEWAY_DEEP` is `true`. The read probe runs one inexpensive upstream request and treats an authoritative empty result as success. The publish probe opens configured `PROBE_RELAYS` and closes them without sending an event. Relay acceptance of a real event is a separate manual test. This Worker does not publish a public Nostr event.
+Optional deep monitors use `GET /health/deep` and stay disabled unless `ENABLE_NOSTRMASH_READ_GATEWAY_DEEP` or `ENABLE_NOSTRMASH_PUBLISH_GATEWAY_DEEP` is `true`. Each sends `Authorization: Bearer` from its own secret, `READ_GATEWAY_HEALTH_TOKEN` or `PUBLISH_GATEWAY_HEALTH_TOKEN`. The secret value is not part of the monitor definition. An authenticated redirect is not followed. The read probe picks a request the configured upstream supports. An empty result is success and does not prove the upstream has indexed data. The publish probe opens `PROBE_RELAYS` and closes them without sending an event. `healthy` means the configured relay threshold is met, `degraded` means some relays opened, and `down` means none did. The default threshold is every configured relay. Relay acceptance of a real event is a separate manual test. This Worker does not publish a public Nostr event.
 
 ## What stays out of scope
 

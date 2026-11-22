@@ -12,7 +12,7 @@ Report vulnerabilities privately. See [SECURITY.md](../SECURITY.md).
 
 ## Outbound probes
 
-Every probe URL comes from configuration, and the host must match the host of that configured URL. The Worker does not accept a caller-supplied URL. Probes are HTTPS on port 443 unless `PRIVATE_NETWORK_PROFILE=true`, which is off by default. Userinfo, redirects to another host, and redirects that fail the same policy are rejected. Vendor calls refuse every redirect so a token cannot be replayed to another host.
+Every probe URL comes from configuration, and the host must match the host of that configured URL. The Worker does not accept a caller-supplied URL or header. Probes are HTTPS on port 443 unless `PRIVATE_NETWORK_PROFILE=true`, which is off by default. Userinfo, redirects to another host, and redirects that fail the same policy are rejected. A probe that sends `Authorization` does not follow any redirect. Vendor calls refuse every redirect so a token cannot be replayed to another host. Gateway health tokens are separate from publish and read API tokens.
 
 Blocked destinations, unless the private-network profile is explicitly on, include loopback, private ranges, link-local, multicast, documentation ranges, IPv6 unique-local and link-local, IPv4-mapped private addresses, decimal and hex IP literals, `localhost`, and metadata hostnames.
 

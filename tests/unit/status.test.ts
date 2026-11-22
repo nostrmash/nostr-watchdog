@@ -196,12 +196,53 @@ describe("operational status", () => {
           advisoriesCheckedAt: null,
           releasesStale: true,
           advisoriesStale: true,
+          releasesState: "unavailable",
+          advisoriesState: "unavailable",
+          coverage: "unavailable",
           errorCode: "unavailable",
           consecutiveFailures: 3,
         },
       ],
     });
     expect(missing.status).toBe("degraded");
+    const incomplete = derive({
+      ...empty(),
+      runs: [
+        {
+          name: "checks",
+          startedAt: NOW - 10_000,
+          finishedAt: NOW - 1_000,
+          successAt: NOW - 1_000,
+          error: null,
+        },
+        {
+          name: "updates",
+          startedAt: NOW - 10_000,
+          finishedAt: NOW - 1_000,
+          successAt: null,
+          error: "coverage_incomplete",
+        },
+      ],
+      vendorChecks: [
+        {
+          monitorId: "sfs-alby-hub",
+          vendor: "getAlby/hub",
+          attemptedAt: NOW - 1_000,
+          succeededAt: null,
+          releasesCheckedAt: NOW - 1_000,
+          advisoriesCheckedAt: NOW - 1_000,
+          releasesStale: false,
+          advisoriesStale: false,
+          releasesState: "fresh",
+          advisoriesState: "fresh",
+          coverage: "incomplete",
+          errorCode: "coverage_incomplete",
+          consecutiveFailures: 0,
+        },
+      ],
+    });
+    expect(incomplete.status).toBe("degraded");
+    expect(incomplete.body.securityChecks).toMatchObject([{ coverage: "incomplete" }]);
     expect(missing.body.securityChecks).toMatchObject([
       { monitorId: "sfs-alby-hub", errorCode: "unavailable", consecutiveFailures: 3 },
     ]);
