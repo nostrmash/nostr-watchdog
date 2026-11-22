@@ -13,6 +13,9 @@ export interface Settings {
   staleSeconds: number;
   progressSeconds: number;
   reminderSeconds: number;
+  unknownThreshold: number;
+  deliveryClaimMs: number;
+  schedulerStaleSeconds: number;
   telegramMode: "dual" | "nostr_fallback";
   bootstrap: string[];
   githubApi: string;
@@ -38,6 +41,9 @@ export function loadSettings(env: Env): Settings {
     staleSeconds: clamp(readInt(env, "HEARTBEAT_STALE_SECONDS", 180), 30, 86_400),
     progressSeconds: clamp(readInt(env, "HEARTBEAT_PROGRESS_SECONDS", 600), 30, 86_400),
     reminderSeconds: clamp(readInt(env, "CRITICAL_REMINDER_SECONDS", 0), 0, 604_800),
+    unknownThreshold: clamp(readInt(env, "UNKNOWN_THRESHOLD", 5), 2, 100),
+    deliveryClaimMs: clamp(readInt(env, "DELIVERY_CLAIM_MS", 120_000), 30_000, 300_000),
+    schedulerStaleSeconds: clamp(readInt(env, "SCHEDULER_STALE_SECONDS", 180), 90, 3600),
     telegramMode: mode === "nostr_fallback" ? "nostr_fallback" : "dual",
     bootstrap: readString(env, "BOOTSTRAP_RELAYS")
       .split(",")

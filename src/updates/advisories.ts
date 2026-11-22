@@ -9,6 +9,7 @@ export interface AdvisoryRef {
 
 export type SecurityStatus =
   | "unknown"
+  | "version_unavailable"
   | "review_recommended"
   | "affected"
   | "no_published_advisories"

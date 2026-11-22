@@ -63,11 +63,11 @@ export async function runBtcpayCheck(input: BtcPayInput): Promise<CheckResult> {
   }
   if (input.apiKey === "") {
     return result({
-      status: synchronized ? "healthy" : "degraded",
-      errorClass: synchronized ? null : "unsynchronized",
+      status: "degraded",
+      errorClass: synchronized ? "coverage_incomplete" : "unsynchronized",
       summary: synchronized
-        ? "BTCPay public health passed. Server info was not checked because no read-only key is configured."
-        : "BTCPay is up but not synchronized. Server info was not checked because no read-only key is configured.",
+        ? "BTCPay public health passed. Version, sync detail, and payment-processor status were not checked because no read-only key is configured."
+        : "BTCPay public health says the server is not synchronized. Server info was not checked because no read-only key is configured.",
       latencyMs: healthLatency,
     });
   }

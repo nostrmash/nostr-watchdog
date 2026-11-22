@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { assessAdvisories } from "../../src/updates/advisories";
+import { assessSecurity } from "../../src/updates/security";
+import { VENDOR_POLICY } from "../../src/updates/vendor-policy";
 import { fetchAdvisories, fetchReleases } from "../../src/updates/github";
 import { jsonResponse } from "../helpers";
 import { affectedAdvisory, reviewAdvisory } from "../fixtures/advisories";
@@ -42,6 +44,68 @@ describe("advisories", () => {
 
   it("reports unknown when the feed is unavailable", () => {
     expect(assessAdvisories("1.2.0", null).status).toBe("unknown");
+  });
+
+  it("classifies BTCPay policy ranges and security releases without inventing a vulnerability", () => {
+    const policy = VENDOR_POLICY.filter((entry) => entry.vendorId === "btcpayserver/btcpayserver");
+    const affected = assessSecurity({
+      vendorId: "btcpayserver/btcpayserver",
+      installed: "2.4.1",
+      advisories: [],
+      releases: [],
+      policy,
+    });
+    expect(affected.status).toBe("affected");
+    expect(affected.summary).toContain("2.4.1");
+    const review = assessSecurity({
+      vendorId: "btcpayserver/btcpayserver",
+      installed: "2.4.3",
+      advisories: [],
+      releases: [
+        {
+          tag: "v2.4.7",
+          url: "https://github.com/btcpayserver/btcpayserver/releases/tag/v2.4.7",
+          prerelease: false,
+          draft: false,
+          securityRelated: true,
+        },
+        {
+          tag: "v2.4.6",
+          url: "https://github.com/btcpayserver/btcpayserver/releases/tag/v2.4.6",
+          prerelease: false,
+          draft: false,
+          securityRelated: false,
+        },
+      ],
+      policy,
+    });
+    expect(review.status).toBe("review_recommended");
+    expect(review.summary).toContain("no verified affected range");
+    const current = assessSecurity({
+      vendorId: "btcpayserver/btcpayserver",
+      installed: "2.4.7",
+      advisories: [],
+      releases: [
+        {
+          tag: "v2.4.7",
+          url: "https://github.com/btcpayserver/btcpayserver/releases/tag/v2.4.7",
+          prerelease: false,
+          draft: false,
+          securityRelated: true,
+        },
+      ],
+      policy,
+    });
+    expect(current.status).toBe("no_published_advisories");
+    expect(
+      assessSecurity({
+        vendorId: "btcpayserver/btcpayserver",
+        installed: null,
+        advisories: [],
+        releases: [],
+        policy,
+      }).status,
+    ).toBe("version_unavailable");
   });
 
   it("parses official releases and ignores non-github urls", async () => {

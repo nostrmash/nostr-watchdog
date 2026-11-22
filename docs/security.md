@@ -38,7 +38,13 @@ Headers are `X-Watchdog-Timestamp` (unix seconds), `X-Watchdog-Nonce` (16–128 
 
 ## Delivery
 
-Gift wraps go only to validated kind 10050 inbox relays. Telegram requests go only to `api.telegram.org`, and the bot token is not logged. The chat id must be an integer string. Critical Telegram text is the same short incident text as the Nostr message. When Telegram is configured, dual delivery is the default because a relay can accept an event that no phone displays. That also sends the alert text to Telegram. Use `nostr_fallback` when you would rather risk a missed page than send the text to Telegram on every critical incident.
+Gift wraps go only to kind 10050 inbox relays whose event id and signature verify. Telegram requests go only to `api.telegram.org`, and the bot token is not logged. The chat id must be an integer string. Critical Telegram text is the same short incident text as the Nostr message. When Telegram is configured, dual delivery is the default because a relay can accept an event that no phone displays. That also sends the alert text to Telegram. Use `nostr_fallback` when you would rather risk a missed page than send the text to Telegram on every critical incident. Fallback sends one Telegram message per incident, not one per Nostr retry.
+
+## Data stored in D1
+
+The outbox stores the alert plaintext and, after the first signing, the gift-wrap JSON so a retry keeps the same event id. Relays store the encrypted gift wrap. D1 does not. Do not put wallet seeds, unlock passwords, payment tokens, or NWC secrets in alert text. The Worker does not add them. Accepted rows are deleted after 14 days and dead letters after 30 days. Open incidents and alerts that can still be retried are kept.
+
+Cloudflare operates D1 and the Worker isolate. This repository cannot promise that Cloudflare staff, a legal request, or a platform compromise cannot read that plaintext. Use a separate D1 database, operator token, and sender key for staging and production. Heartbeat secrets rotate by publishing the new key in `HEARTBEAT_KEYS` and the old key in `HEARTBEAT_KEYS_PREVIOUS`, then clearing the previous key after emitters have restarted.
 
 Test alerts are limited to three per project per hour.
 

@@ -59,11 +59,12 @@ export function formatSecurityMessage(input: {
   summary: string;
   url: string | null;
   occurredAt: number;
+  classification?: string;
 }): string {
   const lines = [
     `[${input.projectName}] ${input.severity.toUpperCase()} security_update`,
     `Service: ${input.displayName}`,
-    `State: ${input.severity === "critical" ? "affected" : "review_recommended"}`,
+    `State: ${input.classification ?? (input.severity === "critical" ? "affected" : "review_recommended")}`,
     `Time: ${new Date(input.occurredAt).toISOString()}`,
     `Reason: ${sanitizeText(input.summary, 300)}`,
   ];

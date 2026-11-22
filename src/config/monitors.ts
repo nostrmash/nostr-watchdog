@@ -5,6 +5,7 @@ const common = {
   intervalSeconds: 60,
   failureThreshold: 2,
   recoveryThreshold: 2,
+  unknownThreshold: 5,
 };
 
 export const MONITORS: MonitorDefinition[] = [
@@ -140,6 +141,44 @@ export const MONITORS: MonitorDefinition[] = [
     severity: "critical",
     incidentOnDegraded: true,
     runbookPath: "/nostrmash/worker",
+  },
+  {
+    ...common,
+    id: "nostrmash-read-gateway",
+    projectId: "nostrmash",
+    kind: "http_json",
+    displayName: "Nostr read gateway",
+    enableVar: "ENABLE_NOSTRMASH_READ_GATEWAY",
+    severity: "warning",
+    incidentOnDegraded: false,
+    runbookPath: "/nostrmash/read-gateway",
+    http: {
+      urlVar: "NOSTRMASH_READ_GATEWAY_URL",
+      expectedPath: "/health",
+      headers: { accept: "application/json" },
+      expectedStatuses: [200],
+      predicates: [{ pointer: "/status", equals: "ok" }],
+      maxBytes: 8_192,
+    },
+  },
+  {
+    ...common,
+    id: "nostrmash-publish-gateway",
+    projectId: "nostrmash",
+    kind: "http_json",
+    displayName: "Nostr publish gateway",
+    enableVar: "ENABLE_NOSTRMASH_PUBLISH_GATEWAY",
+    severity: "warning",
+    incidentOnDegraded: false,
+    runbookPath: "/nostrmash/publish-gateway",
+    http: {
+      urlVar: "NOSTRMASH_PUBLISH_GATEWAY_URL",
+      expectedPath: "/health",
+      headers: { accept: "application/json" },
+      expectedStatuses: [200],
+      predicates: [{ pointer: "/status", equals: "ok" }],
+      maxBytes: 8_192,
+    },
   },
 ];
 

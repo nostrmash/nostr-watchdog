@@ -154,7 +154,8 @@ describe("btcpay", () => {
         "https://pay.example/api/v1/health": () => jsonResponse({ synchronized: true }),
       }),
     });
-    expect(healthy.status).toBe("healthy");
+    expect(healthy.status).toBe("degraded");
+    expect(healthy.errorClass).toBe("coverage_incomplete");
     expect(healthy.summary).toContain("no read-only key");
     const unsynced = await runBtcpayCheck({
       baseUrl: "https://pay.example",

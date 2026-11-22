@@ -15,6 +15,7 @@ import {
   lastChecks,
   loadMemory,
   markRun,
+  pruneOperationalRows,
   readHeartbeat,
   releaseLease,
 } from "../state/store";
@@ -27,14 +28,18 @@ export async function runCheckCycle(env: Env, deps: Dependencies): Promise<void>
   const settings = loadSettings(env);
   if (!settings.enabled) {
     log("info", "checks_skipped", { reason: "disabled" });
+    await markRun(env.DB, "checks", deps.now(), deps.now(), "disabled");
     return;
   }
   const owner = crypto.randomUUID();
   const started = deps.now();
-  if (!(await acquireLease(env.DB, "checks", owner, started + 50_000, started))) {
+  const leased = await acquireLease(env.DB, "checks", owner, started + 50_000, started);
+  if (!leased) {
     log("info", "checks_skipped", { reason: "lease" });
+    await dispatchDue(env, deps, settings);
     return;
   }
+  let cycleError: string | null = null;
   try {
     await markRun(env.DB, "checks", started, null, null);
     const previous = await lastChecks(env.DB);
@@ -53,16 +58,31 @@ export async function runCheckCycle(env: Env, deps: Dependencies): Promise<void>
         log("error", "probe_rejected", { monitor: "unknown" });
         continue;
       }
-      await applyProbe(env, settings, item.value.monitor, item.value.result, deps.now());
+      try {
+        await applyProbe(env, settings, item.value.monitor, item.value.result, deps.now());
+      } catch {
+        cycleError = "monitor_commit_failed";
+        log("error", "monitor_commit_failed", { monitor: item.value.monitor.id });
+      }
     }
-    await dispatchDue(env, deps, settings);
-    await markRun(env.DB, "checks", null, deps.now(), null);
+    try {
+      await pruneOperationalRows(env.DB, deps.now());
+    } catch {
+      log("error", "retention_failed", {});
+    }
   } catch {
-    await markRun(env.DB, "checks", null, deps.now(), "cycle_failed");
+    cycleError = "cycle_failed";
     log("error", "checks_failed", {});
   } finally {
     await releaseLease(env.DB, "checks", owner, deps.now());
   }
+  try {
+    await dispatchDue(env, deps, settings);
+  } catch {
+    cycleError = cycleError ?? "dispatch_failed";
+    log("error", "dispatch_failed", {});
+  }
+  await markRun(env.DB, "checks", null, deps.now(), cycleError);
 }
 
 async function probe(
@@ -133,20 +153,22 @@ async function applyProbe(
       recoveryThreshold: settings.recoveryThreshold ?? monitor.recoveryThreshold,
       severity: monitor.severity,
       incidentOnDegraded: monitor.incidentOnDegraded,
+      unknownThreshold: settings.unknownThreshold || monitor.unknownThreshold,
     },
     reminderSeconds: settings.reminderSeconds,
     newIncidentId: `inc_${crypto.randomUUID()}`,
+    newIntegrityIncidentId: `inc_${crypto.randomUUID()}`,
   });
-  const alerts = next.notice
-    ? incidentAlerts(
-        env,
-        settings,
-        monitor,
-        next.notice,
-        check.observedVersion ?? loaded.memory.observedVersion,
-        now,
-      )
-    : [];
+  const alerts = next.notices.flatMap((item) =>
+    incidentAlerts(
+      env,
+      settings,
+      monitor,
+      item,
+      check.observedVersion ?? loaded.memory.observedVersion,
+      now,
+    ),
+  );
   await commitCheck(env.DB, {
     monitorId: monitor.id,
     projectId: monitor.projectId,
@@ -154,7 +176,7 @@ async function applyProbe(
     memory: next.memory,
     check,
     now,
-    notice: next.notice,
+    notices: next.notices,
     alerts,
   });
 }

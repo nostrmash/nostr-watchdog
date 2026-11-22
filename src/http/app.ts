@@ -1,6 +1,8 @@
 import { formatTestMessage } from "../alerts/format";
 import { discoverInbox, workersRelayConnect } from "../alerts/nip17";
 import { recipientPubkey } from "../alerts/nip17";
+import { deriveOperationalStatus } from "./status";
+import { handleTestRelay, testRelayAllowed } from "./relay-fixture";
 import { canonicalHeartbeat } from "../security/canonical";
 import { verifyHmacSha256, hmacSha256Hex, secretsEqual } from "../security/hmac";
 import { readLimited } from "../security/body";
@@ -17,10 +19,12 @@ import {
   countRecent,
   insertAlert,
   listOpenIncident,
+  listFailedAlerts,
+  operationalSnapshot,
   relayCache,
+  retryDeadLetter,
   saveRelayCache,
   silenceIncident,
-  statusSummary,
   storeHeartbeat,
 } from "../state/store";
 import type { AlertDraft, ProjectId } from "../types";
@@ -32,6 +36,9 @@ export async function handleFetch(
 ): Promise<Response> {
   const url = new URL(request.url);
   try {
+    if (testRelayAllowed(env) && url.pathname.startsWith("/__test_relay")) {
+      return handleTestRelay(request);
+    }
     const relayDiagnostics = request.method === "GET" && url.pathname === "/v1/diagnostics/relays";
     if (url.search !== "" && !relayDiagnostics) return json({ error: "not_found" }, 404);
     if (request.method === "GET" && url.pathname === "/healthz") return healthz(env);
@@ -46,6 +53,11 @@ export async function handleFetch(
     if (request.method === "GET" && url.pathname === "/v1/diagnostics/relays") {
       return relayDiagnostic(request, env, url, deps);
     }
+    if (request.method === "GET" && url.pathname === "/v1/outbox/failed") {
+      return failedOutbox(request, env);
+    }
+    const retry = /^\/v1\/outbox\/(alt_[0-9a-f-]{8,80})\/retry$/.exec(url.pathname);
+    if (request.method === "POST" && retry?.[1]) return retryOutbox(request, env, retry[1], deps);
     const incident = /^\/v1\/incidents\/(inc_[0-9a-f-]{36})\/(silence|ack)$/.exec(url.pathname);
     if (request.method === "POST" && incident?.[1] && incident[2]) {
       return incidentAction(request, env, incident[1], incident[2], deps);
@@ -78,23 +90,17 @@ async function status(request: Request, env: Env, deps: Dependencies): Promise<R
   const auth = await authorize(request, env);
   if (auth !== "ok") return authResponse(auth);
   try {
-    const summary = await statusSummary(env.DB);
-    const body = JSON.stringify({
-      status: summary.deadLetters > 0 ? "degraded" : "ok",
-      environment: readString(env, "ENVIRONMENT"),
-      checkedAt: new Date(deps.now()).toISOString(),
-      openIncidents: summary.openIncidents,
-      deadLetters: summary.deadLetters,
-      lastCheckRunAt: summary.lastCheck ? new Date(summary.lastCheck).toISOString() : null,
-      lastUpdateRunAt: summary.lastUpdate ? new Date(summary.lastUpdate).toISOString() : null,
-    });
+    const settings = loadSettings(env);
+    const snapshot = await operationalSnapshot(env.DB);
+    const derived = deriveOperationalStatus({ env, settings, now: deps.now(), snapshot });
+    const body = JSON.stringify(derived.body);
     const headers = new Headers({
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
     });
     const signing = readString(env, "STATUS_SIGNING_SECRET");
     if (signing !== "") headers.set("x-watchdog-signature", await hmacSha256Hex(signing, body));
-    return new Response(body, { status: 200, headers });
+    return new Response(body, { status: derived.httpStatus, headers });
   } catch {
     return json({ error: "status_unavailable" }, 503);
   }
@@ -211,6 +217,9 @@ async function testAlert(request: Request, env: Env, deps: Dependencies): Promis
     attempt_count: 0,
     next_attempt_at: now,
     claim_until: null,
+    claim_token: null,
+    accepted_relays: null,
+    failed_relays: null,
     last_error: null,
     created_at: now,
     updated_at: now,
@@ -248,6 +257,7 @@ async function relayDiagnostic(
     bootstrap: settings.bootstrap,
     connect: deps.connectRelay ?? workersRelayConnect(deps.fetch, settings.timeoutMs),
     timeoutMs: settings.timeoutMs,
+    nowMs: deps.now(),
   });
   const now = deps.now();
   if (found.relays.length > 0) {
@@ -267,6 +277,26 @@ async function relayDiagnostic(
     cached: false,
     error: found.definitiveEmpty ? "recipient_inbox_missing" : "inbox_discovery_failed",
   });
+}
+
+async function failedOutbox(request: Request, env: Env): Promise<Response> {
+  const auth = await authorize(request, env);
+  if (auth !== "ok") return authResponse(auth);
+  const alerts = await listFailedAlerts(env.DB);
+  return json({ alerts });
+}
+
+async function retryOutbox(
+  request: Request,
+  env: Env,
+  id: string,
+  deps: Dependencies,
+): Promise<Response> {
+  const auth = await authorize(request, env);
+  if (auth !== "ok") return authResponse(auth);
+  const retried = await retryDeadLetter(env.DB, id, deps.now());
+  if (!retried) return json({ error: "not_found" }, 404);
+  return json({ id, status: "queued" });
 }
 
 async function incidentAction(

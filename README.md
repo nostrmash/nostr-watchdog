@@ -25,7 +25,7 @@ Every monitor ships disabled. A check runs only after you set its endpoint or cr
 
 - Node.js 26.13.1 or newer (`.nvmrc`)
 - pnpm 12.21.0
-- A Cloudflare Workers **Paid** plan. Cron Triggers on the Free plan stop at 10 ms of CPU. One NIP-17 gift wrap measured about 7 ms locally on Node, before D1 and JSON, so the Free plan is not a supported target. See [docs/deployment.md](docs/deployment.md).
+- A Cloudflare Workers **Paid** plan. Cron Triggers on the Free plan stop at 10 ms of CPU. Gift-wrap work already exceeds that budget. See [docs/deployment.md](docs/deployment.md).
 
 ## Quick start
 

@@ -12,7 +12,7 @@ Use Cloudflare Workers Paid. As of 22 November 2026, the documented Cron Trigger
 | Workers Paid, cron interval under 1 hour      | 30 seconds default, up to 5 minutes via `limits.cpu_ms` |
 | Workers Paid, cron interval of 1 hour or more | up to 15 minutes of CPU                                 |
 
-Network time spent waiting on probes is not CPU time. This Worker sets `limits.cpu_ms` to 30000. A local Node measurement of `nostr-tools` `wrapEvent` was about 6.6 ms per gift wrap after one warmup call. That number is not a Cloudflare trace. It is already most of the Free plan's 10 ms cron budget before D1, JSON, and a second project are included, so the Free plan is not supported. Confirm the limit on the account you deploy to.
+Network time spent waiting on probes is not CPU time. This Worker sets `limits.cpu_ms` to 30000. A Workers-runtime test builds one gift wrap and expects it to finish in under 2 seconds. That is a budget, not a measured production CPU trace, and it is already more than the Free plan's 10 ms cron budget before D1 and a second project. The Free plan is not supported. Confirm the limit on the account you deploy to.
 
 The minute cron is the uptime path. The hour cron is the only path that calls GitHub. One Worker and one D1 database per environment is the whole footprint. There is no queue, KV namespace, or second Worker.
 
@@ -35,7 +35,7 @@ wrangler d1 migrations apply nostr-watchdog-staging --env staging --remote
 wrangler d1 migrations apply nostr-watchdog --env production --remote
 ```
 
-`pnpm migrate:staging` and `pnpm migrate:production` are the same remote commands. They are not run by CI.
+`pnpm migrate:staging` and `pnpm migrate:production` are the same remote commands. They are not run by CI. `0002_hardening.sql` adds columns and replaces the one-open-incident index with one open incident per monitor and kind. It applies to an empty database and to a database that already has `0001_init.sql`. It does not require deleting production data. Do not run it twice by hand: D1 records applied migrations.
 
 ## Secrets and environments
 
@@ -70,4 +70,8 @@ To stop probes without deleting the Worker, set `WATCHDOG_ENABLED` to `false` an
 
 ## GitHub rate limit
 
-The hour cron requests releases and advisories for each enabled monitor that names a vendor. Anonymous GitHub API usage is 60 requests per hour per origin. A 403 or 429 stores `x-ratelimit-reset` and the next run uses the cache until that time. Do not point the minute cron at the GitHub API. `GITHUB_TOKEN` is optional and should be a public-repo read token.
+The hour cron requests releases and advisories for each enabled monitor that names a vendor. Anonymous GitHub API usage is 60 requests per hour per origin. A 403 or 429 stores `x-ratelimit-reset` and the next run uses the cache until that time. Requests time out and stop at 256 KiB. Do not point the minute cron at the GitHub API. `GITHUB_TOKEN` is optional and should be a public-repo read token.
+
+## An external checker
+
+Run one HTTPS check from outside Cloudflare against `GET /v1/status` with the operator bearer token. Page when the response is not HTTP 200. That covers the Worker being unreachable, monitoring disabled, no monitors enabled, a stale scheduler, dead letters, and missing alert configuration. `/healthz` only answers whether the isolate is up. Verifying `X-Watchdog-Signature` is optional and catches a proxy that replaces the body. This repository does not ship that second checker. A hosted uptime probe is enough. Do not point it at a customer service to test an outage.

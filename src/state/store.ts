@@ -18,6 +18,9 @@ interface StateRow {
   failure_kind: string | null;
   observed_version: string | null;
   generation: number;
+  consecutive_unknowns: number;
+  unknown_since: number | null;
+  last_unknown_reason: string | null;
 }
 
 interface IncidentRow {
@@ -37,16 +40,18 @@ export async function loadMemory(
 ): Promise<{ memory: MonitorMemory; generation: number }> {
   const state = await db
     .prepare(
-      "SELECT monitor_id, project_id, status, consecutive_successes, consecutive_failures, failure_kind, observed_version, generation FROM monitor_state WHERE monitor_id = ?",
+      `SELECT monitor_id, project_id, status, consecutive_successes, consecutive_failures, failure_kind,
+              observed_version, generation, consecutive_unknowns, unknown_since, last_unknown_reason
+       FROM monitor_state WHERE monitor_id = ?`,
     )
     .bind(monitorId)
     .first<StateRow>();
-  const incident = await db
+  const incidents = await db
     .prepare(
       "SELECT id, kind, severity, opened_at, reminder_count, last_reminder_at, silenced_until, acked_at FROM incidents WHERE monitor_id = ? AND status = 'open'",
     )
     .bind(monitorId)
-    .first<IncidentRow>();
+    .all<IncidentRow>();
   if (!state) return { memory: emptyMemory(), generation: 0 };
   const memory = emptyMemory();
   memory.status = asStatus(state.status);
@@ -54,7 +59,14 @@ export async function loadMemory(
   memory.consecutiveFailures = state.consecutive_failures;
   memory.failureKind = state.failure_kind ? asStatus(state.failure_kind) : null;
   memory.observedVersion = state.observed_version;
-  memory.openIncident = incident ? toIncident(incident) : null;
+  memory.consecutiveUnknowns = state.consecutive_unknowns;
+  memory.unknownSince = state.unknown_since;
+  memory.lastUnknownReason = state.last_unknown_reason;
+  for (const row of incidents.results) {
+    const incident = toIncident(row);
+    if (incident.kind === "inconclusive") memory.integrityIncident = incident;
+    else memory.openIncident = incident;
+  }
   return { memory, generation: state.generation };
 }
 
@@ -67,7 +79,7 @@ export async function commitCheck(
     memory: MonitorMemory;
     check: CheckResult;
     now: number;
-    notice: Notice | null;
+    notices: Notice[];
     alerts: AlertDraft[];
   },
 ): Promise<void> {
@@ -85,8 +97,8 @@ export async function commitCheck(
         `INSERT INTO monitor_state (
         monitor_id, project_id, status, consecutive_successes, consecutive_failures, failure_kind,
         last_check_at, last_success_at, last_failure_at, last_error_class, last_latency_ms, last_summary,
-        observed_version, generation, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        observed_version, generation, updated_at, consecutive_unknowns, unknown_since, last_unknown_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(monitor_id) DO UPDATE SET
         project_id = excluded.project_id,
         status = excluded.status,
@@ -101,7 +113,10 @@ export async function commitCheck(
         last_summary = excluded.last_summary,
         observed_version = COALESCE(excluded.observed_version, monitor_state.observed_version),
         generation = monitor_state.generation + 1,
-        updated_at = excluded.updated_at
+        updated_at = excluded.updated_at,
+        consecutive_unknowns = excluded.consecutive_unknowns,
+        unknown_since = excluded.unknown_since,
+        last_unknown_reason = excluded.last_unknown_reason
       WHERE monitor_state.generation = ?`,
       )
       .bind(
@@ -120,64 +135,72 @@ export async function commitCheck(
         input.memory.observedVersion,
         nextGeneration,
         input.now,
+        input.memory.consecutiveUnknowns,
+        input.memory.unknownSince,
+        input.memory.lastUnknownReason,
         input.previousGeneration,
       ),
   ];
-  if (input.notice?.event === "open") {
-    statements.push(
-      db
-        .prepare(
-          `INSERT INTO incidents (
-          id, monitor_id, project_id, status, kind, severity, opened_at, open_reason, reminder_count, updated_at
-        )
-        SELECT ?, ?, ?, 'open', ?, ?, ?, ?, 0, ?
-        FROM monitor_state
-        WHERE monitor_id = ? AND generation = ?
-          AND NOT EXISTS (SELECT 1 FROM incidents WHERE monitor_id = ? AND status = 'open')`,
-        )
-        .bind(
-          input.notice.incidentId,
-          input.monitorId,
-          input.projectId,
-          input.notice.kind,
-          input.notice.severity,
-          input.notice.occurredAt,
-          input.notice.reason,
-          input.now,
-          input.monitorId,
-          nextGeneration,
-          input.monitorId,
-        ),
-    );
-  }
-  if (input.notice?.event === "close") {
-    statements.push(
-      db
-        .prepare(
-          `UPDATE incidents SET status = 'closed', closed_at = ?, close_reason = ?, updated_at = ?
-         WHERE id = ? AND status = 'open'
-           AND EXISTS (SELECT 1 FROM monitor_state WHERE monitor_id = ? AND generation = ?)`,
-        )
-        .bind(
-          input.now,
-          input.notice.reason,
-          input.now,
-          input.notice.incidentId,
-          input.monitorId,
-          nextGeneration,
-        ),
-    );
-  }
-  if (input.notice?.event === "remind") {
-    statements.push(
-      db
-        .prepare(
-          `UPDATE incidents SET reminder_count = reminder_count + 1, last_reminder_at = ?, updated_at = ?
-         WHERE id = ? AND status = 'open'
-           AND EXISTS (SELECT 1 FROM monitor_state WHERE monitor_id = ? AND generation = ?)`,
-        )
-        .bind(input.now, input.now, input.notice.incidentId, input.monitorId, nextGeneration),
-    );
+  for (const item of input.notices) {
+    if (item.event === "open") {
+      statements.push(
+        db
+          .prepare(
+            `INSERT INTO incidents (
+            id, monitor_id, project_id, status, kind, severity, opened_at, open_reason, reminder_count, updated_at
+          )
+          SELECT ?, ?, ?, 'open', ?, ?, ?, ?, 0, ?
+          FROM monitor_state
+          WHERE monitor_id = ? AND generation = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM incidents WHERE monitor_id = ? AND status = 'open' AND kind = ?
+            )`,
+          )
+          .bind(
+            item.incidentId,
+            input.monitorId,
+            input.projectId,
+            item.kind,
+            item.severity,
+            item.occurredAt,
+            item.reason,
+            input.now,
+            input.monitorId,
+            nextGeneration,
+            input.monitorId,
+            item.kind,
+          ),
+      );
+    }
+    if (item.event === "close") {
+      statements.push(
+        db
+          .prepare(
+            `UPDATE incidents SET status = 'closed', closed_at = ?, close_reason = ?, updated_at = ?
+           WHERE id = ? AND status = 'open'
+             AND EXISTS (SELECT 1 FROM monitor_state WHERE monitor_id = ? AND generation = ?)`,
+          )
+          .bind(
+            input.now,
+            item.reason,
+            input.now,
+            item.incidentId,
+            input.monitorId,
+            nextGeneration,
+          ),
+      );
+    }
+    if (item.event === "remind") {
+      statements.push(
+        db
+          .prepare(
+            `UPDATE incidents SET reminder_count = reminder_count + 1, last_reminder_at = ?, updated_at = ?
+           WHERE id = ? AND status = 'open'
+             AND EXISTS (SELECT 1 FROM monitor_state WHERE monitor_id = ? AND generation = ?)`,
+          )
+          .bind(input.now, input.now, item.incidentId, input.monitorId, nextGeneration),
+      );
+    }
   }
   for (const alert of input.alerts) {
     statements.push(
@@ -362,7 +385,8 @@ export async function claimOutbox(
   const rows = await db
     .prepare(
       `SELECT id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity, state,
-            payload_text, envelope_json, attempt_count, next_attempt_at, claim_until, last_error, created_at, updated_at
+            payload_text, envelope_json, attempt_count, next_attempt_at, claim_until, claim_token,
+            accepted_relays, failed_relays, last_error, created_at, updated_at
      FROM alert_outbox
      WHERE state IN ('queued', 'retrying') AND next_attempt_at <= ? AND (claim_until IS NULL OR claim_until < ?)
      ORDER BY created_at LIMIT 20`,
@@ -371,50 +395,131 @@ export async function claimOutbox(
     .all<OutboxRow>();
   const claimed: OutboxRow[] = [];
   for (const row of rows.results) {
+    const token = crypto.randomUUID();
     const result = await db
       .prepare(
-        `UPDATE alert_outbox SET claim_until = ?, state = 'retrying', updated_at = ?
+        `UPDATE alert_outbox SET claim_until = ?, claim_token = ?, state = 'retrying', updated_at = ?
        WHERE id = ? AND state IN ('queued', 'retrying') AND (claim_until IS NULL OR claim_until < ?)`,
       )
-      .bind(claimUntil, now, row.id, now)
+      .bind(claimUntil, token, now, row.id, now)
       .run();
-    if ((result.meta.changes ?? 0) > 0)
-      claimed.push({ ...row, state: "retrying", claim_until: claimUntil });
+    if ((result.meta.changes ?? 0) > 0) {
+      claimed.push({ ...row, state: "retrying", claim_until: claimUntil, claim_token: token });
+    }
   }
   return claimed;
+}
+
+export async function claimRow(
+  db: D1Database,
+  id: string,
+  now: number,
+  claimUntil: number,
+): Promise<string | null> {
+  const token = crypto.randomUUID();
+  const result = await db
+    .prepare(
+      `UPDATE alert_outbox SET claim_until = ?, claim_token = ?, state = 'retrying', updated_at = ?
+       WHERE id = ? AND state IN ('queued', 'retrying') AND (claim_until IS NULL OR claim_until < ?)`,
+    )
+    .bind(claimUntil, token, now, id, now)
+    .run();
+  return (result.meta.changes ?? 0) > 0 ? token : null;
+}
+
+export async function extendClaim(
+  db: D1Database,
+  id: string,
+  token: string,
+  claimUntil: number,
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      "UPDATE alert_outbox SET claim_until = ? WHERE id = ? AND claim_token = ? AND state = 'retrying'",
+    )
+    .bind(claimUntil, id, token)
+    .run();
+  return (result.meta.changes ?? 0) > 0;
 }
 
 export async function saveEnvelope(
   db: D1Database,
   id: string,
+  token: string,
   envelope: string,
   now: number,
-): Promise<void> {
-  await db
+): Promise<"saved" | "exists" | "lost"> {
+  const result = await db
     .prepare(
-      "UPDATE alert_outbox SET envelope_json = ?, updated_at = ? WHERE id = ? AND envelope_json IS NULL",
+      `UPDATE alert_outbox SET envelope_json = ?, updated_at = ?
+       WHERE id = ? AND claim_token = ? AND envelope_json IS NULL`,
     )
-    .bind(envelope, now, id)
+    .bind(envelope, now, id, token)
     .run();
+  if ((result.meta.changes ?? 0) > 0) return "saved";
+  const row = await db
+    .prepare("SELECT envelope_json, claim_token FROM alert_outbox WHERE id = ?")
+    .bind(id)
+    .first<{ envelope_json: string | null; claim_token: string | null }>();
+  if (row?.envelope_json) return "exists";
+  return row?.claim_token === token ? "lost" : "lost";
+}
+
+export async function readEnvelope(db: D1Database, id: string): Promise<string | null> {
+  const row = await db
+    .prepare("SELECT envelope_json FROM alert_outbox WHERE id = ?")
+    .bind(id)
+    .first<{ envelope_json: string | null }>();
+  return row?.envelope_json ?? null;
 }
 
 export async function finishDelivery(
   db: D1Database,
   input: {
     id: string;
+    token: string;
     state: "relay_accepted" | "retrying" | "failed";
     attemptCount: number;
     nextAttemptAt: number;
     error: string | null;
+    acceptedRelays: string[] | null;
+    failedRelays: string[] | null;
     now: number;
   },
-): Promise<void> {
-  await db
+): Promise<boolean> {
+  const result = await db
     .prepare(
-      `UPDATE alert_outbox SET state = ?, attempt_count = ?, next_attempt_at = ?, last_error = ?, claim_until = NULL, updated_at = ? WHERE id = ?`,
+      `UPDATE alert_outbox
+       SET state = ?, attempt_count = ?, next_attempt_at = ?, last_error = ?,
+           accepted_relays = ?, failed_relays = ?, claim_until = NULL, claim_token = NULL, updated_at = ?
+       WHERE id = ? AND claim_token = ?`,
     )
-    .bind(input.state, input.attemptCount, input.nextAttemptAt, input.error, input.now, input.id)
+    .bind(
+      input.state,
+      input.attemptCount,
+      input.nextAttemptAt,
+      input.error,
+      input.acceptedRelays ? JSON.stringify(input.acceptedRelays) : null,
+      input.failedRelays ? JSON.stringify(input.failedRelays) : null,
+      input.now,
+      input.id,
+      input.token,
+    )
     .run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+export async function retryDeadLetter(db: D1Database, id: string, now: number): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `UPDATE alert_outbox
+       SET state = 'queued', attempt_count = 0, next_attempt_at = ?, claim_until = NULL,
+           claim_token = NULL, last_error = NULL, updated_at = ?
+       WHERE id = ? AND state = 'failed'`,
+    )
+    .bind(now, now, id)
+    .run();
+  return (result.meta.changes ?? 0) > 0;
 }
 
 export async function insertAlert(db: D1Database, alert: AlertDraft, now: number): Promise<void> {
@@ -623,6 +728,139 @@ export async function installedVersion(db: D1Database, monitorId: string): Promi
     .bind(monitorId)
     .first<{ observed_version: string | null }>();
   return row?.observed_version ?? null;
+}
+
+const ACCEPTED_RETENTION_MS = 14 * 86_400_000;
+const DEAD_LETTER_RETENTION_MS = 30 * 86_400_000;
+const CLOSED_INCIDENT_RETENTION_MS = 90 * 86_400_000;
+const UPSTREAM_RETENTION_MS = 7 * 86_400_000;
+
+export async function pruneOperationalRows(db: D1Database, now: number): Promise<void> {
+  await db.batch([
+    db.prepare("DELETE FROM heartbeat_nonces WHERE expires_at < ?").bind(now),
+    db.prepare("DELETE FROM relay_list_cache WHERE expires_at < ?").bind(now),
+    db
+      .prepare("DELETE FROM alert_outbox WHERE state = 'relay_accepted' AND updated_at < ?")
+      .bind(now - ACCEPTED_RETENTION_MS),
+    db
+      .prepare("DELETE FROM alert_outbox WHERE state = 'failed' AND updated_at < ?")
+      .bind(now - DEAD_LETTER_RETENTION_MS),
+    db
+      .prepare(
+        "DELETE FROM incidents WHERE status = 'closed' AND closed_at IS NOT NULL AND closed_at < ?",
+      )
+      .bind(now - CLOSED_INCIDENT_RETENTION_MS),
+    db
+      .prepare(
+        "DELETE FROM upstream_cache WHERE fetched_at < ? AND (rate_limited_until IS NULL OR rate_limited_until < ?)",
+      )
+      .bind(now - UPSTREAM_RETENTION_MS, now),
+  ]);
+}
+
+export interface OperationalSnapshot {
+  states: Array<{ monitorId: string; status: string; lastCheckAt: number | null }>;
+  openIncidents: number;
+  outbox: Array<{ state: string; count: number }>;
+  errors: Array<{ error: string; count: number }>;
+  runs: Array<{
+    name: string;
+    startedAt: number | null;
+    finishedAt: number | null;
+    error: string | null;
+  }>;
+  heartbeats: Array<{ monitorId: string; receivedAt: number }>;
+}
+
+export async function operationalSnapshot(db: D1Database): Promise<OperationalSnapshot> {
+  const [states, open, outbox, errors, runs, heartbeats] = await Promise.all([
+    db
+      .prepare("SELECT monitor_id, status, last_check_at FROM monitor_state")
+      .all<{ monitor_id: string; status: string; last_check_at: number | null }>(),
+    db
+      .prepare("SELECT COUNT(*) AS count FROM incidents WHERE status = 'open'")
+      .first<{ count: number }>(),
+    db
+      .prepare("SELECT state, COUNT(*) AS count FROM alert_outbox GROUP BY state")
+      .all<{ state: string; count: number }>(),
+    db
+      .prepare(
+        `SELECT last_error AS error, COUNT(*) AS count FROM alert_outbox
+         WHERE state IN ('retrying', 'failed') AND last_error IS NOT NULL
+         GROUP BY last_error`,
+      )
+      .all<{ error: string; count: number }>(),
+    db
+      .prepare("SELECT job_name, last_started_at, last_finished_at, last_error FROM scheduler_runs")
+      .all<{
+        job_name: string;
+        last_started_at: number | null;
+        last_finished_at: number | null;
+        last_error: string | null;
+      }>(),
+    db
+      .prepare("SELECT monitor_id, received_at FROM heartbeats")
+      .all<{ monitor_id: string; received_at: number }>(),
+  ]);
+  return {
+    states: states.results.map((row) => ({
+      monitorId: row.monitor_id,
+      status: row.status,
+      lastCheckAt: row.last_check_at,
+    })),
+    openIncidents: open?.count ?? 0,
+    outbox: outbox.results.map((row) => ({ state: row.state, count: row.count })),
+    errors: errors.results.map((row) => ({ error: row.error, count: row.count })),
+    runs: runs.results.map((row) => ({
+      name: row.job_name,
+      startedAt: row.last_started_at,
+      finishedAt: row.last_finished_at,
+      error: row.last_error,
+    })),
+    heartbeats: heartbeats.results.map((row) => ({
+      monitorId: row.monitor_id,
+      receivedAt: row.received_at,
+    })),
+  };
+}
+
+export async function listFailedAlerts(db: D1Database): Promise<
+  Array<{
+    id: string;
+    monitorId: string;
+    projectId: string;
+    destination: string;
+    attemptCount: number;
+    lastError: string | null;
+    createdAt: number;
+    payloadText: string;
+  }>
+> {
+  const rows = await db
+    .prepare(
+      `SELECT id, monitor_id, project_id, destination, attempt_count, last_error, created_at, payload_text
+       FROM alert_outbox WHERE state = 'failed' ORDER BY updated_at DESC LIMIT 50`,
+    )
+    .all<{
+      id: string;
+      monitor_id: string;
+      project_id: string;
+      destination: string;
+      attempt_count: number;
+      last_error: string | null;
+      created_at: number;
+      payload_text: string;
+    }>();
+  return rows.results.map((row) => ({
+    id: row.id,
+    monitorId: row.monitor_id,
+    projectId: row.project_id,
+    destination: row.destination,
+    attemptCount: row.attempt_count,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    payloadText: row.payload_text.slice(0, 500),
+  }));
 }
 
 export async function statusSummary(db: D1Database): Promise<{

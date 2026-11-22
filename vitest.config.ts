@@ -39,6 +39,7 @@ export default defineConfig({
             TELEGRAM_BOT_TOKEN: "",
             TELEGRAM_CHAT_IDS: "",
             GITHUB_TOKEN: "",
+            TEST_RELAY: "enabled",
           },
         },
       };
