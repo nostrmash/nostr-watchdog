@@ -46,5 +46,18 @@ export default defineConfig({
   ],
   test: {
     setupFiles: ["./tests/apply-migrations.ts"],
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "json-summary", "html"],
+      reportOnFailure: true,
+      include: ["src/**/*.ts"],
+      exclude: ["**/*.d.ts"],
+      thresholds: {
+        statements: 74,
+        branches: 68,
+        functions: 85,
+        lines: 80,
+      },
+    },
   },
 });
