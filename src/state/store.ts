@@ -296,6 +296,9 @@ export interface VendorCheckRow {
   advisoriesCheckedAt: number | null;
   releasesStale: boolean;
   advisoriesStale: boolean;
+  releasesState: string;
+  advisoriesState: string;
+  coverage: string;
   errorCode: string | null;
   consecutiveFailures: number;
 }
@@ -307,7 +310,8 @@ export async function readVendorCheck(
   const row = await db
     .prepare(
       `SELECT monitor_id, vendor, attempted_at, succeeded_at, releases_checked_at, advisories_checked_at,
-        releases_stale, advisories_stale, error_code, consecutive_failures
+        releases_stale, advisories_stale, releases_state, advisories_state, coverage, error_code,
+        consecutive_failures
        FROM vendor_checks WHERE monitor_id = ?`,
     )
     .bind(monitorId)
@@ -320,6 +324,9 @@ export async function readVendorCheck(
       advisories_checked_at: number | null;
       releases_stale: number;
       advisories_stale: number;
+      releases_state: string;
+      advisories_state: string;
+      coverage: string;
       error_code: string | null;
       consecutive_failures: number;
     }>();
@@ -335,8 +342,9 @@ export async function writeVendorCheck(
     .prepare(
       `INSERT INTO vendor_checks (
       monitor_id, vendor, attempted_at, succeeded_at, releases_checked_at, advisories_checked_at,
-      releases_stale, advisories_stale, error_code, consecutive_failures, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      releases_stale, advisories_stale, releases_state, advisories_state, coverage, error_code,
+      consecutive_failures, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(monitor_id) DO UPDATE SET
       vendor = excluded.vendor,
       attempted_at = COALESCE(excluded.attempted_at, vendor_checks.attempted_at),
@@ -345,6 +353,9 @@ export async function writeVendorCheck(
       advisories_checked_at = COALESCE(excluded.advisories_checked_at, vendor_checks.advisories_checked_at),
       releases_stale = excluded.releases_stale,
       advisories_stale = excluded.advisories_stale,
+      releases_state = excluded.releases_state,
+      advisories_state = excluded.advisories_state,
+      coverage = excluded.coverage,
       error_code = excluded.error_code,
       consecutive_failures = excluded.consecutive_failures,
       updated_at = excluded.updated_at`,
@@ -358,6 +369,9 @@ export async function writeVendorCheck(
       row.advisoriesCheckedAt,
       row.releasesStale ? 1 : 0,
       row.advisoriesStale ? 1 : 0,
+      row.releasesState,
+      row.advisoriesState,
+      row.coverage,
       row.errorCode,
       row.consecutiveFailures,
       now,
@@ -374,6 +388,9 @@ function vendorCheckFrom(row: {
   advisories_checked_at: number | null;
   releases_stale: number;
   advisories_stale: number;
+  releases_state: string;
+  advisories_state: string;
+  coverage: string;
   error_code: string | null;
   consecutive_failures: number;
 }): VendorCheckRow {
@@ -386,6 +403,9 @@ function vendorCheckFrom(row: {
     advisoriesCheckedAt: row.advisories_checked_at,
     releasesStale: row.releases_stale === 1,
     advisoriesStale: row.advisories_stale === 1,
+    releasesState: row.releases_state,
+    advisoriesState: row.advisories_state,
+    coverage: row.coverage,
     errorCode: row.error_code,
     consecutiveFailures: row.consecutive_failures,
   };
@@ -917,7 +937,8 @@ export async function operationalSnapshot(db: D1Database): Promise<OperationalSn
     db
       .prepare(
         `SELECT monitor_id, vendor, attempted_at, succeeded_at, releases_checked_at, advisories_checked_at,
-          releases_stale, advisories_stale, error_code, consecutive_failures
+          releases_stale, advisories_stale, releases_state, advisories_state, coverage, error_code,
+          consecutive_failures
          FROM vendor_checks`,
       )
       .all<{
@@ -929,6 +950,9 @@ export async function operationalSnapshot(db: D1Database): Promise<OperationalSn
         advisories_checked_at: number | null;
         releases_stale: number;
         advisories_stale: number;
+        releases_state: string;
+        advisories_state: string;
+        coverage: string;
         error_code: string | null;
         consecutive_failures: number;
       }>(),

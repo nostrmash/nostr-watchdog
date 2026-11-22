@@ -55,6 +55,8 @@ interface __BaseEnv_Env {
 	OPERATOR_TOKEN: string;
 	STATUS_SIGNING_SECRET: string;
 		STATUS_READ_TOKEN: string;
+		READ_GATEWAY_HEALTH_TOKEN: string;
+		PUBLISH_GATEWAY_HEALTH_TOKEN: string;
 	SFS_BOT_NSEC: string;
 	NOSTRMASH_BOT_NSEC: string;
 	HEARTBEAT_KEYS: string;
@@ -120,6 +122,8 @@ declare namespace Cloudflare {
 		OPERATOR_TOKEN: string;
 		STATUS_SIGNING_SECRET: string;
 		STATUS_READ_TOKEN: string;
+		READ_GATEWAY_HEALTH_TOKEN: string;
+		PUBLISH_GATEWAY_HEALTH_TOKEN: string;
 		SFS_BOT_NSEC: string;
 		NOSTRMASH_BOT_NSEC: string;
 		HEARTBEAT_KEYS: string;
@@ -184,6 +188,8 @@ declare namespace Cloudflare {
 		OPERATOR_TOKEN: string;
 		STATUS_SIGNING_SECRET: string;
 		STATUS_READ_TOKEN: string;
+		READ_GATEWAY_HEALTH_TOKEN: string;
+		PUBLISH_GATEWAY_HEALTH_TOKEN: string;
 		SFS_BOT_NSEC: string;
 		NOSTRMASH_BOT_NSEC: string;
 		HEARTBEAT_KEYS: string;

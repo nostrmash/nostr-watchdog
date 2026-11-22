@@ -100,6 +100,9 @@ export function deriveOperationalStatus(input: {
       (row.releasesStale || row.advisoriesStale) &&
       (row.succeededAt === null || input.now - row.succeededAt > UPDATE_OVERDUE_MS),
   );
+  const coverageGap = vendorChecks.some(
+    (row) => row.coverage === "incomplete" || row.coverage === "unavailable",
+  );
   const checkUnhealthy =
     schedulerStale &&
     (checkAge === null || checkAge > input.settings.schedulerStaleSeconds * 3 * 1000);
@@ -110,7 +113,8 @@ export function deriveOperationalStatus(input: {
     (updateOverdue && !updateUnhealthy) ||
     updateFailed ||
     vendorFailing ||
-    vendorStale;
+    vendorStale ||
+    coverageGap;
   let status: WatchdogStatus = "healthy";
   if (!input.settings.enabled) status = "disabled";
   else if (enabled.length === 0) status = "not_configured";
@@ -159,6 +163,9 @@ export function deriveOperationalStatus(input: {
         : null,
       releasesStale: row.releasesStale,
       advisoriesStale: row.advisoriesStale,
+      releasesState: row.releasesState,
+      advisoriesState: row.advisoriesState,
+      coverage: row.coverage,
       errorCode: row.errorCode,
       consecutiveFailures: row.consecutiveFailures,
     })),

@@ -10,6 +10,7 @@ export async function runHttpJsonCheck(input: {
   privateNetwork: boolean;
   timeoutMs: number;
   fetch: FetchLike;
+  bearerToken?: string;
 }): Promise<CheckResult> {
   if (input.url === "") return misconfigured("The readiness URL is not configured.");
   let target: URL;
@@ -37,23 +38,37 @@ export async function runHttpJsonCheck(input: {
 
 async function fetchChecked(
   target: URL,
-  input: { spec: HttpCheckSpec; privateNetwork: boolean; timeoutMs: number; fetch: FetchLike },
+  input: {
+    spec: HttpCheckSpec;
+    privateNetwork: boolean;
+    timeoutMs: number;
+    fetch: FetchLike;
+    bearerToken?: string;
+  },
   started: number,
   hop: number,
 ): Promise<CheckResult> {
+  const headers: Record<string, string> = {
+    accept: "application/json",
+    "cache-control": "no-cache",
+    pragma: "no-cache",
+    ...input.spec.headers,
+  };
+  if (input.bearerToken) headers.authorization = `Bearer ${input.bearerToken}`;
   const response = await input.fetch(target.toString(), {
     method: "GET",
     redirect: "manual",
     signal: AbortSignal.timeout(input.timeoutMs),
-    headers: {
-      accept: "application/json",
-      "cache-control": "no-cache",
-      pragma: "no-cache",
-      ...input.spec.headers,
-    },
+    headers,
   });
   if (response.status >= 300 && response.status < 400) {
     await response.body?.cancel();
+    if (input.bearerToken) {
+      return misconfigured(
+        "The readiness endpoint redirected. The authenticated probe did not follow it.",
+        Date.now() - started,
+      );
+    }
     if (hop >= 2)
       return misconfigured(
         "The readiness endpoint redirected too many times.",
@@ -101,6 +116,17 @@ async function fetchChecked(
       return unknownResult("The readiness response was not JSON.", "schema", latencyMs);
     }
   }
+  if (input.spec.statusFromBody) {
+    return (
+      statusFromBody(body, response.status, input.spec, latencyMs) ??
+      result({
+        status: "down",
+        errorClass: "predicate",
+        summary: "The readiness response did not match its status contract.",
+        latencyMs,
+      })
+    );
+  }
   if (!input.spec.expectedStatuses.includes(response.status)) {
     return result({
       status: "down",
@@ -120,4 +146,38 @@ async function fetchChecked(
     }
   }
   return result({ status: "healthy", summary: "The readiness contract passed.", latencyMs });
+}
+
+function statusFromBody(
+  body: unknown,
+  httpStatus: number,
+  spec: HttpCheckSpec,
+  latencyMs: number,
+): CheckResult | null {
+  const map = spec.statusFromBody;
+  if (!map) return null;
+  const value = readPointer(body, map.pointer);
+  if (value === map.healthy && spec.expectedStatuses.includes(httpStatus)) {
+    return result({ status: "healthy", summary: "The readiness contract passed.", latencyMs });
+  }
+  if (map.degraded && value === map.degraded && httpStatus === 200) {
+    return result({
+      status: "degraded",
+      errorClass: "partial",
+      summary: "The endpoint is only partly available.",
+      latencyMs,
+    });
+  }
+  if (map.down && value === map.down) {
+    return result({
+      status: "down",
+      errorClass: "http_status",
+      summary: "The endpoint reported that it is down.",
+      latencyMs,
+    });
+  }
+  if (map.misconfigured && value === map.misconfigured) {
+    return misconfigured("The endpoint reported that it is misconfigured.", latencyMs);
+  }
+  return null;
 }
