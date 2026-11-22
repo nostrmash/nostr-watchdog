@@ -625,9 +625,7 @@ export async function installedVersion(db: D1Database, monitorId: string): Promi
   return row?.observed_version ?? null;
 }
 
-export async function statusSummary(
-  db: D1Database,
-): Promise<{
+export async function statusSummary(db: D1Database): Promise<{
   openIncidents: number;
   deadLetters: number;
   lastCheck: number | null;
