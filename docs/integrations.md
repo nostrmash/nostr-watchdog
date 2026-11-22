@@ -13,9 +13,9 @@ The response should not include secrets, hostnames of internal databases, or wal
 Use a heartbeat when the thing you care about is a job loop rather than an HTTP server. The Worker treats these as different signals:
 
 - `receivedAt` is when the signed request arrived.
-- `loopAt` is the last time that job loop iterated, including an iteration that found no work.
-- `idle` is true only when the loop observed an empty queue.
-- `progress` changes only when a unit of work finishes.
+- `loopAt` is the last time the process successfully observed its own work state. For a queue worker that is a completed queue inspection. For an ingestor it is a completed relay-state read. It is not the heartbeat send time, and it does not by itself prove a job or event was processed.
+- `idle` is true only when that observation found no actionable work. Future scheduled jobs and a quiet connected relay are idle. A paused queue, a waiting or active job, a due delayed job, a failed claim, or zero connected relays are not idle.
+- `progress` changes when a unit of work finishes. Use a process-start generation plus a counter so a restart does not look like a stall and retention of old completed jobs cannot freeze the counter.
 
 A fresh request with `idle: true` is healthy. A fresh request that is not idle, and whose progress has not changed, becomes degraded. A stale `loopAt` is down even if the HTTP request just arrived. A timer that sets `loopAt` to the send time stays green while the job loop is stuck. Do not do that.
 
@@ -76,7 +76,9 @@ The worker heartbeat's `loopAt` is the last claim-loop iteration. `idle` is true
 
 ## Read and publish gateways
 
-`nostrmash-read-gateway` and `nostrmash-publish-gateway` are HTTP monitors. Both stay disabled until `ENABLE_NOSTRMASH_READ_GATEWAY` or `ENABLE_NOSTRMASH_PUBLISH_GATEWAY` is `true` and the matching URL is set. Readiness is `GET /health` with `status` equal to `ok`. The publish gateway health route does not prove that an event can be published. This Worker does not publish a public Nostr event to test that.
+`nostrmash-read-gateway` and `nostrmash-publish-gateway` are HTTP monitors. Both stay disabled until their enable flag is `true` and the matching URL is set. Readiness is `GET /health` with `status` equal to `ok`. That does not prove a read or a publish works.
+
+Optional deep monitors use `GET /health/deep` and stay disabled unless `ENABLE_NOSTRMASH_READ_GATEWAY_DEEP` or `ENABLE_NOSTRMASH_PUBLISH_GATEWAY_DEEP` is `true`. The read probe runs one inexpensive upstream request and treats an authoritative empty result as success. The publish probe opens configured `PROBE_RELAYS` and closes them without sending an event. Relay acceptance of a real event is a separate manual test. This Worker does not publish a public Nostr event.
 
 ## What stays out of scope
 

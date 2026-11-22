@@ -113,14 +113,16 @@ describe("operational status", () => {
       }).status,
     ).toBe("misconfigured");
     expect(degraded.body.delivery).toMatchObject({ recentErrors: { relay_rejected: 2 } });
-    const healthy = derive({
+    bind({ ENABLE_SFS_ALBY: "false" });
+    const alertsOff = derive({
       ...recent,
       outbox: [],
       errors: [],
       heartbeats: [{ monitorId: "sfs-worker", receivedAt: NOW }],
     });
-    expect(healthy.status).toBe("healthy");
-    expect(healthy.httpStatus).toBe(200);
+    expect(alertsOff.status).toBe("alerts_disabled");
+    expect(alertsOff.httpStatus).toBe(503);
+    expect(alertsOff.body.alertsEnabled).toBe(false);
     const failedRun = derive({
       ...recent,
       outbox: [],
@@ -129,5 +131,99 @@ describe("operational status", () => {
       ],
     });
     expect(failedRun.status).toBe("degraded");
+  });
+
+  it("stays healthy while a customer monitor is down and alerts are configured", () => {
+    bind({
+      ENABLE_SFS_WEB: "true",
+      ALERTS_ENABLED: "true",
+      SFS_BOT_NSEC: "nsec-test",
+      ADMIN_NPUB: "npub-test",
+      BOOTSTRAP_RELAYS: "wss://relay.example",
+    });
+    const result = derive({
+      ...empty(),
+      states: [{ monitorId: "sfs-web", status: "down", lastCheckAt: NOW }],
+      openIncidents: 1,
+      runs: [
+        {
+          name: "checks",
+          startedAt: NOW - 10_000,
+          finishedAt: NOW - 1_000,
+          successAt: NOW - 1_000,
+          error: null,
+        },
+      ],
+    });
+    expect(result.status).toBe("healthy");
+    expect(result.httpStatus).toBe(200);
+    expect(result.body.monitors).toMatchObject({ down: 1 });
+  });
+
+  it("degrades when a required security-update cycle has not succeeded", () => {
+    bind({
+      ENABLE_SFS_ALBY: "true",
+      ALERTS_ENABLED: "true",
+      SFS_BOT_NSEC: "nsec-test",
+      ADMIN_NPUB: "npub-test",
+      BOOTSTRAP_RELAYS: "wss://relay.example",
+    });
+    const missing = derive({
+      ...empty(),
+      runs: [
+        {
+          name: "checks",
+          startedAt: NOW - 10_000,
+          finishedAt: NOW - 1_000,
+          successAt: NOW - 1_000,
+          error: null,
+        },
+        {
+          name: "updates",
+          startedAt: NOW - 10_000,
+          finishedAt: NOW - 1_000,
+          successAt: null,
+          error: "vendor_checks_failed",
+        },
+      ],
+      vendorChecks: [
+        {
+          monitorId: "sfs-alby-hub",
+          vendor: "getAlby/hub",
+          attemptedAt: NOW - 1_000,
+          succeededAt: null,
+          releasesCheckedAt: null,
+          advisoriesCheckedAt: null,
+          releasesStale: true,
+          advisoriesStale: true,
+          errorCode: "unavailable",
+          consecutiveFailures: 3,
+        },
+      ],
+    });
+    expect(missing.status).toBe("degraded");
+    expect(missing.body.securityChecks).toMatchObject([
+      { monitorId: "sfs-alby-hub", errorCode: "unavailable", consecutiveFailures: 3 },
+    ]);
+    const staleSuccess = derive({
+      ...empty(),
+      runs: [
+        {
+          name: "checks",
+          startedAt: NOW - 10_000,
+          finishedAt: NOW - 1_000,
+          successAt: NOW - 1_000,
+          error: null,
+        },
+        {
+          name: "updates",
+          startedAt: NOW - 1_000,
+          finishedAt: NOW - 1_000,
+          successAt: NOW - 7 * 3_600_000,
+          error: null,
+        },
+      ],
+    });
+    expect(staleSuccess.status).toBe("unhealthy");
   });
 });

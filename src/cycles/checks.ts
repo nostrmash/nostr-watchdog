@@ -82,7 +82,14 @@ export async function runCheckCycle(env: Env, deps: Dependencies): Promise<void>
     cycleError = cycleError ?? "dispatch_failed";
     log("error", "dispatch_failed", {});
   }
-  await markRun(env.DB, "checks", null, deps.now(), cycleError);
+  await markRun(
+    env.DB,
+    "checks",
+    null,
+    deps.now(),
+    cycleError,
+    cycleError === null ? deps.now() : null,
+  );
 }
 
 async function probe(

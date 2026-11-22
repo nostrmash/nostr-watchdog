@@ -9,7 +9,8 @@ export type ProjectId = string;
 
 export type Destination = "nostr" | "telegram";
 
-export type AlertClass = "outage" | "recovery" | "reminder" | "update" | "security" | "test";
+export type AlertClass =
+  "outage" | "recovery" | "reminder" | "update" | "security" | "integrity" | "test";
 
 export type DeliveryState = "queued" | "relay_accepted" | "retrying" | "failed";
 
