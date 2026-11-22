@@ -4,7 +4,8 @@ export type Severity = "info" | "warning" | "critical";
 
 export type IncidentKind = "outage" | "degraded" | "misconfigured" | "inconclusive";
 
-export type ProjectId = "smartflowsocial" | "nostrmash";
+/** Configured project id. Add projects in src/config/projects.ts; core code does not special-case ids. */
+export type ProjectId = string;
 
 export type Destination = "nostr" | "telegram";
 
@@ -47,6 +48,8 @@ export interface MonitorDefinition {
   intervalSeconds: number;
   failureThreshold: number;
   recoveryThreshold: number;
+  /** Consecutive unknown samples before a monitoring-integrity warning. */
+  unknownThreshold: number;
   severity: Severity;
   incidentOnDegraded: boolean;
   runbookPath: string;
@@ -71,6 +74,10 @@ export interface MonitorMemory {
   consecutiveFailures: number;
   failureKind: MonitorStatus | null;
   openIncident: OpenIncident | null;
+  integrityIncident: OpenIncident | null;
+  consecutiveUnknowns: number;
+  unknownSince: number | null;
+  lastUnknownReason: string | null;
   observedVersion: string | null;
 }
 
@@ -86,7 +93,9 @@ export interface Notice {
 
 export interface TransitionResult {
   memory: MonitorMemory;
+  /** Preferred notice for callers that handle one event. Integrity closes yield to outage notices. */
   notice: Notice | null;
+  notices: Notice[];
   changed: boolean;
 }
 
@@ -119,6 +128,9 @@ export interface OutboxRow {
   attempt_count: number;
   next_attempt_at: number;
   claim_until: number | null;
+  claim_token: string | null;
+  accepted_relays: string | null;
+  failed_relays: string | null;
   last_error: string | null;
   created_at: number;
   updated_at: number;

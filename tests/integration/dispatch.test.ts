@@ -3,10 +3,10 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { dispatchDue } from "../../src/cycles/dispatch";
 import { loadSettings } from "../../src/config/settings";
-import { insertAlert } from "../../src/state/store";
+import { claimOutbox, finishDelivery, insertAlert } from "../../src/state/store";
 import type { AlertDraft } from "../../src/types";
 import { bind, binding, jsonResponse } from "../helpers";
-import { serveInbox, socketPair } from "../relay-pair";
+import { serveInbox, signedInbox, socketPair } from "../relay-pair";
 import { decode } from "nostr-tools/nip19";
 
 afterEach(() => {
@@ -41,7 +41,6 @@ describe("delivery", () => {
   it("accepts a gift wrap on the discovered inbox and republishes the same event after a retry", async () => {
     const recipient = decode(binding("TEST_RECIPIENT_NSEC"));
     if (recipient.type !== "nsec") throw new Error("recipient");
-    const author = (await import("nostr-tools/pure")).getPublicKey(recipient.data);
     bind({ BOOTSTRAP_RELAYS: "wss://bootstrap.example" });
     const now = { value: 1_700_000_000_000 };
     let attempt = 0;
@@ -52,7 +51,9 @@ describe("delivery", () => {
       connectRelay: async (url: string) => {
         const { client, server } = socketPair();
         if (url === "wss://bootstrap.example")
-          serveInbox(server, author, [{ created_at: 1, tags: [["relay", "wss://inbox.example"]] }]);
+          serveInbox(server, [
+            signedInbox(recipient.data, 1_700_000_001, [["relay", "wss://inbox.example"]]),
+          ]);
         else {
           attempt += 1;
           server.onMessage((data) => {
@@ -87,7 +88,6 @@ describe("delivery", () => {
   it("keeps the nostr alert when telegram fails and falls back only in nostr_fallback mode", async () => {
     const recipient = decode(binding("TEST_RECIPIENT_NSEC"));
     if (recipient.type !== "nsec") throw new Error("recipient");
-    const author = (await import("nostr-tools/pure")).getPublicKey(recipient.data);
     bind({
       BOOTSTRAP_RELAYS: "wss://bootstrap.example",
       TELEGRAM_BOT_TOKEN: "telegram-token",
@@ -103,7 +103,9 @@ describe("delivery", () => {
       connectRelay: async (url: string) => {
         const { client, server } = socketPair();
         if (url === "wss://bootstrap.example")
-          serveInbox(server, author, [{ created_at: 1, tags: [["relay", "wss://inbox.example"]] }]);
+          serveInbox(server, [
+            signedInbox(recipient.data, 1_700_000_001, [["relay", "wss://inbox.example"]]),
+          ]);
         else
           server.onMessage((data) => {
             const message = JSON.parse(data) as [string, { id: string }];
@@ -132,8 +134,8 @@ describe("delivery", () => {
         connectRelay: async (url: string) => {
           const { client, server } = socketPair();
           if (url === "wss://bootstrap.example")
-            serveInbox(server, author, [
-              { created_at: 1, tags: [["relay", "wss://inbox.example"]] },
+            serveInbox(server, [
+              signedInbox(recipient.data, 1_700_000_001, [["relay", "wss://inbox.example"]]),
             ]);
           else
             server.onMessage((data) => {
@@ -159,7 +161,6 @@ describe("delivery", () => {
     bind({ BOOTSTRAP_RELAYS: "wss://bootstrap.example" });
     const recipient = decode(binding("TEST_RECIPIENT_NSEC"));
     if (recipient.type !== "nsec") throw new Error("recipient");
-    const author = (await import("nostr-tools/pure")).getPublicKey(recipient.data);
     const now = 1_720_000_000_000;
     await insertAlert(env.DB, alert("alt_empty"), now);
     await dispatchDue(
@@ -169,7 +170,7 @@ describe("delivery", () => {
         fetch: async () => jsonResponse({}),
         connectRelay: async () => {
           const { client, server } = socketPair();
-          serveInbox(server, author, []);
+          serveInbox(server, []);
           return client;
         },
       },
@@ -179,5 +180,32 @@ describe("delivery", () => {
       .bind("alt_empty")
       .first<{ state: string; last_error: string }>();
     expect(row).toEqual({ state: "failed", last_error: "recipient_inbox_missing" });
+  });
+
+  it("drops a finish from a claimant whose lease was replaced", async () => {
+    const now = 1_730_000_000_000;
+    await insertAlert(env.DB, alert("alt_fence"), now);
+    const claimed = await claimOutbox(env.DB, now, now + 1_000);
+    expect(claimed).toHaveLength(1);
+    const token = claimed[0]?.claim_token ?? "";
+    await env.DB.prepare("UPDATE alert_outbox SET claim_token = ? WHERE id = ?")
+      .bind("newer-token", "alt_fence")
+      .run();
+    const owned = await finishDelivery(env.DB, {
+      id: "alt_fence",
+      token,
+      state: "relay_accepted",
+      attemptCount: 1,
+      nextAttemptAt: now,
+      error: null,
+      acceptedRelays: ["wss://inbox.example"],
+      failedRelays: [],
+      now,
+    });
+    expect(owned).toBe(false);
+    const row = await env.DB.prepare("SELECT state, claim_token FROM alert_outbox WHERE id = ?")
+      .bind("alt_fence")
+      .first<{ state: string; claim_token: string }>();
+    expect(row).toEqual({ state: "retrying", claim_token: "newer-token" });
   });
 });

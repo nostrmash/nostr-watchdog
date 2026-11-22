@@ -39,6 +39,9 @@
     "HEARTBEAT_STALE_SECONDS": "180",
     "HEARTBEAT_PROGRESS_SECONDS": "600",
     "CRITICAL_REMINDER_SECONDS": "0",
+    "UNKNOWN_THRESHOLD": "5",
+    "DELIVERY_CLAIM_MS": "120000",
+    "SCHEDULER_STALE_SECONDS": "180",
     "TELEGRAM_CRITICAL_MODE": "dual",
     "BOOTSTRAP_RELAYS": "",
     "GITHUB_API_BASE": "https://api.github.com",
@@ -62,6 +65,10 @@
     "NOSTRMASH_API_READY_URL": "",
     "ENABLE_NOSTRMASH_INGESTOR": "false",
     "ENABLE_NOSTRMASH_WORKER": "false",
+    "ENABLE_NOSTRMASH_READ_GATEWAY": "false",
+    "NOSTRMASH_READ_GATEWAY_URL": "",
+    "ENABLE_NOSTRMASH_PUBLISH_GATEWAY": "false",
+    "NOSTRMASH_PUBLISH_GATEWAY_URL": "",
   },
   "secrets": {
     "required": [
@@ -112,6 +119,9 @@
         "HEARTBEAT_STALE_SECONDS": "180",
         "HEARTBEAT_PROGRESS_SECONDS": "600",
         "CRITICAL_REMINDER_SECONDS": "0",
+        "UNKNOWN_THRESHOLD": "5",
+        "DELIVERY_CLAIM_MS": "120000",
+        "SCHEDULER_STALE_SECONDS": "180",
         "TELEGRAM_CRITICAL_MODE": "dual",
         "BOOTSTRAP_RELAYS": "",
         "GITHUB_API_BASE": "https://api.github.com",
@@ -135,6 +145,10 @@
         "NOSTRMASH_API_READY_URL": "",
         "ENABLE_NOSTRMASH_INGESTOR": "false",
         "ENABLE_NOSTRMASH_WORKER": "false",
+        "ENABLE_NOSTRMASH_READ_GATEWAY": "false",
+        "NOSTRMASH_READ_GATEWAY_URL": "",
+        "ENABLE_NOSTRMASH_PUBLISH_GATEWAY": "false",
+        "NOSTRMASH_PUBLISH_GATEWAY_URL": "",
       },
       "secrets": {
         "required": [
@@ -185,6 +199,9 @@
         "HEARTBEAT_STALE_SECONDS": "180",
         "HEARTBEAT_PROGRESS_SECONDS": "600",
         "CRITICAL_REMINDER_SECONDS": "0",
+        "UNKNOWN_THRESHOLD": "5",
+        "DELIVERY_CLAIM_MS": "120000",
+        "SCHEDULER_STALE_SECONDS": "180",
         "TELEGRAM_CRITICAL_MODE": "dual",
         "BOOTSTRAP_RELAYS": "",
         "GITHUB_API_BASE": "https://api.github.com",
@@ -208,6 +225,10 @@
         "NOSTRMASH_API_READY_URL": "",
         "ENABLE_NOSTRMASH_INGESTOR": "false",
         "ENABLE_NOSTRMASH_WORKER": "false",
+        "ENABLE_NOSTRMASH_READ_GATEWAY": "false",
+        "NOSTRMASH_READ_GATEWAY_URL": "",
+        "ENABLE_NOSTRMASH_PUBLISH_GATEWAY": "false",
+        "NOSTRMASH_PUBLISH_GATEWAY_URL": "",
       },
       "secrets": {
         "required": [

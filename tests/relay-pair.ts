@@ -1,3 +1,5 @@
+import { finalizeEvent, type Event } from "nostr-tools/pure";
+
 import type { JsonSocket } from "../src/alerts/relay";
 
 export function socketPair(): { client: JsonSocket; server: JsonSocket } {
@@ -24,26 +26,23 @@ export function socketPair(): { client: JsonSocket; server: JsonSocket } {
     onClose(handler) {
       (name === "client" ? handlers.clientClose : handlers.serverClose).push(handler);
     },
+    onError(handler) {
+      (name === "client" ? handlers.clientClose : handlers.serverClose).push(handler);
+    },
   });
   return { client: socket("client"), server: socket("server") };
 }
 
-export function serveInbox(
-  server: JsonSocket,
-  author: string,
-  events: Array<{ created_at: number; tags: string[][] }>,
-): void {
+export function signedInbox(secret: Uint8Array, createdAt: number, tags: string[][]): Event {
+  return finalizeEvent({ kind: 10050, created_at: createdAt, tags, content: "" }, secret);
+}
+
+export function serveInbox(server: JsonSocket, events: Event[]): void {
   server.onMessage((data) => {
     const message = JSON.parse(data) as unknown[];
     if (message[0] === "REQ") {
       for (const event of events) {
-        server.send(
-          JSON.stringify([
-            "EVENT",
-            message[1],
-            { kind: 10050, pubkey: author, content: "", id: "event", sig: "sig", ...event },
-          ]),
-        );
+        server.send(JSON.stringify(["EVENT", message[1], event]));
       }
       server.send(JSON.stringify(["EOSE", message[1]]));
     }

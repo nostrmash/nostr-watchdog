@@ -9,6 +9,7 @@ const monitor = {
   recoveryThreshold: 2,
   severity: "critical" as const,
   incidentOnDegraded: true,
+  unknownThreshold: 3,
 };
 
 function check(status: CheckResult["status"], summary = status): CheckResult {
@@ -90,6 +91,26 @@ describe("incident transitions", () => {
     const critical = step(step(emptyMemory(), "down", 1).memory, "down", 2);
     const reminder = step(critical.memory, "down", 8_000, 5);
     expect(reminder.notice?.event).toBe("remind");
+  });
+
+  it("opens one monitoring-integrity warning after repeated unknown samples and keeps the outage", () => {
+    let current = step(step(emptyMemory(), "down", 1).memory, "down", 2);
+    current = step(current.memory, "unknown", 3);
+    expect(current.notice).toBeNull();
+    current = step(current.memory, "unknown", 4);
+    expect(current.notice).toBeNull();
+    current = step(current.memory, "unknown", 5);
+    expect(current.notice?.kind).toBe("inconclusive");
+    expect(current.notice?.severity).toBe("warning");
+    expect(current.memory.openIncident?.kind).toBe("outage");
+    expect(current.memory.consecutiveFailures).toBe(2);
+    const duplicate = step(current.memory, "unknown", 6);
+    expect(duplicate.notice).toBeNull();
+    const resumed = step(current.memory, "down", 7);
+    expect(
+      resumed.notices.some((item) => item.kind === "inconclusive" && item.event === "close"),
+    ).toBe(true);
+    expect(resumed.memory.openIncident?.kind).toBe("outage");
   });
 
   it("redacts secrets from alert text", () => {

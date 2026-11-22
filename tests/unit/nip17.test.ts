@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
+import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { npubEncode } from "nostr-tools/nip19";
 
 import {
@@ -9,7 +9,8 @@ import {
   publishGiftWrap,
   recipientPubkey,
 } from "../../src/alerts/nip17";
-import { serveInbox, socketPair } from "../relay-pair";
+import { verifyInboxEvent, workersWebSocketUrl } from "../../src/alerts/relay";
+import { serveInbox, signedInbox, socketPair } from "../relay-pair";
 
 describe("nip17", () => {
   it("round-trips a gift wrap for two different senders and only the recipient", () => {
@@ -33,24 +34,23 @@ describe("nip17", () => {
   });
 
   it("publishes only to the newest valid kind 10050 inbox", async () => {
-    const author = getPublicKey(generateSecretKey());
+    const inboxSecret = generateSecretKey();
+    const author = getPublicKey(inboxSecret);
     const sender = generateSecretKey();
     const discovered = await discoverInbox({
       author,
       bootstrap: ["wss://bootstrap.example"],
       timeoutMs: 1000,
+      nowMs: 1_700_000_100_000,
       connect: async (url) => {
         expect(url).toBe("wss://bootstrap.example");
         const { client, server } = socketPair();
-        serveInbox(server, author, [
-          { created_at: 1, tags: [["relay", "wss://old.example"]] },
-          {
-            created_at: 2,
-            tags: [
-              ["relay", "https://bad.example"],
-              ["relay", "wss://inbox.example"],
-            ],
-          },
+        serveInbox(server, [
+          signedInbox(inboxSecret, 1_700_000_001, [["relay", "wss://old.example"]]),
+          signedInbox(inboxSecret, 1_700_000_002, [
+            ["relay", "https://bad.example"],
+            ["relay", "wss://inbox.example"],
+          ]),
         ]);
         return client;
       },
@@ -102,25 +102,67 @@ describe("nip17", () => {
       author,
       bootstrap: ["wss://bootstrap.example"],
       timeoutMs: 1000,
+      nowMs: 1_700_000_100_000,
       connect: async () => {
         const { client, server } = socketPair();
-        serveInbox(server, author, []);
+        serveInbox(server, []);
         return client;
       },
     });
-    expect(empty).toEqual({ relays: [], definitiveEmpty: true });
+    expect(empty.relays).toEqual([]);
+    expect(empty.definitiveEmpty).toBe(true);
     const mixed = await discoverInbox({
       author,
       bootstrap: ["wss://down.example", "wss://empty.example"],
       timeoutMs: 1000,
+      nowMs: 1_700_000_100_000,
       connect: async (url) => {
         if (url.endsWith("down.example")) throw new Error("timeout");
         const { client, server } = socketPair();
-        serveInbox(server, author, []);
+        serveInbox(server, []);
         return client;
       },
     });
     expect(mixed.definitiveEmpty).toBe(false);
+  });
+
+  it("rejects forged inbox events and keeps the newest valid event across relays", async () => {
+    const secret = generateSecretKey();
+    const author = getPublicKey(secret);
+    const other = generateSecretKey();
+    const valid = signedInbox(secret, 1_700_000_010, [["relay", "wss://new.example"]]);
+    const older = signedInbox(secret, 1_700_000_001, [["relay", "wss://old.example"]]);
+    const forged = { ...valid, sig: "ab".repeat(64), id: "cd".repeat(32) };
+    expect(verifyInboxEvent(forged, author, 1_700_000_100)).toBeNull();
+    const wrongAuthor = finalizeEvent(
+      {
+        kind: 10050,
+        created_at: 1_700_000_050,
+        tags: [["relay", "wss://attacker.example"]],
+        content: "",
+      },
+      other,
+    );
+    expect(verifyInboxEvent(wrongAuthor, author, 1_700_000_100)).toBeNull();
+    const discovered = await discoverInbox({
+      author,
+      bootstrap: ["wss://a.example", "wss://b.example"],
+      timeoutMs: 1000,
+      nowMs: 1_700_000_100_000,
+      connect: async (url) => {
+        const { client, server } = socketPair();
+        serveInbox(server, url.endsWith("a.example") ? [older, forged as typeof valid] : [valid]);
+        return client;
+      },
+    });
+    expect(discovered.relays).toEqual(["wss://new.example"]);
+    expect(discovered.event?.id).toBe(valid.id);
+  });
+
+  it("converts relay URLs to https for the Workers fetch upgrade and rejects ws", () => {
+    expect(workersWebSocketUrl("wss://relay.example/path")).toBe("https://relay.example/path");
+    expect(() => workersWebSocketUrl("ws://relay.example")).toThrow();
+    expect(() => workersWebSocketUrl("https://relay.example")).toThrow();
   });
 
   it("builds a gift wrap within a local execution budget", () => {

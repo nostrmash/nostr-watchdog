@@ -17,6 +17,7 @@ export async function fetchReleases(input: {
   token: string;
   etag: string | null;
   fetch: FetchLike;
+  timeoutMs?: number;
 }): Promise<GithubFetch> {
   const response = await requestGithub(
     input,
@@ -36,6 +37,7 @@ export async function fetchReleases(input: {
       url,
       prerelease: record.prerelease === true,
       draft: record.draft === true,
+      securityRelated: releaseMentionsSecurity(record),
     });
   }
   return { kind: "ok", etag: response.etag, releases };
@@ -48,6 +50,7 @@ export async function fetchAdvisories(input: {
   token: string;
   etag: string | null;
   fetch: FetchLike;
+  timeoutMs?: number;
 }): Promise<GithubFetch> {
   const response = await requestGithub(
     input,
@@ -82,8 +85,23 @@ export async function fetchAdvisories(input: {
   return { kind: "ok", etag: response.etag, advisories };
 }
 
+const SECURITY_HINT =
+  /\b(security|vulnerabilit(?:y|ies)|cve-\d{4}-\d+|ghsa-[0-9a-z-]+|advisory)\b/i;
+
+function releaseMentionsSecurity(record: Record<string, unknown>): boolean {
+  const name = typeof record.name === "string" ? record.name : "";
+  const body = typeof record.body === "string" ? record.body.slice(0, 8_000) : "";
+  return SECURITY_HINT.test(`${name}\n${body}`);
+}
+
 async function requestGithub(
-  input: { apiBase: string; token: string; etag: string | null; fetch: FetchLike },
+  input: {
+    apiBase: string;
+    token: string;
+    etag: string | null;
+    fetch: FetchLike;
+    timeoutMs?: number;
+  },
   path: string,
 ): Promise<
   | { kind: "ok"; etag: string | null; body: unknown }
@@ -111,11 +129,17 @@ async function requestGithub(
   });
   if (input.etag) headers.set("if-none-match", input.etag);
   if (input.token !== "") headers.set("authorization", `Bearer ${input.token}`);
-  const response = await input.fetch(url.toString(), {
-    method: "GET",
-    headers,
-    redirect: "manual",
-  });
+  let response: Response;
+  try {
+    response = await input.fetch(url.toString(), {
+      method: "GET",
+      headers,
+      redirect: "manual",
+      signal: AbortSignal.timeout(input.timeoutMs ?? 10_000),
+    });
+  } catch {
+    return { kind: "unavailable" };
+  }
   if (response.status === 304) {
     await response.body?.cancel();
     return { kind: "not_modified" };

@@ -15,11 +15,19 @@ const EMPTY: MonitorMemory = {
   consecutiveFailures: 0,
   failureKind: null,
   openIncident: null,
+  integrityIncident: null,
+  consecutiveUnknowns: 0,
+  unknownSince: null,
+  lastUnknownReason: null,
   observedVersion: null,
 };
 
 export function emptyMemory(): MonitorMemory {
-  return { ...EMPTY, openIncident: null };
+  return {
+    ...EMPTY,
+    openIncident: null,
+    integrityIncident: null,
+  };
 }
 
 export function transition(input: {
@@ -28,20 +36,30 @@ export function transition(input: {
   now: number;
   monitor: Pick<
     MonitorDefinition,
-    "failureThreshold" | "recoveryThreshold" | "severity" | "incidentOnDegraded"
+    | "failureThreshold"
+    | "recoveryThreshold"
+    | "severity"
+    | "incidentOnDegraded"
+    | "unknownThreshold"
   >;
   reminderSeconds: number;
   newIncidentId: string;
+  newIntegrityIncidentId?: string;
 }): TransitionResult {
   const memory: MonitorMemory = {
     ...input.memory,
     openIncident: input.memory.openIncident ? { ...input.memory.openIncident } : null,
+    integrityIncident: input.memory.integrityIncident
+      ? { ...input.memory.integrityIncident }
+      : null,
     observedVersion: input.result.observedVersion ?? input.memory.observedVersion,
   };
-  if (input.result.status === "unknown") {
-    memory.status = "unknown";
-    return { memory, notice: null, changed: true };
-  }
+  if (input.result.status === "unknown") return applyUnknown(memory, input);
+  const notices: Notice[] = [];
+  closeIntegrity(memory, notices, input.now, input.result.summary);
+  memory.consecutiveUnknowns = 0;
+  memory.unknownSince = null;
+  memory.lastUnknownReason = null;
   if (input.result.status === "healthy") {
     memory.status = "healthy";
     memory.consecutiveSuccesses += 1;
@@ -50,10 +68,8 @@ export function transition(input: {
     if (memory.openIncident && memory.consecutiveSuccesses >= input.monitor.recoveryThreshold) {
       const incident = memory.openIncident;
       memory.openIncident = null;
-      return {
-        memory,
-        changed: true,
-        notice: notice(
+      notices.push(
+        notice(
           "close",
           incident.id,
           incident.kind,
@@ -62,15 +78,15 @@ export function transition(input: {
           input.now,
           "healthy",
         ),
-      };
+      );
     }
-    return { memory, notice: null, changed: true };
+    return done(memory, notices);
   }
   const kind = incidentKind(input.result.status, input.monitor.incidentOnDegraded);
   if (!kind) {
     memory.status = input.result.status;
     memory.consecutiveSuccesses = 0;
-    return { memory, notice: null, changed: true };
+    return done(memory, notices);
   }
   if (memory.failureKind === input.result.status) memory.consecutiveFailures += 1;
   else memory.consecutiveFailures = 1;
@@ -90,10 +106,8 @@ export function transition(input: {
       silencedUntil: null,
       ackedAt: null,
     };
-    return {
-      memory,
-      changed: true,
-      notice: notice(
+    notices.push(
+      notice(
         "open",
         input.newIncidentId,
         kind,
@@ -102,7 +116,8 @@ export function transition(input: {
         input.now,
         input.result.status,
       ),
-    };
+    );
+    return done(memory, notices);
   }
   const open = memory.openIncident;
   if (
@@ -116,10 +131,8 @@ export function transition(input: {
   ) {
     open.reminderCount += 1;
     open.lastReminderAt = input.now;
-    return {
-      memory,
-      changed: true,
-      notice: notice(
+    notices.push(
+      notice(
         "remind",
         open.id,
         open.kind,
@@ -128,9 +141,80 @@ export function transition(input: {
         input.now,
         input.result.status,
       ),
-    };
+    );
   }
-  return { memory, notice: null, changed: true };
+  return done(memory, notices);
+}
+
+function applyUnknown(
+  memory: MonitorMemory,
+  input: {
+    result: CheckResult;
+    now: number;
+    monitor: Pick<MonitorDefinition, "unknownThreshold">;
+    newIncidentId: string;
+    newIntegrityIncidentId?: string;
+  },
+): TransitionResult {
+  memory.consecutiveUnknowns += 1;
+  memory.unknownSince ??= input.now;
+  memory.lastUnknownReason = input.result.summary;
+  if (!memory.openIncident) memory.status = "unknown";
+  const threshold = input.monitor.unknownThreshold;
+  if (!memory.integrityIncident && memory.consecutiveUnknowns >= threshold) {
+    const id = input.newIntegrityIncidentId ?? input.newIncidentId;
+    memory.integrityIncident = {
+      id,
+      kind: "inconclusive",
+      severity: "warning",
+      openedAt: input.now,
+      reminderCount: 0,
+      lastReminderAt: null,
+      silencedUntil: null,
+      ackedAt: null,
+    };
+    const opened = notice(
+      "open",
+      id,
+      "inconclusive",
+      "warning",
+      input.result.summary,
+      input.now,
+      memory.status,
+    );
+    return { memory, notice: opened, notices: [opened], changed: true };
+  }
+  return { memory, notice: null, notices: [], changed: true };
+}
+
+function closeIntegrity(
+  memory: MonitorMemory,
+  notices: Notice[],
+  now: number,
+  reason: string,
+): void {
+  if (!memory.integrityIncident) return;
+  const incident = memory.integrityIncident;
+  memory.integrityIncident = null;
+  notices.push(
+    notice(
+      "close",
+      incident.id,
+      "inconclusive",
+      incident.severity,
+      `Monitoring produced a conclusive sample. ${reason}`,
+      now,
+      "healthy",
+    ),
+  );
+}
+
+function done(memory: MonitorMemory, notices: Notice[]): TransitionResult {
+  return { memory, notice: primaryNotice(notices), notices, changed: true };
+}
+
+function primaryNotice(notices: Notice[]): Notice | null {
+  return notices.find((item) => item.kind !== "inconclusive") ?? notices[0] ?? null;
 }
 
 function incidentKind(status: MonitorStatus, incidentOnDegraded: boolean): IncidentKind | null {

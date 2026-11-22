@@ -16,8 +16,9 @@ import {
   writeUpstream,
   writeVersion,
 } from "../state/store";
-import { assessAdvisories, type AdvisoryRef, type SecurityStatus } from "../updates/advisories";
+import type { AdvisoryRef, SecurityStatus } from "../updates/advisories";
 import { fetchAdvisories, fetchReleases } from "../updates/github";
+import { alertSeverity, assessSecurity } from "../updates/security";
 import { latestStable, updateAvailable, type ReleaseRef } from "../updates/semver";
 import type { AlertDraft, MonitorDefinition, VendorId } from "../types";
 import { dispatchDue } from "./dispatch";
@@ -37,7 +38,11 @@ export async function runUpdateCycle(env: Env, deps: Dependencies): Promise<void
     await markRun(env.DB, "updates", started, null, null);
     for (const monitor of enabledMonitors(env)) {
       if (!monitor.versionVendor) continue;
-      await checkVendor(env, deps, settings, monitor, monitor.versionVendor);
+      try {
+        await checkVendor(env, deps, settings, monitor, monitor.versionVendor);
+      } catch {
+        log("error", "vendor_check_failed", { monitor: monitor.id });
+      }
     }
     await dispatchDue(env, deps, settings);
     await markRun(env.DB, "updates", null, deps.now(), null);
@@ -64,23 +69,23 @@ async function checkVendor(
   const previous = await readVersion(env.DB, monitor.id);
   const latest = releases ? latestStable(releases) : null;
   const comparison = installed && latest ? updateAvailable(installed, latest.tag) : null;
-  const assessment =
-    advisoryFeed.failed && !advisoryFeed.advisories
-      ? assessAdvisories(installed, null)
-      : assessAdvisories(installed, advisoryFeed.advisories);
-  const securityStatus: SecurityStatus =
-    advisoryFeed.failed && previous
-      ? (previous.securityStatus as SecurityStatus)
-      : assessment.status;
+  const assessment = assessSecurity({
+    vendorId,
+    installed,
+    advisories: advisoryFeed.advisories,
+    releases,
+  });
+  const securityStatus: SecurityStatus = assessment.status;
   const alerts: AlertDraft[] = [];
   let notice = previous?.noticeFingerprint ?? null;
   if (comparison === true && latest && previous?.latest !== latest.tag) {
     alerts.push(versionAlert(monitor, installed ?? "", latest.tag, latest.url, now));
     notice = `update:${latest.tag}`;
   }
+  const severity = alertSeverity(assessment.status);
   if (
-    !advisoryFeed.failed &&
-    (assessment.status === "affected" || assessment.status === "review_recommended") &&
+    severity &&
+    assessment.status !== "unknown" &&
     assessment.fingerprint !== previous?.advisoryFingerprint
   ) {
     alerts.push(
@@ -133,6 +138,7 @@ async function loadReleases(
     token: readString(env, "GITHUB_TOKEN"),
     etag: cache?.etag ?? null,
     fetch: deps.fetch,
+    timeoutMs: settings.timeoutMs,
   });
   if (fetched.kind === "not_modified") return asReleases(cache?.payload);
   if (fetched.kind === "rate_limited") {
@@ -173,6 +179,7 @@ async function loadAdvisories(
     token: readString(env, "GITHUB_TOKEN"),
     etag: cache?.etag ?? null,
     fetch: deps.fetch,
+    timeoutMs: settings.timeoutMs,
   });
   if (fetched.kind === "not_modified")
     return { advisories: asAdvisories(cache?.payload), failed: false };
@@ -243,6 +250,7 @@ function securityAlerts(
     summary,
     url,
     occurredAt: now,
+    classification: status,
   });
   const drafts = [securityDraft(monitor, severity, fingerprint, "nostr", text)];
   if (

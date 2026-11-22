@@ -1,6 +1,6 @@
 {
   "name": "nostr-watchdog",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Independent Cloudflare Worker that monitors configured services and sends encrypted NIP-17 alerts.",
   "license": "Unlicense",
@@ -69,7 +69,7 @@
     "husky": "^9.1.7",
     "lint-staged": "^17.6.1",
     "prettier": "^3.10.1",
-    "typescript": "~5.9.3",
+    "typescript": "~6.0.3",
     "typescript-eslint": "^8.73.0",
     "vitest": "~4.1.12",
     "wrangler": "^4.166.0"

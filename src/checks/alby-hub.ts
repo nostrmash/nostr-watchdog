@@ -194,14 +194,28 @@ export function classifyAlby(input: {
     }
   }
   const base = { latencyMs: input.latencyMs, observedVersion: input.version };
-  if (!input.info.running || input.alarms.includes("node_not_ready") || !input.nodeReady) {
+  if (!input.info.running) {
     return result({
       ...base,
       status: "degraded",
       errorClass: "node_not_ready",
-      summary: input.info.running
-        ? "The Alby Hub is up and the Lightning node is not ready."
-        : "The Alby Hub API is up and the node is not running.",
+      summary: "The Alby Hub API is up and the node is not running.",
+    });
+  }
+  if (!input.info.unlocked) {
+    return result({
+      ...base,
+      status: "degraded",
+      errorClass: "locked",
+      summary: "The Alby Hub API is up and the hub is locked, so the Lightning node is not usable.",
+    });
+  }
+  if (input.alarms.includes("node_not_ready") || !input.nodeReady) {
+    return result({
+      ...base,
+      status: "degraded",
+      errorClass: "node_not_ready",
+      summary: "The Alby Hub is up and the Lightning node is not ready.",
     });
   }
   if (input.alarms.includes("alby_service")) {

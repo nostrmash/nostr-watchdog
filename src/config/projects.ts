@@ -4,10 +4,10 @@ export interface ProjectDefinition {
   id: ProjectId;
   displayName: string;
   contactName: string;
-  senderSecret: "SFS_BOT_NSEC" | "NOSTRMASH_BOT_NSEC";
+  senderSecret: keyof Env;
 }
 
-export const PROJECTS: Record<ProjectId, ProjectDefinition> = {
+export const PROJECTS: Record<string, ProjectDefinition> = {
   smartflowsocial: {
     id: "smartflowsocial",
     displayName: "SmartFlowSocial",
@@ -21,6 +21,10 @@ export const PROJECTS: Record<ProjectId, ProjectDefinition> = {
     senderSecret: "NOSTRMASH_BOT_NSEC",
   },
 };
+
+export function projectById(id: string): ProjectDefinition | null {
+  return PROJECTS[id] ?? null;
+}
 
 export function projectRecipient(env: Env, projectId: ProjectId): string | null {
   const raw = env.PROJECT_RECIPIENTS.trim();

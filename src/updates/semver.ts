@@ -73,6 +73,7 @@ export interface ReleaseRef {
   url: string;
   prerelease: boolean;
   draft: boolean;
+  securityRelated?: boolean;
 }
 
 export function latestStable(releases: ReleaseRef[], includePrerelease = false): ReleaseRef | null {
