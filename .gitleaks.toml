@@ -1,0 +1,9 @@
+title = "nostr-watchdog"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic NIP-19 prefix used to test redaction. It is not a key."
+regexTarget = "line"
+regexes = ['''nsec1q{10,}''']

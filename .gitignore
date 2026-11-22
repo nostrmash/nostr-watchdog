@@ -3,6 +3,8 @@ node_modules/
 .dev.vars
 dist/
 coverage/
+.eslintcache
+eslint-report.json
 *.log
 .DS_Store
 *.tsbuildinfo

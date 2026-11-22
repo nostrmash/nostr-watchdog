@@ -2,20 +2,42 @@
   "name": "nostr-watchdog",
   "version": "0.1.0",
   "private": true,
+  "description": "Independent Cloudflare Worker that monitors configured services and sends encrypted NIP-17 alerts.",
   "license": "Unlicense",
   "type": "module",
   "packageManager": "pnpm@12.21.0",
   "engines": {
-    "node": ">=22"
+    "node": ">=26.13.1"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nostrmash/nostr-watchdog.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nostrmash/nostr-watchdog/issues"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "monitoring",
+    "nip-17",
+    "nostr",
+    "typescript"
+  ],
   "scripts": {
     "dev": "wrangler dev",
     "start": "wrangler dev",
     "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:security": "vitest run tests/security",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tests/tsconfig.json",
     "lint": "eslint .",
+    "lint:fix": "eslint --fix .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "validate": "pnpm format:check && pnpm lint && pnpm typecheck",
     "cf-typegen": "wrangler types",
     "migrate:local": "wrangler d1 migrations apply nostr-watchdog --local",
     "migrate:staging": "wrangler d1 migrations apply nostr-watchdog-staging --env staging --remote",
@@ -23,7 +45,17 @@
     "deploy:staging": "wrangler deploy --env staging",
     "deploy:production": "wrangler deploy --env production",
     "build": "wrangler deploy --dry-run --outdir dist --env=",
-    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm build"
+    "check": "pnpm validate && pnpm test && pnpm test:coverage && pnpm build",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.ts": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{js,json,md,yml,yaml}": [
+      "prettier --write"
+    ]
   },
   "dependencies": {
     "nostr-tools": "^2.26.1"
@@ -32,7 +64,10 @@
     "@cloudflare/vitest-plugin": "^1.6.1",
     "@eslint/js": "^10.0.1",
     "@types/node": "22.19.1",
+    "@vitest/coverage-v8": "4.1.12",
     "eslint": "^10.15.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.1",
     "prettier": "^3.10.1",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.73.0",
