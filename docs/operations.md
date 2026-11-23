@@ -78,7 +78,7 @@ Ack when a person has seen a critical incident and further reminders would only 
 ## Limits
 
 - This Worker cannot see a Cloudflare outage that takes the Worker down.
-- Kind 10050 discovery depends on the bootstrap relays being reachable from Cloudflare.
+- Kind 10050 discovery starts at the bootstrap relays. After the first list is stored, the next lookup also asks those inbox relays. Both must be reachable from Cloudflare.
 - A quiet service is healthy when its heartbeat says the loop is idle. This version does not treat a low request count as an outage.
 - An `alby_hub` monitor without a read-only token, and a `btcpay` monitor without a read-only server-info key, cannot prove node health, processor availability, or installed version.
 - One slow sample is recorded as latency. A timeout is a failed sample and counts toward the failure threshold.

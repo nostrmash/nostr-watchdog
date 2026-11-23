@@ -1,5 +1,5 @@
 import { formatTestMessage } from "../alerts/format";
-import { discoverInbox, workersRelayConnect } from "../alerts/nip17";
+import { discoverInbox, discoveryRelays, workersRelayConnect } from "../alerts/nip17";
 import { recipientPubkey } from "../alerts/nip17";
 import { deriveOperationalStatus } from "./status";
 import { handleTestRelay, testRelayAllowed } from "./relay-fixture";
@@ -22,6 +22,7 @@ import {
   listFailedAlerts,
   operationalSnapshot,
   relayCache,
+  rememberedInboxRelays,
   retryDeadLetter,
   saveRelayCache,
   silenceIncident,
@@ -254,7 +255,7 @@ async function relayDiagnostic(
     return json({ projectId, inboxRelays: [], cached: false, error: "bootstrap_relays_missing" });
   const found = await discoverInbox({
     author,
-    bootstrap: settings.bootstrap,
+    bootstrap: discoveryRelays(settings.bootstrap, await rememberedInboxRelays(env.DB, author)),
     connect: deps.connectRelay ?? workersRelayConnect(deps.fetch, settings.timeoutMs),
     timeoutMs: settings.timeoutMs,
     nowMs: deps.now(),

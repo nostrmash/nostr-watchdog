@@ -16,7 +16,7 @@ A project is an id, a display name, a contact name, and the name of the secret t
 
 The recipient is `ADMIN_NPUB`, unless `PROJECT_RECIPIENTS` contains a value for that project id. Values are `npub` or 64-character hex. Invalid JSON in `PROJECT_RECIPIENTS` disables delivery for every project, even when `ADMIN_NPUB` is set.
 
-`BOOTSTRAP_RELAYS` is a comma-separated list of `wss://` URLs used only to read kind `10050`. The recipient publishes kind `10050` with `relay` tags for the inboxes that should receive gift wraps. This Worker does not fall back to kind `10002` relays.
+`BOOTSTRAP_RELAYS` is a comma-separated list of `wss://` URLs used to find the first kind `10050`. After an inbox list has been stored, the next lookup also reads that list's relays and keeps the newest valid event. Gift wraps go only to the `relay` tags in the chosen event. This Worker does not fall back to kind `10002` relays.
 
 Generate one sender identity per project. The command prints an `nsec`. Paste it only into `wrangler secret put` or `.dev.vars`, then clear the terminal scrollback.
 

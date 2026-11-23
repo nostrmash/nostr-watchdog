@@ -707,6 +707,21 @@ export async function countRecent(
   return row?.count ?? 0;
 }
 
+export async function rememberedInboxRelays(db: D1Database, pubkey: string): Promise<string[]> {
+  const row = await db
+    .prepare("SELECT relays_json, negative FROM relay_list_cache WHERE pubkey = ?")
+    .bind(pubkey)
+    .first<{ relays_json: string; negative: number }>();
+  if (!row || row.negative === 1) return [];
+  try {
+    const relays = JSON.parse(row.relays_json) as unknown;
+    if (!Array.isArray(relays) || relays.some((item) => typeof item !== "string")) return [];
+    return relays;
+  } catch {
+    return [];
+  }
+}
+
 export async function relayCache(
   db: D1Database,
   pubkey: string,
@@ -890,7 +905,7 @@ const UPSTREAM_RETENTION_MS = 7 * 86_400_000;
 export async function pruneOperationalRows(db: D1Database, now: number): Promise<void> {
   await db.batch([
     db.prepare("DELETE FROM heartbeat_nonces WHERE expires_at < ?").bind(now),
-    db.prepare("DELETE FROM relay_list_cache WHERE expires_at < ?").bind(now),
+    db.prepare("DELETE FROM relay_list_cache WHERE negative = 1 AND expires_at < ?").bind(now),
     db
       .prepare("DELETE FROM alert_outbox WHERE state = 'relay_accepted' AND updated_at < ?")
       .bind(now - ACCEPTED_RETENTION_MS),
