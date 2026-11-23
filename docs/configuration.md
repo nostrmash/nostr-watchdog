@@ -44,19 +44,21 @@ The tree ships sample monitors with every enable flag set to `false`. Their URLs
 
 ## Secrets
 
-| Name                      | When you need it               | Purpose                                                                                  |
-| ------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------- |
-| `OPERATOR_TOKEN`          | operator routes                | Bearer token for diagnostics, status, silence, and ack                                   |
-| `STATUS_READ_TOKEN`       | `GET /v1/status` only          | Optional bearer for an external uptime check. It cannot ack, retry, or send a test alert |
-| `STATUS_SIGNING_SECRET`   | a signed status body           | HMAC key for `X-Watchdog-Signature` on `GET /v1/status`                                  |
-| sender `nsec` bindings    | sending for that project       | Dedicated bot key. One binding per project                                               |
-| `HEARTBEAT_KEYS`          | a heartbeat monitor is enabled | JSON object of monitor id to a secret of at least 32 characters                          |
-| `HEARTBEAT_KEYS_PREVIOUS` | key rotation                   | Same shape. Use `{}` when nothing is rotating                                            |
-| `ALBY_AUTH_TOKEN`         | an `alby_hub` monitor          | Read-only Hub JWT. Empty until then                                                      |
-| `BTCPAY_API_KEY`          | version and processor detail   | Separate read-only Greenfield key. Empty skips server info                               |
-| `TELEGRAM_BOT_TOKEN`      | Telegram                       | Bot token. Empty disables Telegram                                                       |
-| `TELEGRAM_CHAT_IDS`       | Telegram                       | JSON object of project id to a numeric chat id                                           |
-| `GITHUB_TOKEN`            | optional                       | Raises the GitHub API rate limit. Empty uses the anonymous limit                         |
+| Name                           | When you need it               | Purpose                                                                                  |
+| ------------------------------ | ------------------------------ | ---------------------------------------------------------------------------------------- |
+| `OPERATOR_TOKEN`               | operator routes                | Bearer token for diagnostics, status, silence, and ack                                   |
+| `STATUS_READ_TOKEN`            | `GET /v1/status` only          | Optional bearer for an external uptime check. It cannot ack, retry, or send a test alert |
+| `READ_GATEWAY_HEALTH_TOKEN`    | deep read-gateway probe        | Sent only to that monitor's URL. Leave empty while the deep monitor is disabled          |
+| `PUBLISH_GATEWAY_HEALTH_TOKEN` | deep publish-gateway probe     | Separate from the read token and from the gateway's publish API token                    |
+| `STATUS_SIGNING_SECRET`        | a signed status body           | HMAC key for `X-Watchdog-Signature` on `GET /v1/status`                                  |
+| sender `nsec` bindings         | sending for that project       | Dedicated bot key. One binding per project                                               |
+| `HEARTBEAT_KEYS`               | a heartbeat monitor is enabled | JSON object of monitor id to a secret of at least 32 characters                          |
+| `HEARTBEAT_KEYS_PREVIOUS`      | key rotation                   | Same shape. Use `{}` when nothing is rotating                                            |
+| `ALBY_AUTH_TOKEN`              | an `alby_hub` monitor          | Read-only Hub JWT. Empty until then                                                      |
+| `BTCPAY_API_KEY`               | version and processor detail   | Separate read-only Greenfield key. Empty skips server info                               |
+| `TELEGRAM_BOT_TOKEN`           | Telegram                       | Bot token. Empty disables Telegram                                                       |
+| `TELEGRAM_CHAT_IDS`            | Telegram                       | JSON object of project id to a numeric chat id                                           |
+| `GITHUB_TOKEN`                 | optional                       | Raises the GitHub API rate limit. Empty uses the anonymous limit                         |
 
 `secrets.required` makes Wrangler refuse to start when a name is missing. An empty value is still present. Heartbeats fail closed when `HEARTBEAT_KEYS` is empty. Vendor calls that need a token report `misconfigured` instead of healthy.
 
@@ -70,26 +72,26 @@ Rotation: copy the current JSON to `HEARTBEAT_KEYS_PREVIOUS`, put the new JSON i
 
 ## Schedule and thresholds
 
-| Var                          | Default                  | Meaning                                                                                             |
-| ---------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------- |
-| `WATCHDOG_ENABLED`           | `true`                   | `false` skips both crons                                                                            |
-| `ALERTS_ENABLED`             | `true`                   | `false` still stores incidents and outbox rows, and does not deliver them. A test alert still sends |
-| `CHECK_CONCURRENCY`          | `4`                      | Parallel probes, clamped to 1–6                                                                     |
-| `CHECK_TIMEOUT_MS`           | `5000`                   | Per request, clamped to 1–15 seconds                                                                |
-| `FAILURE_THRESHOLD`          | empty                    | Empty uses each monitor's own threshold, which defaults to 2                                        |
-| `RECOVERY_THRESHOLD`         | empty                    | Empty uses 2                                                                                        |
-| `CRITICAL_REMINDER_SECONDS`  | `0`                      | `0` disables reminders. Otherwise the gap between critical outage reminders                         |
-| `UNKNOWN_THRESHOLD`          | `5`                      | Consecutive `unknown` samples before one monitoring-integrity warning. Clamped to 2–100             |
-| `DELIVERY_CLAIM_MS`          | `120000`                 | Outbox claim lease. Clamped to 30–300 seconds. Extended again before publish                        |
-| `SCHEDULER_STALE_SECONDS`    | `180`                    | Age of the last check cycle before `/v1/status` becomes degraded. Three times that is unhealthy     |
-| `RELAY_LIST_TTL_SECONDS`     | `3600`                   | Kind 10050 cache lifetime                                                                           |
-| `HEARTBEAT_MAX_SKEW_SECONDS` | `300`                    | Accepted clock skew for signed heartbeats                                                           |
-| `HEARTBEAT_STALE_SECONDS`    | `180`                    | Age after which a heartbeat or loop timestamp is down                                               |
-| `HEARTBEAT_PROGRESS_SECONDS` | `600`                    | A non-idle heartbeat with unchanged progress becomes degraded                                       |
-| `TELEGRAM_CRITICAL_MODE`     | `dual`                   | `dual` or `nostr_fallback`                                                                          |
-| `PRIVATE_NETWORK_PROFILE`    | `false`                  | `true` allows HTTP and private addresses. Leave this false for public probes                        |
-| `RUNBOOK_BASE_URL`           | empty                    | HTTPS origin prepended to each monitor's runbook path                                               |
-| `GITHUB_API_BASE`            | `https://api.github.com` | Only `api.github.com` or a `*.github.com` HTTPS host is accepted                                    |
+| Var                          | Default                  | Meaning                                                                                                                                                                                                                     |
+| ---------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WATCHDOG_ENABLED`           | `true`                   | `false` skips both crons                                                                                                                                                                                                    |
+| `ALERTS_ENABLED`             | `true`                   | `false` still stores incidents and outbox rows, and does not deliver them. A test alert still sends                                                                                                                         |
+| `CHECK_CONCURRENCY`          | `4`                      | Parallel probes, clamped to 1–6                                                                                                                                                                                             |
+| `CHECK_TIMEOUT_MS`           | `5000`                   | Per request, clamped to 1–15 seconds                                                                                                                                                                                        |
+| `FAILURE_THRESHOLD`          | empty                    | Empty uses each monitor's own threshold, which defaults to 2                                                                                                                                                                |
+| `RECOVERY_THRESHOLD`         | empty                    | Empty uses 2                                                                                                                                                                                                                |
+| `CRITICAL_REMINDER_SECONDS`  | `0` in development       | `0` disables reminders. Staging and production templates use `14400` (4 hours). Critical outages repeat until acknowledgement, recovery, or silence. A confirmed vulnerability repeats on the same interval until it clears |
+| `UNKNOWN_THRESHOLD`          | `5`                      | Consecutive `unknown` samples before one monitoring-integrity warning. Clamped to 2–100                                                                                                                                     |
+| `DELIVERY_CLAIM_MS`          | `120000`                 | Outbox claim lease. Clamped to 30–300 seconds. Extended again before publish                                                                                                                                                |
+| `SCHEDULER_STALE_SECONDS`    | `180`                    | Age of the last check cycle before `/v1/status` becomes degraded. Three times that is unhealthy                                                                                                                             |
+| `RELAY_LIST_TTL_SECONDS`     | `3600`                   | Kind 10050 cache lifetime                                                                                                                                                                                                   |
+| `HEARTBEAT_MAX_SKEW_SECONDS` | `300`                    | Accepted clock skew for signed heartbeats                                                                                                                                                                                   |
+| `HEARTBEAT_STALE_SECONDS`    | `180`                    | Age after which a heartbeat or loop timestamp is down                                                                                                                                                                       |
+| `HEARTBEAT_PROGRESS_SECONDS` | `600`                    | A non-idle heartbeat with unchanged progress becomes degraded                                                                                                                                                               |
+| `TELEGRAM_CRITICAL_MODE`     | `dual`                   | `dual` or `nostr_fallback`                                                                                                                                                                                                  |
+| `PRIVATE_NETWORK_PROFILE`    | `false`                  | `true` allows HTTP and private addresses. Leave this false for public probes                                                                                                                                                |
+| `RUNBOOK_BASE_URL`           | empty                    | HTTPS origin prepended to each monitor's runbook path                                                                                                                                                                       |
+| `GITHUB_API_BASE`            | `https://api.github.com` | Only `api.github.com` or a `*.github.com` HTTPS host is accepted                                                                                                                                                            |
 
 ## Alby Hub
 

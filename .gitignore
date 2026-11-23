@@ -1,6 +1,8 @@
 node_modules/
 .wrangler/
 .dev.vars
+.setup-secrets.json
+.setup-public.txt
 dist/
 coverage/
 .eslintcache

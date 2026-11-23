@@ -31,6 +31,14 @@ export interface JsonPredicate {
   equals: string | number | boolean;
 }
 
+export interface HttpStatusMap {
+  pointer: string;
+  healthy: string;
+  degraded?: string;
+  down?: string;
+  misconfigured?: string;
+}
+
 export interface HttpCheckSpec {
   urlVar: keyof Env;
   expectedPath: string;
@@ -38,6 +46,9 @@ export interface HttpCheckSpec {
   expectedStatuses: number[];
   predicates: JsonPredicate[];
   maxBytes: number;
+  /** Worker secret name. The value is never stored on the monitor. */
+  bearerSecret?: keyof Env;
+  statusFromBody?: HttpStatusMap;
 }
 
 export interface MonitorDefinition {

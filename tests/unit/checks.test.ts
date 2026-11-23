@@ -77,6 +77,60 @@ describe("http json", () => {
     });
     expect(tls.errorClass).toBe("tls");
   });
+
+  it("sends a bearer token and does not follow a redirect that would disclose it", async () => {
+    const seen: Array<{ url: string; authorization: string | null }> = [];
+    const checked = await runHttpJsonCheck({
+      spec: {
+        ...spec,
+        urlVar: "NOSTRMASH_READ_GATEWAY_DEEP_URL",
+        expectedPath: "/health/deep",
+        expectedStatuses: [200, 503],
+        predicates: [],
+        statusFromBody: { pointer: "/status", healthy: "ok", degraded: "degraded" },
+        bearerSecret: "READ_GATEWAY_HEALTH_TOKEN",
+      },
+      url: "https://gateway.example/health/deep",
+      privateNetwork: false,
+      timeoutMs: 1000,
+      bearerToken: "probe-secret",
+      fetch: async (input, init) => {
+        const headers = new Headers(init?.headers);
+        seen.push({ url: String(input), authorization: headers.get("authorization") });
+        if (seen.length === 1) {
+          return new Response(null, {
+            status: 302,
+            headers: { location: "https://evil.example/health/deep" },
+          });
+        }
+        return jsonResponse({ status: "ok" });
+      },
+    });
+    expect(checked.status).toBe("misconfigured");
+    expect(seen).toEqual([
+      { url: "https://gateway.example/health/deep", authorization: "Bearer probe-secret" },
+    ]);
+    const degraded = await runHttpJsonCheck({
+      spec: {
+        ...spec,
+        urlVar: "NOSTRMASH_PUBLISH_GATEWAY_DEEP_URL",
+        expectedPath: "/health/deep",
+        expectedStatuses: [200, 503],
+        predicates: [],
+        statusFromBody: {
+          pointer: "/status",
+          healthy: "healthy",
+          degraded: "degraded",
+          down: "down",
+        },
+      },
+      url: "https://gateway.example/health/deep",
+      privateNetwork: false,
+      timeoutMs: 1000,
+      fetch: async () => jsonResponse({ status: "degraded", reachable: 1, checked: 2 }),
+    });
+    expect(degraded.status).toBe("degraded");
+  });
 });
 
 const alby = (overrides: Partial<Parameters<typeof runAlbyHubCheck>[0]> = {}) =>

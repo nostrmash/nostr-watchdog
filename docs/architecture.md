@@ -30,7 +30,7 @@ Delivery is at least once, not exactly once. A gift wrap uses a random key, so t
 
 The default is two consecutive failures to open and two consecutive successes to close. `down` uses the monitor severity. `degraded` opens a warning incident only when that monitor sets `incidentOnDegraded`. `misconfigured` opens a warning on the first sample. `unknown` does not move the success or failure counters and does not close an outage. After `UNKNOWN_THRESHOLD` consecutive unknown samples, default 5, the Worker opens one warning `inconclusive` incident and keeps updating its reason. A later conclusive sample closes that integrity incident and does not, by itself, close an outage. A skipped check is not a success. Skips happen when a monitor is disabled, its interval has not elapsed, or another run holds the lease. One monitor or vendor failure does not stop the others. Alert delivery still runs when the check lease is already held.
 
-Critical outage reminders stay off until `CRITICAL_REMINDER_SECONDS` is set. Reminders are not sent for warning incidents, acknowledged incidents, or incidents inside a silence window.
+Critical outage reminders use `CRITICAL_REMINDER_SECONDS`. The staging and production templates set four hours. `0` disables them. Reminders are not sent for warning incidents, acknowledged incidents, or incidents inside a silence window. A confirmed vulnerability repeats on the same interval until the finding clears. A partial GitHub result does not refresh the last complete security check, and one source that stays down past the grace period makes `/v1/status` degraded. Disabled monitors stay in the database and do not affect that status.
 
 ## Notifications
 

@@ -2,7 +2,7 @@ import { runAlbyHubCheck } from "../checks/alby-hub";
 import { runBtcpayCheck } from "../checks/btcpay";
 import { evaluateHeartbeat } from "../checks/heartbeat";
 import { runHttpJsonCheck } from "../checks/http-json";
-import { networkFailure, unknownResult } from "../checks/result";
+import { misconfigured, networkFailure, unknownResult } from "../checks/result";
 import { formatIncidentMessage } from "../alerts/format";
 import { PROJECTS } from "../config/projects";
 import { enabledMonitors } from "../config/monitors";
@@ -55,7 +55,8 @@ export async function runCheckCycle(env: Env, deps: Dependencies): Promise<void>
     }));
     for (const item of settled) {
       if (item.status === "rejected") {
-        log("error", "probe_rejected", { monitor: "unknown" });
+        cycleError = cycleError ?? "probe_failed";
+        log("error", "probe_failed", {});
         continue;
       }
       try {
@@ -100,12 +101,18 @@ async function probe(
 ): Promise<CheckResult> {
   try {
     if (monitor.kind === "http_json" && monitor.http) {
+      const secretName = monitor.http.bearerSecret;
+      const bearerToken = secretName ? readString(env, secretName) : "";
+      if (secretName && bearerToken === "") {
+        return misconfigured("The health probe token is not configured.");
+      }
       return await runHttpJsonCheck({
         spec: monitor.http,
         url: readString(env, monitor.http.urlVar),
         privateNetwork: settings.privateNetwork,
         timeoutMs: settings.timeoutMs,
         fetch: deps.fetch,
+        bearerToken,
       });
     }
     if (monitor.kind === "signed_heartbeat") {
