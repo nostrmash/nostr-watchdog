@@ -3,6 +3,7 @@ import type { NostrEvent } from "nostr-tools/pure";
 import {
   buildGiftWrap,
   discoverInbox,
+  discoveryRelays,
   publishGiftWrap,
   recipientPubkey,
   senderKeyFromNsec,
@@ -21,6 +22,7 @@ import {
   insertAlert,
   readEnvelope,
   relayCache,
+  rememberedInboxRelays,
   saveEnvelope,
   saveRelayCache,
 } from "../state/store";
@@ -172,7 +174,10 @@ async function deliverNostr(
     }
     const found = await discoverInbox({
       author: recipient,
-      bootstrap: settings.bootstrap,
+      bootstrap: discoveryRelays(
+        settings.bootstrap,
+        await rememberedInboxRelays(env.DB, recipient),
+      ),
       connect,
       timeoutMs: settings.timeoutMs,
       nowMs: now,

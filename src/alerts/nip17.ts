@@ -3,6 +3,7 @@ import { decode } from "nostr-tools/nip19";
 import { getPublicKey, type NostrEvent } from "nostr-tools/pure";
 
 import { mapLimit } from "../runtime";
+import { assertWssUrl } from "../security/url-policy";
 import type { FetchLike } from "../types";
 import {
   connectRelay,
@@ -57,6 +58,23 @@ export function openGiftWrap(
 ): { content: string; pubkey: string } {
   const rumor = unwrapEvent(event, recipientSecret);
   return { content: rumor.content, pubkey: rumor.pubkey };
+}
+
+/** Bootstrap relays first, then the last accepted inbox, without repeating a normalized URL. */
+export function discoveryRelays(
+  bootstrap: readonly string[],
+  remembered: readonly string[],
+): string[] {
+  const unique: string[] = [];
+  for (const relay of [...bootstrap, ...remembered]) {
+    try {
+      const normalized = assertWssUrl(relay).toString().replace(/\/$/, "");
+      if (!unique.includes(normalized)) unique.push(normalized);
+    } catch {
+      continue;
+    }
+  }
+  return unique;
 }
 
 export async function discoverInbox(input: {

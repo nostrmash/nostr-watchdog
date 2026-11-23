@@ -5,6 +5,7 @@ import { npubEncode } from "nostr-tools/nip19";
 import {
   buildGiftWrap,
   discoverInbox,
+  discoveryRelays,
   openGiftWrap,
   publishGiftWrap,
   recipientPubkey,
@@ -157,6 +158,15 @@ describe("nip17", () => {
     });
     expect(discovered.relays).toEqual(["wss://new.example"]);
     expect(discovered.event?.id).toBe(valid.id);
+  });
+
+  it("asks the last inbox relays after the bootstrap relays and skips duplicates", () => {
+    expect(
+      discoveryRelays(
+        ["wss://purplepag.es/", "https://not-a-relay.example"],
+        ["wss://purplepag.es", "wss://relay.example/"],
+      ),
+    ).toEqual(["wss://purplepag.es", "wss://relay.example"]);
   });
 
   it("converts relay URLs to https for the Workers fetch upgrade and rejects ws", () => {

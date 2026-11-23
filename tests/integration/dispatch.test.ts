@@ -1,4 +1,6 @@
 import { env } from "cloudflare:workers";
+import { decode } from "nostr-tools/nip19";
+import { getPublicKey } from "nostr-tools/pure";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { dispatchDue } from "../../src/cycles/dispatch";
@@ -7,7 +9,6 @@ import { claimOutbox, finishDelivery, insertAlert } from "../../src/state/store"
 import type { AlertDraft } from "../../src/types";
 import { bind, binding, jsonResponse } from "../helpers";
 import { serveInbox, signedInbox, socketPair } from "../relay-pair";
-import { decode } from "nostr-tools/nip19";
 
 afterEach(() => {
   bind({
@@ -86,6 +87,7 @@ describe("delivery", () => {
   });
 
   it("keeps the nostr alert when telegram fails and falls back only in nostr_fallback mode", async () => {
+    await env.DB.prepare("DELETE FROM relay_list_cache").run();
     const recipient = decode(binding("TEST_RECIPIENT_NSEC"));
     if (recipient.type !== "nsec") throw new Error("recipient");
     bind({
@@ -154,6 +156,56 @@ describe("delivery", () => {
       .bind("fallback:alt_fallback")
       .first<{ destination: string }>();
     expect(fallback?.destination).toBe("telegram");
+  });
+
+  it("reads a newer kind 10050 from the last inbox when the bootstrap copy is older", async () => {
+    await env.DB.prepare("DELETE FROM relay_list_cache").run();
+    await env.DB.prepare("DELETE FROM alert_outbox").run();
+    const recipient = decode(binding("TEST_RECIPIENT_NSEC"));
+    if (recipient.type !== "nsec") throw new Error("recipient");
+    bind({ BOOTSTRAP_RELAYS: "wss://bootstrap.example" });
+    const now = 1_730_000_000_000;
+    const pubkey = getPublicKey(recipient.data);
+    await env.DB.prepare(
+      `INSERT INTO relay_list_cache (pubkey, relays_json, fetched_at, expires_at, negative)
+       VALUES (?, ?, ?, ?, 0)`,
+    )
+      .bind(pubkey, JSON.stringify(["wss://previous.example"]), now - 7_200_000, now - 3_600_000)
+      .run();
+    const published: string[] = [];
+    await insertAlert(env.DB, alert("alt_refresh"), now);
+    await dispatchDue(
+      env,
+      {
+        now: () => now,
+        fetch: async () => jsonResponse({}),
+        connectRelay: async (url) => {
+          const { client, server } = socketPair();
+          if (url === "wss://bootstrap.example") {
+            serveInbox(server, [
+              signedInbox(recipient.data, 1_730_000_001, [["relay", "wss://stale.example"]]),
+            ]);
+          } else if (url === "wss://previous.example") {
+            serveInbox(server, [
+              signedInbox(recipient.data, 1_730_000_100, [["relay", "wss://current.example"]]),
+            ]);
+          } else {
+            published.push(url);
+            server.onMessage((data) => {
+              const message = JSON.parse(data) as [string, { id: string }];
+              server.send(JSON.stringify(["OK", message[1].id, true, ""]));
+            });
+          }
+          return client;
+        },
+      },
+      loadSettings(env),
+    );
+    expect(published).toEqual(["wss://current.example"]);
+    const stored = await env.DB.prepare("SELECT relays_json FROM relay_list_cache WHERE pubkey = ?")
+      .bind(pubkey)
+      .first<{ relays_json: string }>();
+    expect(stored?.relays_json).toBe(JSON.stringify(["wss://current.example"]));
   });
 
   it("records a terminal failure when the recipient has no inbox", async () => {
