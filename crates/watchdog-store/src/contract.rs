@@ -78,7 +78,9 @@ pub trait OperationalStore {
         id: &str,
         token: &str,
         claim_until: i64,
+        now: i64,
     ) -> Result<bool, StoreError>;
+    async fn outbox_state(&self, id: &str) -> Result<Option<String>, StoreError>;
     async fn save_envelope(
         &self,
         id: &str,

@@ -3,12 +3,13 @@ use std::collections::HashMap;
 use futures_util::future::join_all;
 use uuid::Uuid;
 use watchdog_core::catalog::{project_by_id, telegram_chat, PROJECTS};
+use watchdog_core::clock::Clock;
 use watchdog_core::domain::{
     next_delivery_state, AlertClass, AlertDraft, CheckResult, DeliveryState, Destination,
     MonitorDefinition, Notice, NoticeEvent, Severity,
 };
 use watchdog_core::format::{format_incident_message, IncidentMessage};
-use watchdog_core::settings::{route_for, Settings, TelegramMode};
+use watchdog_core::settings::{logical_notification_key, route_for, Settings, TelegramMode};
 use watchdog_core::transition::{transition, TransitionInput};
 use watchdog_notify::marmot_blocker;
 use watchdog_store::{OperationalStore, OutboxRow};
@@ -45,13 +46,14 @@ pub trait Notifier {
     ) -> impl std::future::Future<Output = DeliveryOutcome>;
 }
 
-pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier>(
+pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C: Clock>(
     store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     http: &H,
     notifier: &N,
     now: i64,
+    clock: &C,
 ) -> Result<(), watchdog_store::StoreError> {
     if !settings.enabled {
         store
@@ -69,7 +71,6 @@ pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier>(
         .acquire_lease("checks", &owner, now + lease_ms, now)
         .await?
     {
-        dispatch_due(store, settings, get, notifier, now).await?;
         return Ok(());
     }
     let mut cycle_error: Option<String> = None;
@@ -77,6 +78,7 @@ pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier>(
     let width = settings.concurrency.max(1) as usize;
     for chunk in due.chunks(width) {
         let probed = join_all(chunk.iter().map(|monitor| async move {
+            let before = store.load_memory(monitor.id).await.ok();
             let heartbeat = if monitor.kind == watchdog_core::CheckKind::SignedHeartbeat {
                 store.read_heartbeat(monitor.id).await.ok().flatten()
             } else {
@@ -94,10 +96,17 @@ pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier>(
                 http,
             )
             .await;
-            (monitor, result)
+            (monitor, before, result)
         }))
         .await;
-        for (monitor, result) in probed {
+        for (monitor, before, result) in probed {
+            if let Some(before) = before.as_ref() {
+                if let Ok(current) = store.load_memory(monitor.id).await {
+                    if current.generation != before.generation {
+                        continue;
+                    }
+                }
+            }
             if apply_probe(store, settings, get, monitor, &result, now)
                 .await
                 .is_err()
@@ -107,13 +116,10 @@ pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier>(
         }
     }
     let _ = store.prune(now).await;
-    if dispatch_due(store, settings, get, notifier, now)
-        .await
-        .is_err()
-    {
-        cycle_error.get_or_insert("dispatch_failed".to_string());
-    }
-    store.release_lease("checks", &owner, now).await?;
+    let _ = notifier;
+    store
+        .release_lease("checks", &owner, clock.unix_ms())
+        .await?;
     store
         .mark_run(
             "checks",
@@ -126,31 +132,95 @@ pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier>(
     Ok(())
 }
 
-pub async fn dispatch_due<S: OperationalStore, N: Notifier>(
+pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
     store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     notifier: &N,
-    now: i64,
+    clock: &C,
 ) -> Result<(), watchdog_store::StoreError> {
-    let _ = now;
     if !settings.alerts_enabled {
         return Ok(());
     }
     for destination in ["telegram", "marmot", "nostr"] {
-        let claimed_at = unix_ms();
+        if destination == "nostr" && !settings.nip17_enabled {
+            continue;
+        }
+        if destination == "marmot" && !settings.marmot_enabled {
+            continue;
+        }
+        if destination == "telegram" && get("TELEGRAM_BOT_TOKEN").is_empty() {
+            continue;
+        }
+        let claimed_at = clock.unix_ms();
         let rows = store
             .claim_outbox(
                 claimed_at,
                 claimed_at + settings.delivery_claim_ms,
                 Some(destination),
-                2,
+                4,
             )
             .await?;
+        let mut critical = 0;
+        let mut other = 0;
         for row in rows {
             let token = row.claim_token.clone().unwrap_or_default();
+            let is_critical = row.severity == "critical";
+            let admit = if is_critical { critical < 2 } else { other < 1 };
+            if !admit {
+                let now = clock.unix_ms();
+                let _ = store
+                    .finish_delivery(
+                        &row.id,
+                        &token,
+                        DeliveryState::Queued,
+                        row.attempt_count,
+                        now,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        now,
+                    )
+                    .await;
+                continue;
+            }
+            if is_critical {
+                critical += 1;
+            } else {
+                other += 1;
+            }
+            let now = clock.unix_ms();
+            if !transport_enabled(settings, get, &row) {
+                let _ = store
+                    .finish_delivery(
+                        &row.id,
+                        &token,
+                        DeliveryState::Queued,
+                        row.attempt_count,
+                        now + 300_000,
+                        Some("transport_disabled"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        now,
+                    )
+                    .await;
+                continue;
+            }
             if !store
-                .extend_claim(&row.id, &token, unix_ms() + settings.delivery_claim_ms)
+                .extend_claim(
+                    &row.id,
+                    &token,
+                    now + settings.delivery_claim_ms,
+                    now,
+                )
                 .await
                 .unwrap_or(false)
             {
@@ -172,6 +242,7 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier>(
                     push_envelope: None,
                 },
             };
+            let finished = clock.unix_ms();
             let attempt = row.attempt_count + 1;
             let state = if outcome.accepted {
                 DeliveryState::RelayAccepted
@@ -184,7 +255,7 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier>(
                     &token,
                     state,
                     attempt,
-                    unix_ms() + watchdog_core::backoff_ms(attempt),
+                    finished + watchdog_core::backoff_ms(attempt),
                     outcome.error.as_deref(),
                     Some(
                         &serde_json::to_string(&outcome.accepted_relays)
@@ -198,27 +269,44 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier>(
                     outcome.push_phase.as_deref(),
                     outcome.message_event_id.as_deref(),
                     outcome.push_envelope.as_deref(),
-                    unix_ms(),
+                    finished,
                 )
                 .await?;
             if owned
                 && !outcome.accepted
                 && settings.telegram_mode == TelegramMode::NostrFallback
-                && row.severity == "critical"
                 && matches!(row.destination.as_str(), "nostr" | "marmot")
             {
-                enqueue_fallback(store, get, &row, unix_ms()).await?;
+                enqueue_fallback(store, settings, get, &row, finished).await?;
             }
         }
     }
     Ok(())
 }
 
-fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+fn transport_enabled(
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    row: &OutboxRow,
+) -> bool {
+    let Some(severity) = Severity::parse(&row.severity) else {
+        return false;
+    };
+    if row.alert_class == "test" {
+        return match row.destination.as_str() {
+            "nostr" => settings.nip17_enabled,
+            "marmot" => settings.marmot_enabled,
+            "telegram" => !get("TELEGRAM_BOT_TOKEN").is_empty(),
+            _ => false,
+        };
+    }
+    let route = route_for(settings, get, &row.project_id, severity);
+    match row.destination.as_str() {
+        "nostr" => route.nip17,
+        "marmot" => route.marmot,
+        "telegram" => route.telegram,
+        _ => false,
+    }
 }
 
 async fn due_monitors<S: OperationalStore>(
@@ -269,7 +357,7 @@ async fn apply_probe<S: OperationalStore>(
         .iter()
         .flat_map(|notice| incident_alerts(settings, get, monitor, notice, check, now))
         .collect::<Vec<_>>();
-    store
+    let outcome = store
         .commit_check(
             monitor.id,
             monitor.project_id,
@@ -281,6 +369,7 @@ async fn apply_probe<S: OperationalStore>(
             &alerts,
         )
         .await?;
+    let _ = outcome.committed;
     Ok(())
 }
 
@@ -342,12 +431,7 @@ fn incident_alerts(
             &text,
         ));
     }
-    let critical_event = notice.severity == Severity::Critical
-        && matches!(
-            notice.event,
-            NoticeEvent::Open | NoticeEvent::Remind | NoticeEvent::Close
-        );
-    if critical_event
+    if route.telegram
         && settings.telegram_mode == TelegramMode::Dual
         && telegram_chat(&get("TELEGRAM_CHAT_IDS"), monitor.project_id).is_some()
     {
@@ -391,11 +475,18 @@ fn draft(
 
 async fn enqueue_fallback<S: OperationalStore>(
     store: &S,
+    settings: &Settings,
     get: &impl Fn(&str) -> String,
     row: &OutboxRow,
     now: i64,
 ) -> Result<(), watchdog_store::StoreError> {
     if project_by_id(&row.project_id).is_none() {
+        return Ok(());
+    }
+    let Some(severity) = Severity::parse(&row.severity) else {
+        return Ok(());
+    };
+    if !route_for(settings, get, &row.project_id, severity).telegram {
         return Ok(());
     }
     if telegram_chat(&get("TELEGRAM_CHAT_IDS"), &row.project_id).is_none()
@@ -411,9 +502,9 @@ async fn enqueue_fallback<S: OperationalStore>(
                 incident_id: row.incident_id.clone(),
                 monitor_id: row.monitor_id.clone(),
                 project_id: row.project_id.clone(),
-                dedupe_key: format!("fallback:{}", row.dedupe_key),
+                dedupe_key: format!("fallback:{}", logical_notification_key(&row.dedupe_key)),
                 destination: Destination::Telegram,
-                severity: Severity::Critical,
+                severity,
                 text: row.payload_text.clone(),
             },
             now,

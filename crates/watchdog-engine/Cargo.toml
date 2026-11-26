@@ -20,5 +20,6 @@ watchdog-notify = { workspace = true }
 watchdog-store = { workspace = true }
 
 [dev-dependencies]
+nostr = { git = "https://github.com/nostrdevkit/nostr", rev = "4904ffb85f60178375a1dda659a61793f36f03b8", default-features = false, features = ["std", "os-rng"] }
 tokio = { workspace = true }
 watchdog-store = { workspace = true, features = ["sqlite"] }

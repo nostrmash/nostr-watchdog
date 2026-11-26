@@ -7,8 +7,10 @@
 
 pub mod catalog;
 pub mod classify;
+pub mod clock;
 pub mod crypto;
 pub mod domain;
+pub mod group_auth;
 pub mod format;
 pub mod heartbeat;
 pub mod http_judge;

@@ -6,10 +6,12 @@
 
 mod contract;
 mod model;
+mod schema;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
 pub use contract::OperationalStore;
+pub use schema::{schema_status, MIGRATIONS, SCHEMA_VERSION};
 pub use model::{
     CommitOutcome, FailedAlert, HeartbeatStored, LoadedMemory, MarmotProjectRow, OutboxRow,
     StoreError, UpstreamRow, VersionRow,

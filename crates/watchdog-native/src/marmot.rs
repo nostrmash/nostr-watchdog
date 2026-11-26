@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use watchdog_core::catalog::{project_by_id, project_recipient};
 use watchdog_core::settings::load_settings;
@@ -28,7 +28,12 @@ pub async fn deliver(
     let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
     let settings = load_settings(&get);
     if !store
-        .extend_claim(&row.id, claim, now_ms() + settings.delivery_claim_ms)
+        .extend_claim(
+            &row.id,
+            claim,
+            now_ms() + settings.delivery_claim_ms,
+            now_ms(),
+        )
         .unwrap_or(false)
     {
         return pending("claim_lost");
@@ -145,6 +150,7 @@ pub async fn deliver(
         .map(str::to_string);
     remember(store, row, account, Some(&group), None);
     match disposition {
+        "rejected" => failed("marmot_send_rejected"),
         "published" => DeliveryOutcome {
             accepted: true,
             terminal: false,
@@ -188,17 +194,62 @@ fn socket_path(vars: &HashMap<String, String>) -> Option<PathBuf> {
 }
 
 async fn ensure_helper(vars: &HashMap<String, String>, socket: &Path) -> Result<(), String> {
-    if socket.exists() {
+    reap_helper();
+    if ping(socket).await.is_ok() {
         return Ok(());
     }
+    stop_helper();
+    if socket.exists() {
+        let _ = std::fs::remove_file(socket);
+    }
     spawn_helper(vars, socket)?;
-    for _ in 0..50 {
-        if socket.exists() {
+    let mut delay = Duration::from_millis(100);
+    for _ in 0..8 {
+        if ping(socket).await.is_ok() {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(2));
     }
     Err("marmot_helper_unavailable".to_string())
+}
+
+async fn ping(socket: &Path) -> Result<(), String> {
+    if !socket.exists() {
+        return Err("marmot_helper_unavailable".to_string());
+    }
+    let value = call(socket, json!({"op": "ping"}), Duration::from_secs(2)).await?;
+    if value.get("ok") == Some(&Value::Bool(true)) {
+        Ok(())
+    } else {
+        Err("marmot_helper_unavailable".to_string())
+    }
+}
+
+fn helper_child() -> &'static Mutex<Option<std::process::Child>> {
+    static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+    &CHILD
+}
+
+fn stop_helper() {
+    let mut guard = helper_child()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn reap_helper() {
+    let mut guard = helper_child()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(child) = guard.as_mut() {
+        if child.try_wait().ok().flatten().is_some() {
+            *guard = None;
+        }
+    }
 }
 
 fn spawn_helper(vars: &HashMap<String, String>, socket: &Path) -> Result<(), String> {
@@ -208,15 +259,21 @@ fn spawn_helper(vars: &HashMap<String, String>, socket: &Path) -> Result<(), Str
     let Some(root) = vars.get("MARMOT_ROOT").filter(|path| !path.is_empty()) else {
         return Err("marmot_root_missing".to_string());
     };
-    static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
-    let mut guard = CHILD
+    let mut guard = helper_child()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard.is_some() {
-        return Ok(());
+    if let Some(child) = guard.as_mut() {
+        if child.try_wait().ok().flatten().is_none() {
+            return Ok(());
+        }
     }
     let mut command = Command::new(binary);
     command
+        .env_clear()
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        )
         .arg("--root")
         .arg(root)
         .arg("--socket")
@@ -254,12 +311,9 @@ async fn call(socket: &Path, request: Value, timeout: Duration) -> Result<Value,
             .write_all(b"\n")
             .await
             .map_err(|_| "marmot_helper_unavailable".to_string())?;
-        let mut lines = BufReader::new(stream).lines();
-        let line = lines
-            .next_line()
+        let line = read_bounded_line(&mut stream, 65_536)
             .await
-            .map_err(|_| "marmot_response_invalid".to_string())?
-            .ok_or_else(|| "marmot_response_invalid".to_string())?;
+            .map_err(|_| "marmot_response_invalid".to_string())?;
         serde_json::from_str(&line).map_err(|_| "marmot_response_invalid".to_string())
     })
     .await
@@ -337,6 +391,29 @@ fn failed(error: &str) -> DeliveryOutcome {
         message_event_id: None,
         push_envelope: None,
     }
+}
+
+async fn read_bounded_line(
+    stream: &mut UnixStream,
+    max: usize,
+) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let read = stream
+            .read(&mut byte)
+            .await
+            .map_err(|_| "marmot_response_invalid".to_string())?;
+        if read == 0 || byte[0] == b'\n' {
+            break;
+        }
+        if bytes.len() >= max {
+            return Err("marmot_response_invalid".to_string());
+        }
+        bytes.push(byte[0]);
+    }
+    String::from_utf8(bytes).map_err(|_| "marmot_response_invalid".to_string())
 }
 
 fn now_ms() -> i64 {

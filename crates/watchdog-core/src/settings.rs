@@ -144,6 +144,109 @@ pub struct TransportRoute {
 /// disables that transport. `true` allows every severity. A comma-separated
 /// list allows only those severities. Queued alerts keep the destination they
 /// were created with; changing configuration does not rewrite the outbox.
+/// Configuration names read by the engine, the catalog, and the runtimes.
+/// Both the Worker and the native process load this list. Production names
+/// stay as they are on the TypeScript Worker. The two historical Worker typos
+/// are accepted only as aliases of the canonical names.
+pub const CONFIG_KEYS: &[&str] = &[
+    "WATCHDOG_ENABLED",
+    "ALERTS_ENABLED",
+    "ENABLE_MARMOT",
+    "ENABLE_NIP17",
+    "CHECK_CONCURRENCY",
+    "CHECK_TIMEOUT_MS",
+    "FAILURE_THRESHOLD",
+    "RECOVERY_THRESHOLD",
+    "RELAY_LIST_TTL_SECONDS",
+    "HEARTBEAT_MAX_SKEW_SECONDS",
+    "HEARTBEAT_MAX_BODY_BYTES",
+    "HEARTBEAT_STALE_SECONDS",
+    "HEARTBEAT_PROGRESS_SECONDS",
+    "CRITICAL_REMINDER_SECONDS",
+    "UNKNOWN_THRESHOLD",
+    "DELIVERY_CLAIM_MS",
+    "SCHEDULER_STALE_SECONDS",
+    "TELEGRAM_CRITICAL_MODE",
+    "BOOTSTRAP_RELAYS",
+    "GITHUB_API_BASE",
+    "GITHUB_TOKEN",
+    "PRIVATE_NETWORK_PROFILE",
+    "RUNBOOK_BASE_URL",
+    "ENVIRONMENT",
+    "MARMOT_SYNC_SECONDS",
+    "PROJECT_RECIPIENTS",
+    "ADMIN_NPUB",
+    "SFS_BOT_NSEC",
+    "NOSTRMASH_BOT_NSEC",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_IDS",
+    "OPERATOR_TOKEN",
+    "STATUS_READ_TOKEN",
+    "STATUS_SIGNING_SECRET",
+    "HEARTBEAT_KEYS",
+    "HEARTBEAT_KEYS_PREVIOUS",
+    "ENABLE_SFS_WEB",
+    "SFS_WEB_READY_URL",
+    "ENABLE_SFS_WORKER",
+    "ENABLE_SFS_BLOSSOM",
+    "SFS_BLOSSOM_READY_URL",
+    "ENABLE_SFS_BLASTR",
+    "SFS_BLASTR_READY_URL",
+    "ENABLE_SFS_ALBY",
+    "ALBY_BASE_URL",
+    "ALBY_ROUTING_PROFILE",
+    "ALBY_HUB_NAME",
+    "ALBY_HUB_REGION",
+    "ALBY_AUTH_TOKEN",
+    "ENABLE_SFS_BTCPAY",
+    "BTCPAY_BASE_URL",
+    "BTCPAY_API_KEY",
+    "ENABLE_NOSTRMASH_API",
+    "NOSTRMASH_API_READY_URL",
+    "ENABLE_NOSTRMASH_INGESTOR",
+    "ENABLE_NOSTRMASH_WORKER",
+    "ENABLE_NOSTRMASH_READ_GATEWAY",
+    "NOSTRMASH_READ_GATEWAY_URL",
+    "ENABLE_NOSTRMASH_PUBLISH_GATEWAY",
+    "NOSTRMASH_PUBLISH_GATEWAY_URL",
+    "ENABLE_NOSTRMASH_READ_GATEWAY_DEEP",
+    "NOSTRMASH_READ_GATEWAY_DEEP_URL",
+    "READ_GATEWAY_HEALTH_TOKEN",
+    "ENABLE_NOSTRMASH_PUBLISH_GATEWAY_DEEP",
+    "NOSTRMASH_PUBLISH_GATEWAY_DEEP_URL",
+    "PUBLISH_GATEWAY_HEALTH_TOKEN",
+    "NOTIFY_SMARTFLOWSOCIAL_MARMOT",
+    "NOTIFY_SMARTFLOWSOCIAL_NIP17",
+    "NOTIFY_SMARTFLOWSOCIAL_TELEGRAM",
+    "NOTIFY_NOSTRMASH_MARMOT",
+    "NOTIFY_NOSTRMASH_NIP17",
+    "NOTIFY_NOSTRMASH_TELEGRAM",
+    "DATABASE_PATH",
+    "LISTEN_ADDR",
+    "MARMOT_SOCKET",
+    "MARMOT_ROOT",
+    "MARMOT_HELPER",
+];
+
+/// Older Worker builds loaded these names. They are not a second configuration.
+pub fn config_alias(key: &str) -> Option<&'static str> {
+    match key {
+        "STATUS_READER_TOKEN" => Some("STATUS_READ_TOKEN"),
+        "STATUS_SIGNING_KEY" => Some("STATUS_SIGNING_SECRET"),
+        _ => None,
+    }
+}
+
+/// Drop the transport suffix so two failed transports share one fallback key.
+pub fn logical_notification_key(dedupe_key: &str) -> &str {
+    match dedupe_key.rsplit_once(':') {
+        Some((head, tail)) if matches!(tail, "nostr" | "marmot" | "telegram") && !head.is_empty() => {
+            head
+        }
+        _ => dedupe_key,
+    }
+}
+
 pub fn route_for(
     settings: &Settings,
     get: &impl Fn(&str) -> String,
@@ -257,5 +360,44 @@ mod tests {
         assert!(!smartflow.nip17);
         assert!(smartflow.marmot);
         assert!(nostrmash.nip17);
+    }
+
+    #[test]
+    fn logical_key_collapses_transport_suffixes_and_catalog_names_are_registered() {
+        assert_eq!(
+            logical_notification_key("incident:inc_1:open:nostr"),
+            "incident:inc_1:open"
+        );
+        assert_eq!(
+            logical_notification_key("incident:inc_1:open:marmot"),
+            "incident:inc_1:open"
+        );
+        assert_eq!(logical_notification_key("test:plain"), "test:plain");
+        assert_eq!(
+            config_alias("STATUS_READER_TOKEN"),
+            Some("STATUS_READ_TOKEN")
+        );
+        assert_eq!(
+            config_alias("STATUS_SIGNING_KEY"),
+            Some("STATUS_SIGNING_SECRET")
+        );
+        for monitor in crate::catalog::monitors() {
+            assert!(
+                CONFIG_KEYS.contains(&monitor.enable_var),
+                "{}",
+                monitor.enable_var
+            );
+            if let Some(http) = &monitor.http {
+                assert!(CONFIG_KEYS.contains(&http.url_var), "{}", http.url_var);
+                if let Some(secret) = http.bearer_secret {
+                    assert!(CONFIG_KEYS.contains(&secret), "{secret}");
+                }
+            }
+        }
+        for project in crate::catalog::PROJECTS {
+            assert!(CONFIG_KEYS.contains(&project.sender_secret));
+        }
+        assert!(CONFIG_KEYS.contains(&"STATUS_READ_TOKEN"));
+        assert!(CONFIG_KEYS.contains(&"STATUS_SIGNING_SECRET"));
     }
 }

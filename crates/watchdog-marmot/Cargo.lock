@@ -5073,6 +5073,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "watchdog-core"
+version = "1.0.0-dev"
+dependencies = [
+ "chrono",
+ "hex",
+ "hmac 0.12.1",
+ "js-sys",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "url",
+]
+
+[[package]]
 name = "watchdog-marmot"
 version = "1.0.0-dev"
 dependencies = [
@@ -5082,6 +5097,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "watchdog-core",
  "zeroize",
 ]
 

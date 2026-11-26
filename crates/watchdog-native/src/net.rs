@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use watchdog_core::url_policy::resolved_addresses_allowed;
 
@@ -10,8 +11,9 @@ pub async fn resolve_pinned(
     allow_private: bool,
 ) -> Result<SocketAddr, String> {
     let mut addresses = Vec::new();
-    let lookup = tokio::net::lookup_host((host, port))
+    let lookup = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, port)))
         .await
+        .map_err(|_| "dns_timeout".to_string())?
         .map_err(|_| "dns_failed".to_string())?;
     for address in lookup {
         addresses.push(address.ip());

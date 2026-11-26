@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 use watchdog_core::catalog::{known_project, monitor_by_id, project_by_id, project_recipient};
+use watchdog_core::clock::Clock;
 use watchdog_core::crypto::{
     canonical_heartbeat, hmac_sha256_hex, secrets_equal, verify_hmac_sha256,
 };
@@ -37,6 +38,10 @@ pub enum ApiRequest {
         authorization: Option<String>,
         project: String,
     },
+    Relays {
+        authorization: Option<String>,
+        project: String,
+    },
     FailedOutbox {
         authorization: Option<String>,
     },
@@ -57,18 +62,21 @@ pub enum ApiRequest {
 pub struct ApiResponse {
     pub status: u16,
     pub body: Value,
+    /// Exact JSON bytes the caller must send. The status HMAC covers these bytes.
+    pub body_bytes: Vec<u8>,
     pub signature: Option<String>,
 }
 
 pub struct ApiError;
 
-pub async fn handle<S: OperationalStore, N: Notifier>(
+pub async fn handle<S: OperationalStore, N: Notifier, C: Clock>(
     store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     notifier: &N,
     request: ApiRequest,
     now: i64,
+    clock: &C,
 ) -> ApiResponse {
     match request {
         ApiRequest::Healthz => json_response(
@@ -118,9 +126,14 @@ pub async fn handle<S: OperationalStore, N: Notifier>(
                 &body,
                 transport.as_deref(),
                 now,
+                clock,
             )
             .await
         }
+        ApiRequest::Relays {
+            authorization,
+            project,
+        } => relays(store, settings, get, authorization.as_deref(), &project, now).await,
         ApiRequest::MarmotDiagnostic {
             authorization,
             project,
@@ -178,14 +191,12 @@ async fn status<S: OperationalStore>(
                 && !get("TELEGRAM_CHAT_IDS").is_empty(),
         },
     );
-    let mut response = ApiResponse {
-        status: derived.http_status,
-        body: derived.body,
-        signature: None,
-    };
+    let mut response = json_response(derived.http_status, derived.body);
     let secret = get("STATUS_SIGNING_SECRET");
     if !secret.is_empty() {
-        response.signature = Some(hmac_sha256_hex(&secret, &response.body.to_string()));
+        if let Ok(body) = std::str::from_utf8(&response.body_bytes) {
+            response.signature = Some(hmac_sha256_hex(&secret, body));
+        }
     }
     response
 }
@@ -279,7 +290,7 @@ async fn heartbeat<S: OperationalStore>(
     }
 }
 
-async fn test_alert<S: OperationalStore, N: Notifier>(
+async fn test_alert<S: OperationalStore, N: Notifier, C: Clock>(
     store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
@@ -288,6 +299,7 @@ async fn test_alert<S: OperationalStore, N: Notifier>(
     body: &[u8],
     transport: Option<&str>,
     now: i64,
+    clock: &C,
 ) -> ApiResponse {
     if let Some(response) = authorize(get, authorization, false) {
         return response;
@@ -304,11 +316,14 @@ async fn test_alert<S: OperationalStore, N: Notifier>(
     if !known_project(project_id) {
         return json_response(400, json!({"error": "bad_request"}));
     }
-    let requested = value.get("transport").and_then(Value::as_str).or(transport);
-    let Some(requested) = requested else {
-        return json_response(400, json!({"error": "transport_required"}));
-    };
-    let destination = match requested {
+    // Callers that omit transport keep the TypeScript behaviour: NIP-17.
+    let requested = value
+        .get("transport")
+        .and_then(Value::as_str)
+        .or(transport)
+        .unwrap_or("nip17")
+        .to_string();
+    let destination = match requested.as_str() {
         "marmot" => Destination::Marmot,
         "telegram" => Destination::Telegram,
         "nip17" | "nostr" => Destination::Nostr,
@@ -342,15 +357,23 @@ async fn test_alert<S: OperationalStore, N: Notifier>(
         Err(_) => return json_response(500, json!({"error": "internal_error"})),
         Ok(true) => {}
     }
-    let _ = dispatch_due(store, settings, get, notifier, now).await;
+    let _ = dispatch_due(store, settings, get, notifier, clock).await;
+    let delivery = store
+        .outbox_state(&alert.id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "queued".to_string());
     json_response(
         202,
         json!({
+            "queued": delivery == "queued" || delivery == "retrying",
             "alertId": alert.id,
             "transport": requested,
-            "queueStatus": "queued",
-            "deliveryState": "queued",
-            "note": "Queued is not delivery. Relay acceptance is not phone delivery."
+            "queueStatus": delivery,
+            "delivery": delivery,
+            "deliveryState": delivery,
+            "note": "Omitting transport selects nip17. Queue state is read after dispatch. Relay acceptance is not phone delivery."
         }),
     )
 }
@@ -560,10 +583,80 @@ fn nonce_ok(nonce: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
+async fn relays<S: OperationalStore>(
+    store: &S,
+    _settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    authorization: Option<&str>,
+    project: &str,
+    now: i64,
+) -> ApiResponse {
+    if let Some(response) = authorize(get, authorization, false) {
+        return response;
+    }
+    if !known_project(project) {
+        return json_response(400, json!({"error": "bad_request"}));
+    }
+    let Some(raw) = project_recipient(&get("PROJECT_RECIPIENTS"), &get("ADMIN_NPUB"), project) else {
+        return json_response(
+            409,
+            json!({"error": "recipient_missing", "inboxRelays": [], "cached": false}),
+        );
+    };
+    let Ok(author) = watchdog_notify::recipient_pubkey(&raw) else {
+        return json_response(
+            409,
+            json!({"error": "recipient_invalid", "inboxRelays": [], "cached": false}),
+        );
+    };
+    let cached = store.relay_cache(&author, now).await.ok().flatten();
+    let remembered = store.remembered_inbox(&author).await.unwrap_or_default();
+    match watchdog_notify::interpret_cache(cached) {
+        watchdog_notify::CacheDecision::Fresh(relays) => json_response(
+            200,
+            json!({
+                "projectId": project,
+                "inboxRelays": relays,
+                "cached": true,
+                "fresh": true,
+                "negative": false,
+                "rememberedRelays": remembered,
+                "error": null,
+            }),
+        ),
+        watchdog_notify::CacheDecision::Negative => json_response(
+            200,
+            json!({
+                "projectId": project,
+                "inboxRelays": [],
+                "cached": true,
+                "fresh": true,
+                "negative": true,
+                "rememberedRelays": remembered,
+                "error": "recipient_inbox_missing",
+            }),
+        ),
+        watchdog_notify::CacheDecision::Discover => json_response(
+            200,
+            json!({
+                "projectId": project,
+                "inboxRelays": [],
+                "cached": false,
+                "fresh": false,
+                "negative": false,
+                "rememberedRelays": remembered,
+                "error": "discovery_required",
+            }),
+        ),
+    }
+}
+
 fn json_response(status: u16, body: Value) -> ApiResponse {
+    let body_bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
     ApiResponse {
         status,
         body,
+        body_bytes,
         signature: None,
     }
 }

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use watchdog_marmot::Session;
 
@@ -72,19 +72,18 @@ async fn main() {
     let _ = session.shutdown().await;
 }
 
-async fn handle(session: &Session, stream: UnixStream) -> Result<(), String> {
-    let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
-    let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? else {
-        return Ok(());
+async fn handle(session: &Session, mut stream: UnixStream) -> Result<(), String> {
+    let line = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_bounded_line(&mut stream, 65_536),
+    )
+    .await
+    {
+        Ok(Ok(line)) => line,
+        Ok(Err(error)) => return Err(error),
+        Err(_) => return Err("request_timeout".to_string()),
     };
-    if line.len() > 65_536 {
-        return write_json(
-            &mut write,
-            json!({"ok": false, "error": "request_too_large"}),
-        )
-        .await;
-    }
+    let (_, mut write) = stream.into_split();
     let request: Value = match serde_json::from_str(&line) {
         Ok(value) => value,
         Err(_) => {
@@ -175,6 +174,25 @@ fn strings(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+async fn read_bounded_line(stream: &mut UnixStream, max: usize) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let read = stream.read(&mut byte).await.map_err(|error| error.to_string())?;
+        if read == 0 || byte[0] == b'\n' {
+            break;
+        }
+        if bytes.len() >= max {
+            return Err("request_too_large".to_string());
+        }
+        bytes.push(byte[0]);
+    }
+    if bytes.is_empty() {
+        return Err("request_invalid".to_string());
+    }
+    String::from_utf8(bytes).map_err(|_| "request_invalid".to_string())
 }
 
 async fn write_json(

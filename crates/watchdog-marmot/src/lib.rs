@@ -6,13 +6,16 @@
 //! one `links = "sqlite3"` package in a binary. Cloudflare does not use this
 //! process.
 
-use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use cgka_traits::{GroupId, SendAcceptDisposition, TransportEndpoint};
-use marmot_app::{AccountSetupRequest, MarmotApp, MarmotAppConfig, MarmotAppRuntime};
+use marmot_app::{
+    AccountSetupRequest, LocalSendStatus, MarmotApp, MarmotAppConfig, MarmotAppRuntime,
+};
 use serde_json::{json, Value};
+use watchdog_core::group_auth::authorize_group_members;
 use zeroize::Zeroizing;
 
 pub struct Session {
@@ -77,15 +80,40 @@ impl Session {
         name: &str,
         members: &[String],
     ) -> Result<String, String> {
+        let Some(peer) = members.first().filter(|peer| !peer.is_empty()) else {
+            return Err("recipient_missing".to_string());
+        };
+        if let Some(saved) = self.saved_group(account, peer)? {
+            return Ok(saved);
+        }
+        match self
+            .runtime
+            .existing_direct_conversation(account, peer)
+            .await
+        {
+            Ok(Some(existing)) if existing.reusable => {
+                self.remember_group(account, peer, &existing.group_id_hex)?;
+                return Ok(existing.group_id_hex);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let text = safe_error(error);
+                if !text.contains("IndexNotReady") && !text.contains("not ready") {
+                    return Err(text);
+                }
+            }
+        }
         let created = self
             .runtime
-            .create_group(account, name, members, Some("Watchdog alerts".to_string()))
+            .create_group_detailed(account, name, members, Some("Watchdog alerts".to_string()))
             .await
             .map_err(safe_error)?;
         let group = created
             .operation
             .ok_or_else(|| "no_eligible_member".to_string())?;
-        Ok(group.to_string())
+        let id = group.group_id.to_string();
+        self.remember_group(account, peer, &id)?;
+        Ok(id)
     }
 
     pub async fn member_ids(&self, account: &str, group_hex: &str) -> Result<Vec<String>, String> {
@@ -119,6 +147,16 @@ impl Session {
         if let Some(stored) = self.read_result(alert_id)? {
             return Ok(stored);
         }
+        let group = group_id(group_hex)?;
+        if let Some(status) = self
+            .runtime
+            .local_send_status(account, &group, alert_id)
+            .map_err(safe_error)?
+        {
+            let value = self.project_status(account, &group, status).await?;
+            self.write_result(alert_id, &value)?;
+            return Ok(value);
+        }
         if self.started(alert_id)? {
             return Ok(json!({
                 "disposition": "completion_unknown",
@@ -128,42 +166,71 @@ impl Session {
             }));
         }
         let members = self.member_ids(account, group_hex).await?;
-        if members.is_empty() {
-            return Err("membership_unknown".to_string());
-        }
-        let allowed: HashSet<String> = allow
-            .iter()
-            .map(|item| item.to_ascii_lowercase())
-            .chain(std::iter::once(account.to_ascii_lowercase()))
-            .collect();
-        if members.iter().any(|member| !allowed.contains(member)) {
-            return Err("membership_rejected".to_string());
-        }
+        let Some(recipient) = allow.iter().find(|item| !item.is_empty()) else {
+            return Err("recipient_missing".to_string());
+        };
+        authorize_group_members(&members, account, recipient).map_err(str::to_string)?;
         self.mark_started(alert_id)?;
-        let group = group_id(group_hex)?;
-        let summary = self
-            .runtime
-            .send_message(account, &group, text.as_bytes().to_vec())
+        self.runtime
+            .submit_text(account, &group, text.to_string(), alert_id.to_string())
             .await
             .map_err(safe_error)?;
-        let disposition = match summary.accept_disposition {
-            SendAcceptDisposition::Published => "published",
-            SendAcceptDisposition::AcceptedPending => "accepted_pending",
-            SendAcceptDisposition::CompletionUnknown => "completion_unknown",
-        };
-        let push = if disposition == "published" {
-            "trigger_attempted"
-        } else {
-            "not_attempted"
-        };
-        let value = json!({
-            "disposition": disposition,
-            "published": summary.published,
-            "message_ids": summary.message_ids,
-            "push": push
-        });
+        let status = self
+            .runtime
+            .local_send_status(account, &group, alert_id)
+            .map_err(safe_error)?
+            .ok_or_else(|| "completion_unknown".to_string())?;
+        let value = self.project_status(account, &group, status).await?;
         self.write_result(alert_id, &value)?;
         Ok(value)
+    }
+
+    async fn project_status(
+        &self,
+        account: &str,
+        group: &GroupId,
+        status: LocalSendStatus,
+    ) -> Result<Value, String> {
+        let push = match &status {
+            LocalSendStatus::Completed(_) => self.push_phase(account, group).await,
+            _ => "not_attempted",
+        };
+        Ok(match status {
+            LocalSendStatus::Queued { message_id_hex }
+            | LocalSendStatus::EngineOwned { message_id_hex } => json!({
+                "disposition": "accepted_pending",
+                "published": 0,
+                "message_ids": [message_id_hex],
+                "push": push
+            }),
+            LocalSendStatus::Completed(summary) => {
+                let disposition = match summary.accept_disposition {
+                    SendAcceptDisposition::Published => "published",
+                    SendAcceptDisposition::AcceptedPending => "accepted_pending",
+                    SendAcceptDisposition::CompletionUnknown => "completion_unknown",
+                };
+                json!({
+                    "disposition": disposition,
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                    "push": push
+                })
+            }
+            LocalSendStatus::Rejected | LocalSendStatus::RefusedNewMembers => json!({
+                "disposition": "rejected",
+                "published": 0,
+                "message_ids": [],
+                "push": "not_attempted"
+            }),
+        })
+    }
+
+    async fn push_phase(&self, account: &str, group: &GroupId) -> &'static str {
+        match self.runtime.group_push_debug_info(account, group).await {
+            Ok(info) if info.active_token_count == 0 => "recipient_push_token_unavailable",
+            Ok(_) => "push_disposition_unknown",
+            Err(_) => "push_disposition_unknown",
+        }
     }
 
     pub async fn sync(&self) -> Result<(), String> {
@@ -205,11 +272,41 @@ impl Session {
 
     fn write_result(&self, alert_id: &str, value: &Value) -> Result<(), String> {
         let path = self.result_path(alert_id);
-        let bytes = serde_json::to_vec(value).map_err(|_| "boundary_encode".to_string())?;
-        fs::write(&path, bytes).map_err(|error| format!("boundary_write: {error}"))?;
-        restrict(&path)?;
+        atomic_json(&path, value)?;
         let _ = fs::remove_file(self.started_path(alert_id));
         Ok(())
+    }
+
+    fn conversation_path(&self) -> PathBuf {
+        self.boundary.join("conversations.json")
+    }
+
+    fn saved_group(&self, account: &str, peer: &str) -> Result<Option<String>, String> {
+        let path = self.conversation_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path).map_err(|error| format!("boundary_read: {error}"))?;
+        let value: Value =
+            serde_json::from_slice(&bytes).map_err(|_| "boundary_corrupt".to_string())?;
+        Ok(value
+            .get(conversation_key(account, peer))
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    }
+
+    fn remember_group(&self, account: &str, peer: &str, group: &str) -> Result<(), String> {
+        let path = self.conversation_path();
+        let mut value = if path.exists() {
+            let bytes = fs::read(&path).map_err(|error| format!("boundary_read: {error}"))?;
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}))
+        } else {
+            json!({})
+        };
+        if let Some(object) = value.as_object_mut() {
+            object.insert(conversation_key(account, peer), Value::String(group.to_string()));
+        }
+        atomic_json(&path, &value)
     }
 }
 
@@ -226,7 +323,34 @@ fn alert_token(value: &str) -> bool {
         && value.len() <= 80
         && value
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn conversation_key(account: &str, peer: &str) -> String {
+    format!(
+        "{}:{}",
+        account.to_ascii_lowercase(),
+        peer.to_ascii_lowercase()
+    )
+}
+
+fn atomic_json(path: &Path, value: &Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec(value).map_err(|_| "boundary_encode".to_string())?;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|error| format!("boundary_write: {error}"))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("boundary_write: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("boundary_write: {error}"))?;
+    }
+    fs::rename(&tmp, path).map_err(|error| format!("boundary_write: {error}"))?;
+    restrict(path)
 }
 
 fn safe_error(error: impl ToString) -> String {

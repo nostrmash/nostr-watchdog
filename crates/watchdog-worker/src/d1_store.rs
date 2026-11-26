@@ -20,12 +20,12 @@ use watchdog_store::{
 };
 use worker::{D1Database, D1PreparedStatement};
 
-pub struct D1Store {
-    db: D1Database,
+pub struct D1Store<'a> {
+    db: &'a D1Database,
 }
 
-impl D1Store {
-    pub fn new(db: D1Database) -> Self {
+impl<'a> D1Store<'a> {
+    pub fn new(db: &'a D1Database) -> Self {
         Self { db }
     }
 
@@ -97,7 +97,7 @@ fn as_text(value: &Value) -> String {
     value.as_str().unwrap_or_default().to_string()
 }
 
-impl OperationalStore for D1Store {
+impl OperationalStore for D1Store<'_> {
     async fn load_memory(&self, monitor_id: &str) -> Result<LoadedMemory, StoreError> {
         let Some(row) = self
             .first(
@@ -164,6 +164,7 @@ impl OperationalStore for D1Store {
         alerts: &[AlertDraft],
     ) -> Result<CommitOutcome, StoreError> {
         let next_generation = previous_generation + 1;
+        let commit_token = uuid::Uuid::new_v4().to_string();
         let success_at = (check.status == MonitorStatus::Healthy).then_some(now);
         let failure_at = matches!(
             check.status,
@@ -174,8 +175,9 @@ impl OperationalStore for D1Store {
             "INSERT INTO monitor_state (
                 monitor_id, project_id, status, consecutive_successes, consecutive_failures, failure_kind,
                 last_check_at, last_success_at, last_failure_at, last_error_class, last_latency_ms, last_summary,
-                observed_version, generation, updated_at, consecutive_unknowns, unknown_since, last_unknown_reason
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                observed_version, generation, updated_at, consecutive_unknowns, unknown_since, last_unknown_reason,
+                commit_token
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
             ON CONFLICT(monitor_id) DO UPDATE SET
                 project_id = excluded.project_id, status = excluded.status,
                 consecutive_successes = excluded.consecutive_successes,
@@ -188,8 +190,9 @@ impl OperationalStore for D1Store {
                 observed_version = COALESCE(excluded.observed_version, monitor_state.observed_version),
                 generation = monitor_state.generation + 1, updated_at = excluded.updated_at,
                 consecutive_unknowns = excluded.consecutive_unknowns,
-                unknown_since = excluded.unknown_since, last_unknown_reason = excluded.last_unknown_reason
-            WHERE monitor_state.generation = ?19",
+                unknown_since = excluded.unknown_since, last_unknown_reason = excluded.last_unknown_reason,
+                commit_token = excluded.commit_token
+            WHERE monitor_state.generation = ?20",
             &[
                 text(monitor_id),
                 text(project_id),
@@ -209,6 +212,7 @@ impl OperationalStore for D1Store {
                 number(memory.consecutive_unknowns),
                 optional_number(memory.unknown_since),
                 optional_text(memory.last_unknown_reason.as_deref()),
+                text(&commit_token),
                 number(previous_generation),
             ],
         )?;
@@ -218,7 +222,7 @@ impl OperationalStore for D1Store {
                 NoticeEvent::Open => self.prepare(
                     "INSERT INTO incidents (id, monitor_id, project_id, status, kind, severity, opened_at, open_reason, reminder_count, updated_at)
                      SELECT ?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, 0, ?8 FROM monitor_state
-                     WHERE monitor_id = ?2 AND generation = ?9 AND NOT EXISTS (
+                     WHERE monitor_id = ?2 AND generation = ?9 AND commit_token = ?10 AND NOT EXISTS (
                         SELECT 1 FROM incidents WHERE monitor_id = ?2 AND status = 'open' AND kind = ?4
                      )",
                     &[
@@ -231,12 +235,13 @@ impl OperationalStore for D1Store {
                         text(&item.reason),
                         number(now),
                         number(next_generation),
+                        text(&commit_token),
                     ],
                 )?,
                 NoticeEvent::Close => self.prepare(
                     "UPDATE incidents SET status = 'closed', closed_at = ?1, close_reason = ?2, updated_at = ?1
                      WHERE id = ?3 AND status = 'open' AND EXISTS (
-                        SELECT 1 FROM monitor_state WHERE monitor_id = ?4 AND generation = ?5
+                        SELECT 1 FROM monitor_state WHERE monitor_id = ?4 AND generation = ?5 AND commit_token = ?6
                      )",
                     &[
                         number(now),
@@ -244,18 +249,20 @@ impl OperationalStore for D1Store {
                         text(&item.incident_id),
                         text(monitor_id),
                         number(next_generation),
+                        text(&commit_token),
                     ],
                 )?,
                 NoticeEvent::Remind => self.prepare(
                     "UPDATE incidents SET reminder_count = reminder_count + 1, last_reminder_at = ?1, updated_at = ?1
                      WHERE id = ?2 AND status = 'open' AND EXISTS (
-                        SELECT 1 FROM monitor_state WHERE monitor_id = ?3 AND generation = ?4
+                        SELECT 1 FROM monitor_state WHERE monitor_id = ?3 AND generation = ?4 AND commit_token = ?5
                      )",
                     &[
                         number(now),
                         text(&item.incident_id),
                         text(monitor_id),
                         number(next_generation),
+                        text(&commit_token),
                     ],
                 )?,
             };
@@ -267,7 +274,7 @@ impl OperationalStore for D1Store {
                     id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
                     state, payload_text, attempt_count, next_attempt_at, created_at, updated_at
                  ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10
-                 FROM monitor_state WHERE monitor_id = ?4 AND generation = ?11",
+                 FROM monitor_state WHERE monitor_id = ?4 AND generation = ?11 AND commit_token = ?12",
                 &[
                     text(&alert.id),
                     text(alert.alert_class.as_str()),
@@ -280,6 +287,7 @@ impl OperationalStore for D1Store {
                     text(&alert.text),
                     number(now),
                     number(next_generation),
+                    text(&commit_token),
                 ],
             )?);
         }
@@ -402,11 +410,6 @@ impl OperationalStore for D1Store {
         idle: bool,
         loop_at: Option<i64>,
     ) -> Result<bool, StoreError> {
-        let existing = self.read_heartbeat(monitor_id).await?;
-        let progress_changed_at = match &existing {
-            Some(row) if row.progress_token.as_deref() == progress => row.progress_changed_at,
-            _ => now,
-        };
         let statements = vec![
             self.prepare(
                 "DELETE FROM heartbeat_nonces WHERE expires_at < ?1",
@@ -420,7 +423,11 @@ impl OperationalStore for D1Store {
                 "INSERT INTO heartbeats (monitor_id, project_id, received_at, reported_at, progress_token, progress_changed_at, idle, loop_at, summary)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
                  ON CONFLICT(monitor_id) DO UPDATE SET received_at = excluded.received_at, reported_at = excluded.reported_at,
-                   progress_token = excluded.progress_token, progress_changed_at = excluded.progress_changed_at,
+                   progress_token = excluded.progress_token,
+                   progress_changed_at = CASE
+                     WHEN heartbeats.progress_token IS excluded.progress_token THEN heartbeats.progress_changed_at
+                     ELSE excluded.received_at
+                   END,
                    idle = excluded.idle, loop_at = excluded.loop_at",
                 &[
                     text(monitor_id),
@@ -428,7 +435,7 @@ impl OperationalStore for D1Store {
                     number(now),
                     number(reported_at),
                     optional_text(progress),
-                    number(progress_changed_at),
+                    number(now),
                     number(i64::from(idle)),
                     optional_number(loop_at),
                 ],
@@ -436,7 +443,14 @@ impl OperationalStore for D1Store {
         ];
         match self.db.batch(statements).await {
             Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+            Err(error) => {
+                let text = error.to_string();
+                if text.to_ascii_lowercase().contains("unique") {
+                    Ok(false)
+                } else {
+                    Err(StoreError::Database(text))
+                }
+            }
         }
     }
 
@@ -472,19 +486,34 @@ impl OperationalStore for D1Store {
         limit: i64,
     ) -> Result<bool, StoreError> {
         let pattern = format!("{prefix}%");
-        let count = self
-            .first(
-                "SELECT COUNT(*) AS n FROM alert_outbox WHERE dedupe_key LIKE ?1 AND created_at >= ?2",
-                &[text(&pattern), number(since)],
+        let changed = self
+            .run(
+                "INSERT INTO alert_outbox (
+                    id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
+                    state, payload_text, attempt_count, next_attempt_at, created_at, updated_at
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10
+                 WHERE (
+                    SELECT COUNT(*) FROM alert_outbox WHERE dedupe_key LIKE ?11 AND created_at >= ?12
+                 ) < ?13",
+                &[
+                    text(&alert.id),
+                    text(alert.alert_class.as_str()),
+                    optional_text(alert.incident_id.as_deref()),
+                    text(&alert.monitor_id),
+                    text(&alert.project_id),
+                    text(&alert.dedupe_key),
+                    text(alert.destination.as_str()),
+                    text(alert.severity.as_str()),
+                    text(&alert.text),
+                    number(now),
+                    text(&pattern),
+                    number(since),
+                    number(limit),
+                ],
             )
-            .await?
-            .map(|row| as_i64(&row["n"]))
-            .unwrap_or(0);
-        if count >= limit {
-            return Ok(false);
-        }
-        self.insert_alert(alert, now).await?;
-        Ok(true)
+            .await?;
+        Ok(changed > 0)
     }
 
     async fn count_recent(&self, prefix: &str, since: i64) -> Result<i64, StoreError> {
@@ -549,14 +578,24 @@ impl OperationalStore for D1Store {
         id: &str,
         token: &str,
         claim_until: i64,
+        now: i64,
     ) -> Result<bool, StoreError> {
         Ok(self
             .run(
-                "UPDATE alert_outbox SET claim_until = ?1 WHERE id = ?2 AND claim_token = ?3 AND state = 'retrying'",
-                &[number(claim_until), text(id), text(token)],
+                "UPDATE alert_outbox SET claim_until = ?1
+                 WHERE id = ?2 AND claim_token = ?3 AND state = 'retrying'
+                   AND claim_until IS NOT NULL AND claim_until >= ?4",
+                &[number(claim_until), text(id), text(token), number(now)],
             )
             .await?
             > 0)
+    }
+
+    async fn outbox_state(&self, id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .first("SELECT state FROM alert_outbox WHERE id = ?1", &[text(id)])
+            .await?
+            .map(|row| as_text(&row["state"])))
     }
 
     async fn save_envelope(
@@ -616,7 +655,7 @@ impl OperationalStore for D1Store {
                     message_phase = COALESCE(?7, message_phase), push_phase = COALESCE(?8, push_phase),
                     message_event_id = COALESCE(?9, message_event_id),
                     push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11
-                 WHERE id = ?12 AND claim_token = ?13",
+                 WHERE id = ?12 AND claim_token = ?13 AND claim_until IS NOT NULL AND claim_until >= ?11",
                 &[
                     text(state.as_str()),
                     number(attempt_count),
@@ -1055,11 +1094,14 @@ impl OperationalStore for D1Store {
     }
 }
 
+/// Applies the shared migration list. Ordinary requests only validate the
+/// schema. Local setup and tests call this; production uses Wrangler.
+#[allow(dead_code)]
 pub async fn migrate(db: &D1Database) -> Result<(), StoreError> {
     db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);")
         .await
         .map_err(|error| StoreError::Database(error.to_string()))?;
-    for (id, sql) in MIGRATIONS {
+    for (id, sql) in watchdog_store::MIGRATIONS {
         let present = db
             .prepare("SELECT id FROM schema_migrations WHERE id = ?1")
             .bind(&[JsValue::from_str(id)])
@@ -1084,38 +1126,41 @@ pub async fn migrate(db: &D1Database) -> Result<(), StoreError> {
     Ok(())
 }
 
-const MIGRATIONS: &[(&str, &str)] = &[
-    (
-        "0001_init",
-        include_str!("../../../migrations/0001_init.sql"),
-    ),
-    (
-        "0002_hardening",
-        include_str!("../../../migrations/0002_hardening.sql"),
-    ),
-    (
-        "0003_vendor_checks",
-        include_str!("../../../migrations/0003_vendor_checks.sql"),
-    ),
-    (
-        "0004_vendor_source_state",
-        include_str!("../../../migrations/0004_vendor_source_state.sql"),
-    ),
-    (
-        "0005_source_failures",
-        include_str!("../../../migrations/0005_source_failures.sql"),
-    ),
-    (
-        "0006_marmot",
-        include_str!("../../../migrations/0006_marmot.sql"),
-    ),
-    (
-        "0007_marmot_push_identity",
-        include_str!("../../../migrations/0007_marmot_push_identity.sql"),
-    ),
-];
+pub async fn schema_ready(db: &D1Database) -> Result<(), StoreError> {
+    let store = D1Store::new(db);
+    // Native open writes schema_migrations. Wrangler writes d1_migrations and
+    // does not create the native ledger. Either list is accepted. Names in
+    // the Wrangler ledger include the `.sql` suffix.
+    let applied = match store.all("SELECT id FROM schema_migrations", &[]).await {
+        Ok(rows) if !rows.is_empty() => rows
+            .into_iter()
+            .map(|row| as_text(&row["id"]))
+            .collect::<Vec<_>>(),
+        _ => {
+            let rows = store
+                .all("SELECT name FROM d1_migrations", &[])
+                .await
+                .map_err(|_| StoreError::Database("schema_not_ready".to_string()))?;
+            rows.into_iter()
+                .map(|row| {
+                    as_text(&row["name"])
+                        .trim_end_matches(".sql")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    let commit_token_column = store
+        .first("SELECT commit_token FROM monitor_state LIMIT 1", &[])
+        .await
+        .is_ok();
+    match watchdog_store::schema_status(&applied, commit_token_column) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(StoreError::Database(error.to_string())),
+    }
+}
 
-impl D1Store {
+impl D1Store<'_> {
     async fn read_outbox(&self, id: &str) -> Result<Option<OutboxRow>, StoreError> {
         Ok(self
             .first("SELECT * FROM alert_outbox WHERE id = ?1", &[text(id)])

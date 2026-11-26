@@ -16,16 +16,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tracing::info;
-use watchdog_core::catalog::project_by_id;
-use watchdog_core::catalog::{project_recipient, telegram_chat};
+use watchdog_core::catalog::telegram_chat;
+use watchdog_core::clock::SystemClock;
 use watchdog_core::settings::load_settings;
-use watchdog_core::url_policy::assert_wss_url;
 use watchdog_engine::{
     handle, run_update_cycle, ApiRequest, ApiResponse, DeliveryOutcome, HttpClient, Notifier,
     ProbeRequest, ProbeResponse,
-};
-use watchdog_notify::{
-    build_gift_wrap, event_json, parse_event, recipient_pubkey, select_inbox, verify_inbox_event,
 };
 use watchdog_store::{OutboxRow, SqliteStore};
 
@@ -55,20 +51,26 @@ impl HttpClient for ReqwestClient {
             .no_proxy()
             .resolve(&host, address)
             .build()
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| "probe_client_failed".to_string())?;
         let mut builder = client.request(
             reqwest::Method::from_bytes(request.method.as_bytes())
-                .map_err(|error| error.to_string())?,
+                .map_err(|_| "probe_method_invalid".to_string())?,
             url,
         );
         builder = builder.timeout(request.timeout);
         for (key, value) in &request.headers {
             builder = builder.header(key, value);
         }
-        let response = builder.send().await.map_err(|error| error.to_string())?;
+        let response = builder.send().await.map_err(|error| network_code(&error))?;
         let status = response.status().as_u16();
         let mut headers = HashMap::new();
-        for name in ["location", "etag", "x-ratelimit-reset"] {
+        for name in [
+            "location",
+            "etag",
+            "retry-after",
+            "x-ratelimit-reset",
+            "x-ratelimit-remaining",
+        ] {
             if let Some(value) = response
                 .headers()
                 .get(name)
@@ -96,7 +98,7 @@ impl HttpClient for ReqwestClient {
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
-            let chunk = chunk.map_err(|error| error.to_string())?;
+            let chunk = chunk.map_err(|_| "probe_failed".to_string())?;
             if body.len().saturating_add(chunk.len()) > request.max_bytes {
                 return Ok(ProbeResponse {
                     status,
@@ -158,6 +160,7 @@ async fn main() {
         .route("/v1/heartbeats/{monitor_id}", post(heartbeat))
         .route("/v1/diagnostics/test-alert", post(test_alert))
         .route("/v1/diagnostics/marmot", get(marmot))
+        .route("/v1/diagnostics/relays", get(relays))
         .route("/v1/outbox/failed", get(failed))
         .route("/v1/outbox/{id}/retry", post(retry_outbox))
         .route("/v1/incidents/{id}/{action}", post(incident))
@@ -175,7 +178,7 @@ async fn main() {
     let scheduler_stop = stop.clone();
     let scheduler_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
-        let mut last_marmot_sync = 0i64;
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if scheduler_stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
@@ -200,6 +203,7 @@ async fn main() {
                 &scheduler.http,
                 &notifier,
                 now,
+                &SystemClock,
             )
             .await
             {
@@ -212,15 +216,6 @@ async fn main() {
                 .and_then(|snapshot| snapshot.runs.into_iter().find(|run| run.name == "updates"))
                 .and_then(|run| run.started_at)
                 .is_none_or(|started| now - started >= 3_600_000);
-            if settings.marmot_enabled
-                && now.saturating_sub(last_marmot_sync)
-                    >= settings.sync_interval_seconds.saturating_mul(1000)
-            {
-                if let Err(error) = marmot::sync(&scheduler.vars).await {
-                    tracing::warn!(%error, "marmot sync failed");
-                }
-                last_marmot_sync = now;
-            }
             if updates_due {
                 if let Err(error) = run_update_cycle(
                     &scheduler.store,
@@ -229,6 +224,7 @@ async fn main() {
                     &scheduler.http,
                     &notifier,
                     now,
+                    &SystemClock,
                 )
                 .await
                 {
@@ -237,11 +233,57 @@ async fn main() {
             }
         }
     });
+    let dispatch_state = state.clone();
+    let dispatch_stop = stop.clone();
+    let dispatch_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_marmot_sync = 0i64;
+        loop {
+            if dispatch_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            ticker.tick().await;
+            if dispatch_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let now = now_ms();
+            let settings =
+                load_settings(|key| dispatch_state.vars.get(key).cloned().unwrap_or_default());
+            let get = |key: &str| dispatch_state.vars.get(key).cloned().unwrap_or_default();
+            let notifier = NativeNotifier {
+                vars: dispatch_state.vars.clone(),
+                store: dispatch_state.store.clone(),
+                timeout_ms: settings.timeout_ms,
+            };
+            if let Err(error) = watchdog_engine::dispatch_due(
+                &dispatch_state.store,
+                &settings,
+                &get,
+                &notifier,
+                &SystemClock,
+            )
+            .await
+            {
+                tracing::error!(%error, "dispatch failed");
+            }
+            if settings.marmot_enabled
+                && now.saturating_sub(last_marmot_sync)
+                    >= settings.sync_interval_seconds.saturating_mul(1000)
+            {
+                if let Err(error) = marmot::sync(&dispatch_state.vars).await {
+                    tracing::warn!(%error, "marmot sync failed");
+                }
+                last_marmot_sync = now;
+            }
+        }
+    });
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown(stop.clone()))
         .await
         .expect("serve");
     let _ = scheduler_task.await;
+    let _ = dispatch_task.await;
 }
 
 async fn shutdown(stop: Arc<std::sync::atomic::AtomicBool>) {
@@ -260,6 +302,16 @@ async fn shutdown(stop: Arc<std::sync::atomic::AtomicBool>) {
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     info!("shutting down");
+}
+
+fn network_code(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "probe_timeout".to_string()
+    } else if error.is_connect() {
+        "probe_connect_failed".to_string()
+    } else {
+        "probe_failed".to_string()
+    }
 }
 
 fn now_ms() -> i64 {
@@ -289,7 +341,7 @@ async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>)
 async fn status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> (StatusCode, HeaderMap, Json<Value>) {
+) -> (StatusCode, HeaderMap, Bytes) {
     let response = dispatch(
         &state,
         ApiRequest::Status {
@@ -436,11 +488,24 @@ async fn dispatch(state: &AppState, request: ApiRequest, _body: Option<Bytes>) -
         store: state.store.clone(),
         timeout_ms: settings.timeout_ms,
     };
-    handle(&state.store, &settings, &get, &notifier, request, now_ms()).await
+    handle(
+        &state.store,
+        &settings,
+        &get,
+        &notifier,
+        request,
+        now_ms(),
+        &SystemClock,
+    )
+    .await
 }
 
-fn signed(response: ApiResponse) -> (StatusCode, HeaderMap, Json<Value>) {
+fn signed(response: ApiResponse) -> (StatusCode, HeaderMap, Bytes) {
     let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        "application/json".parse().expect("content type"),
+    );
     if let Some(signature) = response.signature {
         if let Ok(value) = signature.parse() {
             headers.insert("x-watchdog-signature", value);
@@ -449,6 +514,26 @@ fn signed(response: ApiResponse) -> (StatusCode, HeaderMap, Json<Value>) {
     (
         StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         headers,
+        Bytes::from(response.body_bytes),
+    )
+}
+
+async fn relays(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<ProjectQuery>,
+) -> (StatusCode, Json<Value>) {
+    let response = dispatch(
+        &state,
+        ApiRequest::Relays {
+            authorization: header(&headers, "authorization"),
+            project: query.project.unwrap_or_default(),
+        },
+        None,
+    )
+    .await;
+    (
+        StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         Json(response.body),
     )
 }
@@ -494,150 +579,16 @@ async fn deliver_nostr(
     timeout_ms: i64,
 ) -> DeliveryOutcome {
     let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
-    let settings = load_settings(get);
-    let Some(project) = project_by_id(&row.project_id) else {
-        return terminal("project_invalid");
-    };
-    if !store
-        .extend_claim(&row.id, claim, now_ms() + settings.delivery_claim_ms)
-        .unwrap_or(false)
-    {
-        return retry_error("claim_lost");
-    }
-    let nsec = get(project.sender_secret);
-    if nsec.is_empty() {
-        return terminal("sender_key_missing");
-    }
-    let Some(recipient_raw) =
-        project_recipient(&get("PROJECT_RECIPIENTS"), &get("ADMIN_NPUB"), project.id)
-    else {
-        return terminal("recipient_missing");
-    };
-    let Ok(recipient) = recipient_pubkey(&recipient_raw) else {
-        return terminal("recipient_invalid");
-    };
-    let relays = match interpret_cache(store.relay_cache(&recipient, now_ms()).ok().flatten()) {
-        CachedInbox::Negative => return terminal("recipient_inbox_missing"),
-        CachedInbox::Fresh(relays) => relays,
-        CachedInbox::Discover => {
-            let remembered = store.remembered_inbox(&recipient).unwrap_or_default();
-            let mut candidates = settings.bootstrap.clone();
-            candidates.extend(remembered);
-            candidates = dedupe_relays(candidates);
-            if candidates.is_empty() {
-                return terminal("bootstrap_relays_missing");
-            }
-            let mut events = Vec::new();
-            let mut failures = 0;
-            let mut completed = 0;
-            for relay in candidates.iter().take(8) {
-                if assert_wss_url(relay).is_err() {
-                    failures += 1;
-                    continue;
-                }
-                match relay::query_inbox(relay, &recipient, timeout_ms).await {
-                    Ok((frames, eose)) => {
-                        if eose {
-                            completed += 1;
-                        } else {
-                            failures += 1;
-                        }
-                        for frame in frames {
-                            if let Some(event) =
-                                verify_inbox_event(&frame, &recipient, (now_ms() / 1000) as u64)
-                            {
-                                events.push(event);
-                            }
-                        }
-                    }
-                    Err(_) => failures += 1,
-                }
-            }
-            let selected = select_inbox(&events);
-            if selected
-                .as_ref()
-                .is_none_or(|event| event.relays.is_empty())
-            {
-                if completed > 0 && failures == 0 {
-                    let _ = store.save_relay_cache(
-                        &recipient,
-                        "[]",
-                        true,
-                        now_ms(),
-                        now_ms() + settings.relay_ttl_seconds.min(300) * 1000,
-                    );
-                    return terminal("recipient_inbox_missing");
-                }
-                return retry_error("inbox_discovery_failed");
-            }
-            let relays = dedupe_relays(selected.unwrap().relays);
-            let _ = store.save_relay_cache(
-                &recipient,
-                &serde_json::to_string(&relays).unwrap_or_else(|_| "[]".into()),
-                false,
-                now_ms(),
-                now_ms() + settings.relay_ttl_seconds * 1000,
-            );
-            relays
-        }
-    };
-    if !store
-        .extend_claim(&row.id, claim, now_ms() + settings.delivery_claim_ms)
-        .unwrap_or(false)
-    {
-        return retry_error("claim_lost");
-    }
-    let event_json = if let Some(stored) = row
-        .envelope_json
-        .clone()
-        .or(store.read_envelope(&row.id).ok().flatten())
-    {
-        stored
-    } else {
-        let Ok(event) = build_gift_wrap(
-            &nsec,
-            &recipient,
-            &row.payload_text,
-            project.contact_name,
-            (row.created_at / 1000) as u64,
-        ) else {
-            return terminal("envelope_invalid");
-        };
-        let json = event_json(&event);
-        match store.save_envelope(&row.id, claim, &json, now_ms()) {
-            Ok("saved") => json,
-            Ok("exists") => store.read_envelope(&row.id).ok().flatten().unwrap_or(json),
-            _ => return terminal("envelope_invalid"),
-        }
-    };
-    if parse_event(&event_json).is_err() {
-        return terminal("envelope_invalid");
-    }
-    let mut accepted = Vec::new();
-    let mut failed = Vec::new();
-    for relay in &relays {
-        match relay::publish(relay, &event_json, timeout_ms).await {
-            Ok(true) => accepted.push(relay.clone()),
-            _ => failed.push(relay.clone()),
-        }
-    }
-    DeliveryOutcome {
-        accepted: !accepted.is_empty(),
-        terminal: false,
-        error: if accepted.is_empty() {
-            Some("relay_rejected".to_string())
-        } else if failed.is_empty() {
-            None
-        } else {
-            Some("partial_relay_acceptance".to_string())
-        },
-        accepted_relays: accepted,
-        failed_relays: failed,
-        message_phase: None,
-        push_phase: None,
-        message_event_id: parse_event(&event_json).ok().map(|event| event.id.to_hex()),
-        push_envelope: None,
-    }
+    watchdog_engine::deliver_nip17(
+        store,
+        &relay::NativeRelay,
+        &get,
+        row,
+        claim,
+        timeout_ms,
+        &SystemClock,
+    )
+    .await
 }
 
 async fn deliver_telegram(

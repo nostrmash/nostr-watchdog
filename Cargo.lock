@@ -2260,6 +2260,7 @@ dependencies = [
  "chrono",
  "hex",
  "hmac",
+ "js-sys",
  "regex",
  "serde",
  "serde_json",
@@ -2273,6 +2274,7 @@ version = "1.0.0-dev"
 dependencies = [
  "async-trait",
  "futures-util",
+ "nostr",
  "regex",
  "serde",
  "serde_json",
@@ -2338,6 +2340,7 @@ dependencies = [
  "js-sys",
  "serde",
  "serde_json",
+ "universal-time",
  "uuid",
  "wasm-bindgen",
  "watchdog-core",

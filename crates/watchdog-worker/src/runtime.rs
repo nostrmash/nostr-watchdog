@@ -1,21 +1,21 @@
 //! Worker fetch, scheduled monitoring, and notification I/O.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{future::Either, StreamExt};
 use serde_json::Value;
-use watchdog_core::settings::load_settings;
+use watchdog_core::clock::SystemClock;
+use watchdog_core::settings::{config_alias, load_settings, CONFIG_KEYS};
 use watchdog_engine::{
-    handle, run_check_cycle, run_update_cycle, ApiRequest, DeliveryOutcome, HttpClient, Notifier,
-    ProbeRequest, ProbeResponse,
+    deliver_nip17, dispatch_due, handle, run_check_cycle, run_update_cycle, ApiRequest, ApiResponse,
+    DeliveryOutcome, HttpClient, InboxFrames, Notifier, ProbeRequest, ProbeResponse, RelayIo,
 };
-use watchdog_notify::{
-    build_gift_wrap, event_json, parse_event, recipient_pubkey, MARMOT_ENGINE_STATUS,
-};
+use watchdog_notify::{auth_frame, parse_relay_frame, MARMOT_ENGINE_STATUS, RelayControl};
 use watchdog_store::OutboxRow;
 use worker::{
-    console_log, D1Database, Env, Fetch, Headers, Method, Request, RequestInit, Response, Result,
-    ScheduledEvent, WebSocket,
+    console_log, AbortController, D1Database, Delay, Env, Fetch, Headers, Method, Request,
+    RequestInit, RequestRedirect, Response, Result, ScheduledEvent, WebSocket,
 };
 
 use crate::d1_store::{self, D1Store};
@@ -40,8 +40,8 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
         }
         return Response::error("database_unconfigured", 503);
     };
-    if let Err(error) = d1_store::migrate(&db).await {
-        return Response::error(error.to_string(), 503);
+    if let Err(error) = d1_store::schema_ready(&db).await {
+        return Response::error(schema_error(&error), 503);
     }
     if req.method() == Method::Get && path == "/readyz" {
         let ready = db
@@ -61,7 +61,7 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
     }
     let vars = read_config(&env);
     let settings = load_settings(|key| vars.get(key).cloned().unwrap_or_default());
-    let store = D1Store::new(db);
+    let store = D1Store::new(&db);
     let notifier = WorkerNotifier {
         db: env.d1("DB")?,
         vars: vars.clone(),
@@ -71,18 +71,27 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
         Some(request) => request,
         None => return Response::error("not_found", 404),
     };
-    let response = handle(&store, &settings, &get, &notifier, request, now_ms()).await;
-    Ok(Response::from_json(&response.body)?.with_status(response.status))
+    let response = handle(
+        &store,
+        &settings,
+        &get,
+        &notifier,
+        request,
+        now_ms(),
+        &SystemClock,
+    )
+    .await;
+    exact_json(response)
 }
 
 pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
     let db = env.d1("DB")?;
-    d1_store::migrate(&db)
+    d1_store::schema_ready(&db)
         .await
-        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+        .map_err(|error| worker::Error::RustError(schema_error(&error).to_string()))?;
     let vars = read_config(&env);
     let settings = load_settings(|key| vars.get(key).cloned().unwrap_or_default());
-    let store = D1Store::new(db);
+    let store = D1Store::new(&db);
     let notifier = WorkerNotifier {
         db: env.d1("DB")?,
         vars: vars.clone(),
@@ -91,13 +100,15 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
     let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
     let now = now_ms();
     let cycle = if event.cron().starts_with("0 ") {
-        run_update_cycle(&store, &settings, &get, &http, &notifier, now).await
+        run_update_cycle(&store, &settings, &get, &http, &notifier, now, &SystemClock).await
     } else {
-        run_check_cycle(&store, &settings, &get, &http, &notifier, now).await
+        run_check_cycle(&store, &settings, &get, &http, &notifier, now, &SystemClock).await
     };
     if let Err(error) = cycle {
         console_log!("monitoring cycle failed: {error}");
-        return Err(worker::Error::RustError(error.to_string()));
+    }
+    if let Err(error) = dispatch_due(&store, &settings, &get, &notifier, &SystemClock).await {
+        console_log!("dispatch failed: {error}");
     }
     Ok(())
 }
@@ -106,27 +117,7 @@ struct WorkerHttp;
 
 impl HttpClient for WorkerHttp {
     async fn send(&self, request: ProbeRequest) -> Result<ProbeResponse, String> {
-        let mut headers = Headers::new();
-        for (key, value) in &request.headers {
-            headers.set(key, value).map_err(|error| error.to_string())?;
-        }
-        let mut init = RequestInit::new();
-        init.with_method(Method::Get).with_headers(headers);
-        let http_request =
-            Request::new_with_init(&request.url, &init).map_err(|error| error.to_string())?;
-        let mut response = Fetch::Request(http_request)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let status = response.status_code();
-        let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-        let too_large = bytes.len() > request.max_bytes;
-        Ok(ProbeResponse {
-            status,
-            headers: HashMap::new(),
-            body: if too_large { Vec::new() } else { bytes },
-            too_large,
-        })
+        bounded_http(&request.method, &request.url, &request.headers, None, request.timeout, request.max_bytes).await
     }
 }
 
@@ -136,51 +127,20 @@ struct WorkerNotifier {
 }
 
 impl Notifier for WorkerNotifier {
-    async fn deliver_nostr(&self, row: &OutboxRow, _claim: &str) -> DeliveryOutcome {
+    async fn deliver_nostr(&self, row: &OutboxRow, claim: &str) -> DeliveryOutcome {
         let get = |key: &str| self.vars.get(key).cloned().unwrap_or_default();
         let settings = load_settings(&get);
-        let Some(project) = watchdog_core::catalog::project_by_id(&row.project_id) else {
-            return terminal("project_invalid");
-        };
-        let nsec = get(project.sender_secret);
-        let Some(recipient_raw) = watchdog_core::catalog::project_recipient(
-            &get("PROJECT_RECIPIENTS"),
-            &get("ADMIN_NPUB"),
-            project.id,
-        ) else {
-            return terminal("recipient_missing");
-        };
-        let Ok(recipient) = recipient_pubkey(&recipient_raw) else {
-            return terminal("recipient_invalid");
-        };
-        let Some(relay) = settings.bootstrap.first().cloned() else {
-            return terminal("bootstrap_relays_missing");
-        };
-        let Ok(event) = build_gift_wrap(
-            &nsec,
-            &recipient,
-            &row.payload_text,
-            project.contact_name,
-            (row.created_at / 1000) as u64,
-        ) else {
-            return terminal("envelope_invalid");
-        };
-        let payload = event_json(&event);
-        match publish_gift_wrap(&relay, &payload).await {
-            Ok(true) => DeliveryOutcome {
-                accepted: true,
-                terminal: false,
-                error: None,
-                accepted_relays: vec![relay],
-                failed_relays: Vec::new(),
-                message_phase: Some("message_accepted".to_string()),
-                push_phase: None,
-                message_event_id: parse_event(&payload).ok().map(|event| event.id.to_hex()),
-                push_envelope: None,
-            },
-            Ok(false) => retry("relay_rejected"),
-            Err(error) => retry(&error),
-        }
+        let store = D1Store::new(&self.db);
+        deliver_nip17(
+            &store,
+            &WorkerRelay,
+            &get,
+            row,
+            claim,
+            settings.timeout_ms,
+            &SystemClock,
+        )
+        .await
     }
 
     async fn deliver_telegram(&self, row: &OutboxRow) -> DeliveryOutcome {
@@ -206,18 +166,30 @@ impl Notifier for WorkerNotifier {
             "chat_id": chat,
             "text": row.payload_text,
             "disable_web_page_preview": true
-        });
-        let mut headers = Headers::new();
-        let _ = headers.set("content-type", "application/json");
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post)
-            .with_headers(headers)
-            .with_body(Some(wasm_bindgen::JsValue::from_str(&body.to_string())));
-        let Ok(request) = Request::new_with_init(&url, &init) else {
+        })
+        .to_string();
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let response = bounded_http(
+            "POST",
+            &url,
+            &headers,
+            Some(body),
+            Duration::from_secs(15),
+            65_536,
+        )
+        .await;
+        let Ok(response) = response else {
             return retry("telegram_failed");
         };
-        match Fetch::Request(request).send().await {
-            Ok(response) if (200..300).contains(&response.status_code()) => DeliveryOutcome {
+        if !(200..300).contains(&response.status) || response.too_large {
+            return retry("telegram_failed");
+        }
+        let Ok(body) = serde_json::from_slice::<Value>(&response.body) else {
+            return retry("telegram_failed");
+        };
+        if body.get("ok") == Some(&Value::Bool(true)) {
+            DeliveryOutcome {
                 accepted: true,
                 terminal: false,
                 error: None,
@@ -227,8 +199,9 @@ impl Notifier for WorkerNotifier {
                 push_phase: None,
                 message_event_id: None,
                 push_envelope: None,
-            },
-            _ => retry("telegram_failed"),
+            }
+        } else {
+            retry("telegram_failed")
         }
     }
 
@@ -249,7 +222,77 @@ impl Notifier for WorkerNotifier {
     }
 }
 
-async fn publish_gift_wrap(relay: &str, event_json: &str) -> Result<bool, String> {
+struct WorkerRelay;
+
+impl RelayIo for WorkerRelay {
+    async fn query_inbox(
+        &self,
+        relay: &str,
+        author: &str,
+        signer: Option<&str>,
+        timeout_ms: i64,
+    ) -> std::result::Result<InboxFrames, String> {
+        let sub = format!("{:032x}", now_ms() as u64);
+        let request =
+            serde_json::json!(["REQ", sub, {"kinds": [10050], "authors": [author], "limit": 5}])
+                .to_string();
+        let frames = relay_exchange(relay, &request, signer, timeout_ms, Exchange::Query { sub }).await?;
+        match frames {
+            ExchangeResult::Inbox(frames) => Ok(frames),
+            ExchangeResult::Published(_) => Err("relay_malformed".to_string()),
+        }
+    }
+
+    async fn publish(
+        &self,
+        relay: &str,
+        event_json: &str,
+        signer: Option<&str>,
+        timeout_ms: i64,
+    ) -> std::result::Result<bool, String> {
+        let event: Value =
+            serde_json::from_str(event_json).map_err(|_| "envelope_invalid".to_string())?;
+        let id = event
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let frame = serde_json::json!(["EVENT", event]).to_string();
+        if frame.len() > 65_536 {
+            return Err("relay_frame_too_large".to_string());
+        }
+        let frames = relay_exchange(
+            relay,
+            &frame,
+            signer,
+            timeout_ms,
+            Exchange::Publish { event_id: id },
+        )
+        .await?;
+        match frames {
+            ExchangeResult::Published(accepted) => Ok(accepted),
+            ExchangeResult::Inbox(_) => Err("relay_malformed".to_string()),
+        }
+    }
+}
+
+enum Exchange {
+    Query { sub: String },
+    Publish { event_id: String },
+}
+
+enum ExchangeResult {
+    Inbox(InboxFrames),
+    Published(bool),
+}
+
+async fn relay_exchange(
+    relay: &str,
+    frame: &str,
+    signer: Option<&str>,
+    timeout_ms: i64,
+    goal: Exchange,
+) -> std::result::Result<ExchangeResult, String> {
     let url = watchdog_core::url_policy::workers_websocket_url(relay)
         .map_err(|error| error.message.to_string())?;
     let url = url.replacen("https://", "wss://", 1);
@@ -257,44 +300,246 @@ async fn publish_gift_wrap(relay: &str, event_json: &str) -> Result<bool, String
     let socket = WebSocket::connect(parsed)
         .await
         .map_err(|_| "relay_connect_failed".to_string())?;
+    // Register the listener before accept so an immediate AUTH or OK is kept.
+    let mut events = socket.events().map_err(|_| "relay_closed".to_string())?;
     socket
         .accept()
         .map_err(|_| "relay_connect_failed".to_string())?;
-    let event: Value =
-        serde_json::from_str(event_json).map_err(|_| "envelope_invalid".to_string())?;
-    let id = event
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let frame = serde_json::json!(["EVENT", event]).to_string();
     socket
-        .send_with_str(&frame)
+        .send_with_str(frame)
         .map_err(|_| "relay_closed".to_string())?;
-    let mut events = socket.events().map_err(|_| "relay_closed".to_string())?;
+    let deadline = now_ms() + timeout_ms.max(1);
+    let mut seen = Vec::new();
+    let mut eose = false;
     let mut accepted = false;
-    for _ in 0..8 {
-        let Some(Ok(event)) = events.next().await else {
-            break;
+    let mut total = 0usize;
+    let mut authed = false;
+    loop {
+        let remaining = deadline.saturating_sub(now_ms());
+        if remaining == 0 {
+            let _ = socket.close(Some(1000), Some("timeout"));
+            return Err("relay_timeout".to_string());
+        }
+        let next = events.next();
+        futures_util::pin_mut!(next);
+        let event = match futures_util::future::select(
+            next,
+            Delay::from(Duration::from_millis(remaining as u64)),
+        )
+        .await
+        {
+            Either::Left((Some(Ok(event)), _)) => event,
+            Either::Left((Some(Err(_)), _)) => {
+                let _ = socket.close(Some(1000), Some("error"));
+                return Err("relay_closed".to_string());
+            }
+            Either::Left((None, _)) => break,
+            Either::Right((_, _)) => {
+                let _ = socket.close(Some(1000), Some("timeout"));
+                return Err("relay_timeout".to_string());
+            }
         };
         let worker::WebsocketEvent::Message(message) = event else {
             continue;
         };
-        let Some(text) = message.text() else { continue };
-        let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+        let Some(text) = message.text() else {
             continue;
         };
-        let Some(items) = parsed.as_array() else {
-            continue;
-        };
-        if items.first().and_then(Value::as_str) == Some("OK")
-            && items.get(1).and_then(Value::as_str) == Some(id.as_str())
-        {
-            accepted = items.get(2).and_then(Value::as_bool).unwrap_or(false);
-            break;
+        if text.len() > 65_536 {
+            let _ = socket.close(Some(1009), Some("frame"));
+            return Err("relay_frame_too_large".to_string());
+        }
+        total = total.saturating_add(text.len());
+        if total > 262_144 {
+            let _ = socket.close(Some(1009), Some("size"));
+            return Err("relay_response_too_large".to_string());
+        }
+        match parse_relay_frame(&text) {
+            RelayControl::Auth { challenge } if !authed => {
+                let Some(nsec) = signer else {
+                    let _ = socket.close(Some(1008), Some("auth"));
+                    return Err("relay_auth_required".to_string());
+                };
+                let frame = auth_frame(nsec, &challenge, relay)
+                    .map_err(|_| "relay_auth_required".to_string())?;
+                socket
+                    .send_with_str(&frame)
+                    .map_err(|_| "relay_closed".to_string())?;
+                authed = true;
+            }
+            RelayControl::Auth { .. } => {
+                let _ = socket.close(Some(1008), Some("auth"));
+                return Err("relay_auth_required".to_string());
+            }
+            RelayControl::Event {
+                subscription,
+                event_json,
+            } => {
+                if let Exchange::Query { sub } = &goal {
+                    if subscription == *sub {
+                        if seen.len() >= 32 {
+                            let _ = socket.close(Some(1009), Some("events"));
+                            return Err("relay_event_limit".to_string());
+                        }
+                        seen.push(event_json);
+                    }
+                }
+            }
+            RelayControl::Eose { subscription } => {
+                if let Exchange::Query { sub } = &goal {
+                    if subscription == *sub {
+                        eose = true;
+                        break;
+                    }
+                }
+            }
+            RelayControl::Ok {
+                event_id,
+                accepted: ok,
+            } => {
+                if let Exchange::Publish { event_id: wanted } = &goal {
+                    if event_id == *wanted {
+                        accepted = ok;
+                        break;
+                    }
+                }
+            }
+            RelayControl::Closed { .. } => {
+                let _ = socket.close(Some(1000), Some("closed"));
+                return Err("relay_closed".to_string());
+            }
+            _ => {}
         }
     }
-    Ok(accepted)
+    let _ = socket.close(Some(1000), Some("done"));
+    Ok(match goal {
+        Exchange::Query { .. } => ExchangeResult::Inbox(InboxFrames {
+            events: seen,
+            eose,
+        }),
+        Exchange::Publish { .. } => ExchangeResult::Published(accepted),
+    })
+}
+
+async fn bounded_http(
+    method: &str,
+    url: &str,
+    headers: &HashMap<String, String>,
+    body: Option<String>,
+    timeout: Duration,
+    max_bytes: usize,
+) -> std::result::Result<ProbeResponse, String> {
+    let method = match method.to_ascii_uppercase().as_str() {
+        "GET" => Method::Get,
+        "POST" => Method::Post,
+        "HEAD" => Method::Head,
+        "PUT" => Method::Put,
+        "PATCH" => Method::Patch,
+        "DELETE" => Method::Delete,
+        _ => return Err("probe_method_invalid".to_string()),
+    };
+    let header_set = Headers::new();
+    for (key, value) in headers {
+        header_set
+            .set(key, value)
+            .map_err(|_| "probe_failed".to_string())?;
+    }
+    let mut init = RequestInit::new();
+    init.with_method(method)
+        .with_headers(header_set)
+        .with_redirect(RequestRedirect::Manual);
+    if let Some(body) = body {
+        init.with_body(Some(wasm_bindgen::JsValue::from_str(&body)));
+    }
+    let http_request =
+        Request::new_with_init(url, &init).map_err(|_| "probe_url_invalid".to_string())?;
+    let controller = AbortController::default();
+    let signal = controller.signal();
+    let fetch_handle = Fetch::Request(http_request);
+    let fetch = fetch_handle.send_with_signal(&signal);
+    futures_util::pin_mut!(fetch);
+    let mut response = match futures_util::future::select(fetch, Delay::from(timeout)).await {
+        Either::Left((Ok(response), _)) => response,
+        Either::Left((Err(_), _)) => return Err("probe_failed".to_string()),
+        Either::Right((_, fetch)) => {
+            controller.abort();
+            drop(fetch);
+            return Err("probe_timeout".to_string());
+        }
+    };
+    let status = response.status_code();
+    let mut kept = HashMap::new();
+    for name in [
+        "location",
+        "etag",
+        "retry-after",
+        "x-ratelimit-reset",
+        "x-ratelimit-remaining",
+    ] {
+        if let Ok(Some(value)) = response.headers().get(name) {
+            kept.insert(name.to_string(), value);
+        }
+    }
+    if let Ok(Some(length)) = response.headers().get("content-length") {
+        if length
+            .parse::<usize>()
+            .ok()
+            .is_some_and(|len| len > max_bytes)
+        {
+            return Ok(ProbeResponse {
+                status,
+                headers: kept,
+                body: Vec::new(),
+                too_large: true,
+            });
+        }
+    }
+    let mut body = Vec::new();
+    let mut stream = response.stream().map_err(|_| "probe_failed".to_string())?;
+    loop {
+        let next = stream.next();
+        futures_util::pin_mut!(next);
+        let chunk = match futures_util::future::select(next, Delay::from(timeout)).await {
+            Either::Left((Some(Ok(chunk)), _)) => chunk,
+            Either::Left((Some(Err(_)), _)) => return Err("probe_failed".to_string()),
+            Either::Left((None, _)) => break,
+            Either::Right((_, _)) => return Err("probe_timeout".to_string()),
+        };
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Ok(ProbeResponse {
+                status,
+                headers: kept,
+                body: Vec::new(),
+                too_large: true,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(ProbeResponse {
+        status,
+        headers: kept,
+        body,
+        too_large: false,
+    })
+}
+
+fn exact_json(response: ApiResponse) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("content-type", "application/json")?;
+    if let Some(signature) = &response.signature {
+        headers.set("x-watchdog-signature", signature)?;
+    }
+    Ok(Response::from_bytes(response.body_bytes)?
+        .with_headers(headers)
+        .with_status(response.status))
+}
+
+fn schema_error(error: &watchdog_store::StoreError) -> &'static str {
+    if error.to_string() == "schema_unsupported" {
+        "schema_unsupported"
+    } else {
+        "schema_not_ready"
+    }
 }
 
 async fn api_request(req: &mut Request) -> Option<ApiRequest> {
@@ -306,6 +551,21 @@ async fn api_request(req: &mut Request) -> Option<ApiRequest> {
         (Method::Get, ["v1", "status"]) => Some(ApiRequest::Status { authorization }),
         (Method::Get, ["v1", "outbox", "failed"]) => {
             Some(ApiRequest::FailedOutbox { authorization })
+        }
+        (Method::Get, ["v1", "diagnostics", "relays"]) => {
+            let project = req
+                .url()
+                .ok()
+                .and_then(|url| {
+                    url.query_pairs()
+                        .find(|(key, _)| key == "project")
+                        .map(|(_, value)| value.into_owned())
+                })
+                .unwrap_or_default();
+            Some(ApiRequest::Relays {
+                authorization,
+                project,
+            })
         }
         (Method::Get, ["v1", "diagnostics", "marmot"]) => {
             let project = req
@@ -364,78 +624,19 @@ async fn api_request(req: &mut Request) -> Option<ApiRequest> {
 }
 
 fn read_config(env: &Env) -> HashMap<String, String> {
-    const KEYS: &[&str] = &[
-        "WATCHDOG_ENABLED",
-        "ALERTS_ENABLED",
-        "ENABLE_MARMOT",
-        "ENABLE_NIP17",
-        "CHECK_CONCURRENCY",
-        "CHECK_TIMEOUT_MS",
-        "BOOTSTRAP_RELAYS",
-        "PROJECT_RECIPIENTS",
-        "ADMIN_NPUB",
-        "SFS_BOT_NSEC",
-        "NOSTRMASH_BOT_NSEC",
-        "TELEGRAM_BOT_TOKEN",
-        "TELEGRAM_CHAT_IDS",
-        "TELEGRAM_CRITICAL_MODE",
-        "OPERATOR_TOKEN",
-        "STATUS_READER_TOKEN",
-        "STATUS_SIGNING_KEY",
-        "ENABLE_SFS_WEB",
-        "SFS_WEB_READY_URL",
-        "ENABLE_SFS_WORKER",
-        "ENABLE_SFS_BLOSSOM",
-        "SFS_BLOSSOM_READY_URL",
-        "ENABLE_SFS_BLASTR",
-        "SFS_BLASTR_READY_URL",
-        "ENABLE_SFS_ALBY",
-        "ALBY_BASE_URL",
-        "ALBY_ROUTING_PROFILE",
-        "ALBY_HUB_NAME",
-        "ALBY_HUB_REGION",
-        "ALBY_AUTH_TOKEN",
-        "ENABLE_SFS_BTCPAY",
-        "BTCPAY_BASE_URL",
-        "BTCPAY_API_KEY",
-        "ENABLE_NOSTRMASH_API",
-        "NOSTRMASH_API_READY_URL",
-        "ENABLE_NOSTRMASH_INGESTOR",
-        "ENABLE_NOSTRMASH_WORKER",
-        "ENABLE_NOSTRMASH_READ_GATEWAY",
-        "NOSTRMASH_READ_GATEWAY_URL",
-        "ENABLE_NOSTRMASH_PUBLISH_GATEWAY",
-        "NOSTRMASH_PUBLISH_GATEWAY_URL",
-        "ENABLE_NOSTRMASH_READ_GATEWAY_DEEP",
-        "NOSTRMASH_READ_GATEWAY_DEEP_URL",
-        "READ_GATEWAY_HEALTH_TOKEN",
-        "ENABLE_NOSTRMASH_PUBLISH_GATEWAY_DEEP",
-        "NOSTRMASH_PUBLISH_GATEWAY_DEEP_URL",
-        "PUBLISH_GATEWAY_HEALTH_TOKEN",
-        "HEARTBEAT_KEYS",
-        "HEARTBEAT_KEYS_PREVIOUS",
-        "GITHUB_TOKEN",
-        "GITHUB_API_BASE",
-        "FAILURE_THRESHOLD",
-        "RECOVERY_THRESHOLD",
-        "ENVIRONMENT",
-        "RUNBOOK_BASE_URL",
-        "NOTIFY_SMARTFLOWSOCIAL_MARMOT",
-        "NOTIFY_SMARTFLOWSOCIAL_NIP17",
-        "NOTIFY_SMARTFLOWSOCIAL_TELEGRAM",
-        "NOTIFY_NOSTRMASH_MARMOT",
-        "NOTIFY_NOSTRMASH_NIP17",
-        "NOTIFY_NOSTRMASH_TELEGRAM",
-    ];
     let mut vars = HashMap::new();
-    for key in KEYS {
-        if let Ok(secret) = env.secret(key) {
-            vars.insert((*key).to_string(), secret.to_string());
+    let mut keys = CONFIG_KEYS.to_vec();
+    keys.extend(["STATUS_READER_TOKEN", "STATUS_SIGNING_KEY"]);
+    for key in keys {
+        let value = if let Ok(secret) = env.secret(key) {
+            secret.to_string()
+        } else if let Ok(value) = env.var(key) {
+            value.to_string()
+        } else {
             continue;
-        }
-        if let Ok(value) = env.var(key) {
-            vars.insert((*key).to_string(), value.to_string());
-        }
+        };
+        let canonical = config_alias(key).unwrap_or(key);
+        vars.entry(canonical.to_string()).or_insert(value);
     }
     vars
 }

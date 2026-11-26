@@ -17,11 +17,12 @@ use watchdog_core::security_feed::{
     assess_security, official_github_url, AdvisoryRef, SecurityStatus,
 };
 use watchdog_core::semver::{latest_stable, update_available, ReleaseRef};
+use watchdog_core::clock::Clock;
 use watchdog_core::settings::{route_for, Settings, TelegramMode};
 use watchdog_core::status::VendorView;
 use watchdog_store::{OperationalStore, UpstreamRow, VersionRow};
 
-use crate::cycle::{dispatch_due, Notifier};
+use crate::cycle::Notifier;
 use crate::probes::{HttpClient, ProbeRequest, ProbeResponse};
 
 struct Feed<T> {
@@ -30,13 +31,14 @@ struct Feed<T> {
     error_code: Option<&'static str>,
 }
 
-pub async fn run_update_cycle<S: OperationalStore, H: HttpClient, N: Notifier>(
+pub async fn run_update_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C: Clock>(
     store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     http: &H,
     notifier: &N,
     now: i64,
+    _clock: &C,
 ) -> Result<(), watchdog_store::StoreError> {
     if !settings.enabled {
         return Ok(());
@@ -92,9 +94,9 @@ pub async fn run_update_cycle<S: OperationalStore, H: HttpClient, N: Notifier>(
                 }
             }
         }
-        record_vendor(store, get, &monitor, &outcome).await?;
+        record_vendor(store, settings, get, &monitor, &outcome).await?;
     }
-    let _ = dispatch_due(store, settings, get, notifier, now).await;
+    let _ = notifier;
     let error = if failed > 0 {
         Some("vendor_checks_failed")
     } else if rate_limited > 0 {
@@ -236,7 +238,9 @@ async fn check_vendor<S: OperationalStore, H: HttpClient>(
             let changed = previous.as_ref().and_then(|row| row.latest.as_deref())
                 != Some(latest.tag.as_str());
             if changed {
-                alerts.push(version_alert(
+                alerts.extend(version_alerts(
+                    settings,
+                    get,
                     monitor,
                     installed.as_deref().unwrap_or(""),
                     &latest.tag,
@@ -306,6 +310,9 @@ async fn check_vendor<S: OperationalStore, H: HttpClient>(
     let latest_url = latest
         .map(|item| item.url.clone())
         .or_else(|| previous.as_ref().and_then(|row| row.latest_url.clone()));
+    for alert in &alerts {
+        store.insert_alert(alert, now).await?;
+    }
     store
         .write_version(
             monitor.id,
@@ -327,9 +334,6 @@ async fn check_vendor<S: OperationalStore, H: HttpClient>(
             now,
         )
         .await?;
-    for alert in &alerts {
-        store.insert_alert(alert, now).await?;
-    }
     let error_code = vendor_error(
         coverage,
         release_state,
@@ -353,6 +357,7 @@ async fn check_vendor<S: OperationalStore, H: HttpClient>(
 
 async fn record_vendor<S: OperationalStore>(
     store: &S,
+    settings: &Settings,
     get: &impl Fn(&str) -> String,
     monitor: &MonitorDefinition,
     outcome: &Outcome,
@@ -391,6 +396,13 @@ async fn record_vendor<S: OperationalStore>(
             .unwrap_or(0),
     );
     let partial = outcome.coverage == "partial" || outcome.coverage == "policy_only";
+    if hard_failure && consecutive >= 3 {
+        let previous_success = previous.as_ref().and_then(|row| row.succeeded_at).unwrap_or(0);
+        for alert in integrity_alerts(settings, get, monitor, previous_success, consecutive, outcome)
+        {
+            store.insert_alert(&alert, outcome.checked_at).await?;
+        }
+    }
     store
         .write_vendor(
             &VendorView {
@@ -416,32 +428,6 @@ async fn record_vendor<S: OperationalStore>(
             outcome.checked_at,
         )
         .await?;
-    if hard_failure && consecutive == 3 {
-        let Some(project) = project_by_id(monitor.project_id) else {
-            return Ok(());
-        };
-        let previous_success = previous.and_then(|row| row.succeeded_at).unwrap_or(0);
-        store.insert_alert(
-            &AlertDraft {
-                id: format!("alt_{}", Uuid::new_v4()),
-                alert_class: AlertClass::Integrity,
-                incident_id: None,
-                monitor_id: monitor.id.to_string(),
-                project_id: monitor.project_id.to_string(),
-                dedupe_key: format!("integrity:{}:vendor:{previous_success}", monitor.id),
-                destination: Destination::Nostr,
-                severity: Severity::Warning,
-                text: format!(
-                    "{} {} security checks failed {consecutive} times ({}). Cached advisories were kept.",
-                    project.display_name,
-                    monitor.display_name,
-                    outcome.error_code.unwrap_or("unavailable")
-                ),
-            },
-            outcome.checked_at,
-        ).await?;
-        let _ = get;
-    }
     Ok(())
 }
 
@@ -790,26 +776,109 @@ fn decode<T: serde::de::DeserializeOwned>(payload: Option<&str>) -> Option<T> {
     serde_json::from_str(payload?).ok()
 }
 
-fn version_alert(
+fn version_alerts(
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
     monitor: &MonitorDefinition,
     installed: &str,
     latest: &str,
     url: &str,
     now: i64,
-) -> AlertDraft {
+) -> Vec<AlertDraft> {
     let project = project_by_id(monitor.project_id)
         .map(|item| item.display_name)
         .unwrap_or(monitor.project_id);
+    let text = format_version_message(project, monitor.display_name, installed, latest, url, now);
+    routed_drafts(
+        settings,
+        get,
+        monitor,
+        Severity::Info,
+        AlertClass::Update,
+        &format!("update:{}:{latest}", monitor.id),
+        &text,
+    )
+}
+
+fn integrity_alerts(
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    monitor: &MonitorDefinition,
+    previous_success: i64,
+    consecutive: i64,
+    outcome: &Outcome,
+) -> Vec<AlertDraft> {
+    let project = project_by_id(monitor.project_id)
+        .map(|item| item.display_name)
+        .unwrap_or(monitor.project_id);
+    let text = format!(
+        "{} {} security checks failed {consecutive} times ({}). Cached advisories were kept.",
+        project,
+        monitor.display_name,
+        outcome.error_code.unwrap_or("unavailable")
+    );
+    routed_drafts(
+        settings,
+        get,
+        monitor,
+        Severity::Warning,
+        AlertClass::Integrity,
+        &format!("integrity:{}:vendor:{previous_success}", monitor.id),
+        &text,
+    )
+}
+
+fn routed_drafts(
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    monitor: &MonitorDefinition,
+    severity: Severity,
+    class: AlertClass,
+    logical_key: &str,
+    text: &str,
+) -> Vec<AlertDraft> {
+    let route = route_for(settings, get, monitor.project_id, severity);
+    let mut drafts = Vec::new();
+    if route.nip17 {
+        drafts.push(routed(monitor, severity, class, logical_key, Destination::Nostr, text));
+    }
+    if route.marmot {
+        drafts.push(routed(monitor, severity, class, logical_key, Destination::Marmot, text));
+    }
+    if route.telegram
+        && settings.telegram_mode == TelegramMode::Dual
+        && telegram_chat(&get("TELEGRAM_CHAT_IDS"), monitor.project_id).is_some()
+    {
+        drafts.push(routed(
+            monitor,
+            severity,
+            class,
+            logical_key,
+            Destination::Telegram,
+            text,
+        ));
+    }
+    drafts
+}
+
+fn routed(
+    monitor: &MonitorDefinition,
+    severity: Severity,
+    class: AlertClass,
+    logical_key: &str,
+    destination: Destination,
+    text: &str,
+) -> AlertDraft {
     AlertDraft {
         id: format!("alt_{}", Uuid::new_v4()),
-        alert_class: AlertClass::Update,
+        alert_class: class,
         incident_id: None,
         monitor_id: monitor.id.to_string(),
         project_id: monitor.project_id.to_string(),
-        dedupe_key: format!("update:{}:{latest}:nostr", monitor.id),
-        destination: Destination::Nostr,
-        severity: Severity::Info,
-        text: format_version_message(project, monitor.display_name, installed, latest, url, now),
+        dedupe_key: format!("{logical_key}:{}", destination.as_str()),
+        destination,
+        severity,
+        text: text.to_string(),
     }
 }
 
@@ -868,7 +937,7 @@ fn security_alerts(
             class,
         ));
     }
-    if severity == Severity::Critical
+    if route.telegram
         && settings.telegram_mode == TelegramMode::Dual
         && telegram_chat(&get("TELEGRAM_CHAT_IDS"), monitor.project_id).is_some()
     {
@@ -979,7 +1048,15 @@ mod tests {
             _ => String::new(),
         };
         let settings = load_settings(get);
-        run_update_cycle(&store, &settings, &get, &Scripted, &Silent, 1_000)
+        run_update_cycle(
+            &store,
+            &settings,
+            &get,
+            &Scripted,
+            &Silent,
+            1_000,
+            &watchdog_core::clock::ManualClock::new(1_000),
+        )
             .await
             .unwrap();
         let version = store.read_version("sfs-btcpay").unwrap().unwrap();

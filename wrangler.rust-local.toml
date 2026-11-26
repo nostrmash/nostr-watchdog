@@ -1,0 +1,26 @@
+# Local workerd config for the Rust Worker. Do not deploy this file.
+# It is not the production Worker and it does not contain the production D1 id.
+
+name = "nostr-watchdog-rust-local"
+main = "crates/watchdog-worker/build/worker/shim.mjs"
+compatibility_date = "2026-11-22"
+
+# Build first, from the repository root:
+# worker-build --dev --no-opt --out-dir build crates/watchdog-worker
+# worker-build writes the shim under the crate, not the repository root.
+
+[limits]
+cpu_ms = 30000
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nostr-watchdog-rust-local"
+database_id = "00000000-0000-4000-8000-0000000000aa"
+migrations_dir = "migrations"
+
+[vars]
+ENVIRONMENT = "development"
+WATCHDOG_ENABLED = "true"
+ALERTS_ENABLED = "false"
+ENABLE_MARMOT = "false"
+ENABLE_NIP17 = "false"
