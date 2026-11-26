@@ -42,11 +42,19 @@ A Durable Object per project sender is still the intended home for a full MDK se
 On 2026-11-26, with rustc 1.100.0 on `aarch64-apple-darwin`:
 
 - `cargo build --manifest-path crates/watchdog-marmot/Cargo.toml --release` produced `crates/watchdog-marmot/target/release/watchdog-marmot` with Odin `dev-2026-10:84bc3fc`. A local process answered a health-socket ping with `{"ok":true,"pong":true}`. Import against `wss://127.0.0.1` returned `relay endpoint host is not a public address`. Import against `wss://relay.damus.io` returned `account directory lookup did not complete`.
-- `cargo test --manifest-path crates/watchdog-marmot/Cargo.toml --test fixture_exchange` passed. The sender was the helper. The recipient was a second `MarmotApp` runtime. The relay was `scripts/fixture-relay.mjs` on `ws://127.0.0.1` with the helper's `--allow-loopback` flag. The recipient decrypted `watchdog fixture alert`, and a restart of the helper returned the same message ids.
+- `cargo test --manifest-path crates/watchdog-marmot/Cargo.toml --test fixture_exchange` passed. The sender was the helper. The recipient was a second `MarmotApp` runtime. The relay was `scripts/fixture-relay.mjs` on `ws://127.0.0.1` with the helper's `--allow-loopback` flag. The recipient decrypted `watchdog fixture alert`, a kind-1059 gift wrap was addressed to the throwaway notification server, and a restart of the helper returned the same message ids.
+- `cargo test --manifest-path crates/watchdog-marmot/Cargo.toml --test fixture_exchange -- --ignored whitenoise_relays_deliver_one_alert` passed in 12.41 seconds. Both throwaway accounts used `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat` with loopback disabled. The official recipient decrypted `watchdog public alert`. This is not a phone notification.
 - `cargo check -p watchdog-worker --target wasm32-unknown-unknown` finished successfully. The watchdog Worker has been loaded in local workerd for health and readiness. Its scheduled handler has not been invoked.
 - `probes/mdk-engine` still only reads `DEFAULT_MAX_PAST_EPOCHS`. The OpenMLS execution is `probes/mls-durable`.
 
-`storage-sqlite` and `marmot-app` were not compiled for wasm. Their Cargo manifests depend on SQLCipher, OpenSSL, and Tokio, which is why they were left out of the probe.
+`probes/mdk-storage` names `storage_sqlite::SqliteAccountStorage`, the only `StorageProvider` implementation in the pinned tree. On 2026-11-26 `cargo check --manifest-path probes/mdk-storage/Cargo.toml --target wasm32-unknown-unknown` failed while compiling that crate's `rusqlite` dependency (`bundled-sqlcipher-vendored-openssl`):
+
+```text
+error: The target OS is "unknown" or "none", so it's unsupported by the errno crate.
+ --> errno-0.3.15/src/sys.rs:8:1
+```
+
+`openssl-src` 300.6.1 was already being compiled for that target when `errno` stopped the build. The trait itself is synchronous and is implemented by `SqliteAccountStorage` only. The OpenMLS Durable Object probe does not implement this trait.
 
 ## Upstream work that would unblock Workers
 

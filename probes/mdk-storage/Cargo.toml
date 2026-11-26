@@ -1,0 +1,12 @@
+[workspace]
+
+[package]
+name = "mdk-storage-probe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Unlicense"
+publish = false
+description = "Compile probe for the pinned MDK StorageProvider. Not the watchdog Worker."
+
+[dependencies]
+storage-sqlite = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182" }

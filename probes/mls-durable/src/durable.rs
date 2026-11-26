@@ -32,10 +32,10 @@ impl DurableObject for MlsGroupObject {
             .map(|row| row.snapshot);
         let outcome = step(previous.as_deref().map(|text| text.as_bytes()))
             .map_err(|error| Error::from(error.to_string()))?;
-        let snapshot = String::from_utf8(outcome.snapshot).map_err(|_| Error::from("mls_snapshot"))?;
-        self.sql.exec("DELETE FROM mls_state WHERE id = 'group'", None)?;
+        let snapshot =
+            String::from_utf8(outcome.snapshot).map_err(|_| Error::from("mls_snapshot"))?;
         self.sql.exec(
-            "INSERT INTO mls_state (id, snapshot) VALUES ('group', ?)",
+            "INSERT INTO mls_state (id, snapshot) VALUES ('group', ?) ON CONFLICT(id) DO UPDATE SET snapshot = excluded.snapshot",
             vec![snapshot.into()],
         )?;
         Response::from_json(&serde_json::json!({

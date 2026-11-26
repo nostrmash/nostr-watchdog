@@ -85,9 +85,7 @@ fn create_group() -> Result<Step, String> {
         credential: credential.into(),
         signature_key: signer.to_public_vec().into(),
     };
-    let config = MlsGroupCreateConfig::builder()
-        .ciphersuite(SUITE)
-        .build();
+    let config = MlsGroupCreateConfig::builder().ciphersuite(SUITE).build();
     let group = MlsGroup::new(&provider, &signer, &config, credential_with_key)
         .map_err(|_| "mls_group_create")?;
     let snapshot = encode(&provider.storage, signer.public(), group.group_id())?;
@@ -109,7 +107,8 @@ fn restore_and_update(bytes: &[u8]) -> Result<Step, String> {
     let public = hex::decode(&snapshot.public_key).map_err(|_| "mls_snapshot")?;
     let signer = SignatureKeyPair::read(provider.storage(), &public, SignatureScheme::ED25519)
         .ok_or("mls_signer_missing")?;
-    let group_id = GroupId::from_slice(&hex::decode(&snapshot.group_id).map_err(|_| "mls_snapshot")?);
+    let group_id =
+        GroupId::from_slice(&hex::decode(&snapshot.group_id).map_err(|_| "mls_snapshot")?);
     let mut group = MlsGroup::load(provider.storage(), &group_id)
         .map_err(|_| "mls_group_load")?
         .ok_or("mls_group_missing")?;
@@ -139,7 +138,11 @@ fn restore_and_update(bytes: &[u8]) -> Result<Step, String> {
     })
 }
 
-fn encode(storage: &MemoryStorage, public_key: &[u8], group_id: &GroupId) -> Result<Vec<u8>, String> {
+fn encode(
+    storage: &MemoryStorage,
+    public_key: &[u8],
+    group_id: &GroupId,
+) -> Result<Vec<u8>, String> {
     let snapshot = Snapshot {
         public_key: hex::encode(public_key),
         group_id: hex::encode(group_id.as_slice()),
