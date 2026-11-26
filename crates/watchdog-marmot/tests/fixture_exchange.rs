@@ -1552,6 +1552,42 @@ async fn executable_exchange() {
         "process restart encrypted the alert a second time"
     );
     drop(recovered_helper);
+    assert_eq!(
+        crash_and_reconcile(
+            &runtime,
+            &helper_bin,
+            &root,
+            &socket,
+            &relay.url,
+            &account,
+            &group,
+            &recipient_hex,
+            "intent",
+            "alt_crash_intent_process",
+            "intent was not submitted",
+        )
+        .await,
+        0,
+        "a crash before submission encrypted the alert"
+    );
+    assert_eq!(
+        crash_and_reconcile(
+            &runtime,
+            &helper_bin,
+            &root,
+            &socket,
+            &relay.url,
+            &account,
+            &group,
+            &recipient_hex,
+            "submitted",
+            "alt_crash_submitted_process",
+            "submitted before the result was stored",
+        )
+        .await,
+        1,
+        "a crash after MDK admitted the alert did not reconcile to one message"
+    );
     let _ = runtime.shutdown_and_close().await;
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&recipient_root);
@@ -1593,11 +1629,11 @@ impl Drop for OwnedProc {
 }
 
 fn start_helper(binary: &Path, root: &Path, socket: &Path, relay: &str) -> OwnedProc {
-    spawn_helper(binary, root, socket, relay, false)
+    spawn_helper(binary, root, socket, relay, None)
 }
 
 fn start_crash_helper(binary: &Path, root: &Path, socket: &Path, relay: &str) -> OwnedProc {
-    spawn_helper(binary, root, socket, relay, true)
+    spawn_helper(binary, root, socket, relay, Some("accepted"))
 }
 
 fn spawn_helper(
@@ -1605,12 +1641,12 @@ fn spawn_helper(
     root: &Path,
     socket: &Path,
     relay: &str,
-    crash: bool,
+    crash_at: Option<&str>,
 ) -> OwnedProc {
     let mut command = Command::new(binary);
-    if crash {
+    if let Some(point) = crash_at {
         command
-            .env("WATCHDOG_MARMOT_CRASH_AT", "accepted")
+            .env("WATCHDOG_MARMOT_CRASH_AT", point)
             .env("WATCHDOG_MARMOT_CRASH_EXIT", "1");
     }
     let child = command
@@ -1802,6 +1838,77 @@ fn journal_ids(root: &Path, alert: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+async fn crash_and_reconcile(
+    runtime: &marmot_app::MarmotAppRuntime,
+    helper_bin: &Path,
+    root: &Path,
+    socket: &Path,
+    relay: &str,
+    account: &str,
+    group: &str,
+    recipient: &str,
+    point: &str,
+    alert: &str,
+    text: &str,
+) -> usize {
+    let mut crashing = spawn_helper(helper_bin, root, socket, relay, Some(point));
+    wait_health(&root.join("health.sock"));
+    let crashed = helper_ipc_result(
+        socket,
+        serde_json::json!({
+            "op": "send",
+            "alert": alert,
+            "project": "smartflowsocial",
+            "account": account,
+            "group": group,
+            "text": text,
+            "allow": [recipient]
+        }),
+    );
+    assert!(crashed.is_err(), "{point} returned a response after process exit");
+    let status = crashing.0.wait().expect("wait");
+    assert_eq!(status.code(), Some(75), "{point} did not exit at the boundary");
+    let helper = start_helper(helper_bin, root, socket, relay);
+    wait_health(&root.join("health.sock"));
+    let recovered = helper_ipc(
+        socket,
+        serde_json::json!({
+            "op": "send",
+            "alert": alert,
+            "project": "smartflowsocial",
+            "account": account,
+            "group": group,
+            "text": text,
+            "allow": [recipient]
+        }),
+    );
+    assert_eq!(recovered.get("ok"), Some(&Value::Bool(true)), "{point} did not reconcile");
+    if point != "intent" {
+        let ids = recovered.get("message_ids").and_then(Value::as_array);
+        assert!(ids.is_some_and(|items| !items.is_empty()), "{point} lost the admitted message");
+    }
+    let repeated = helper_ipc(
+        socket,
+        serde_json::json!({
+            "op": "send",
+            "alert": alert,
+            "project": "smartflowsocial",
+            "account": account,
+            "group": group,
+            "text": text,
+            "allow": [recipient]
+        }),
+    );
+    assert_eq!(
+        repeated.get("message_ids"),
+        recovered.get("message_ids"),
+        "{point} changed message ids on the second reconcile"
+    );
+    let count = plaintext_count(runtime, recipient, group, text).await;
+    drop(helper);
+    count
 }
 
 async fn plaintext_count(

@@ -9,8 +9,7 @@
 //! MDK local submissions are the send journal. The files under `outbox-boundary`
 //! are a projection of that journal plus the direct-conversation id. A pending
 //! projection is refreshed from MDK on every retry. It is not a terminal result.
-//! `operations.log` is the durable operation index. Per-alert files may be pruned.
-//! Operation ids in that index are not.
+//! `operations.log` is a write-ahead log. Per-alert files keep every operation id.
 
 mod journal;
 mod push_trace;
@@ -37,7 +36,19 @@ use watchdog_core::marmot_recovery::{
 };
 use zeroize::Zeroizing;
 
-const JOURNAL_KEEP: usize = 64;
+fn public_key_hex(nsec: &str) -> Result<String, String> {
+    nostr::prelude::Keys::parse(nsec)
+        .map(|keys| keys.public_key().to_hex())
+        .map_err(|_| "sender_secret_invalid".to_string())
+}
+
+fn transport_evidence(value: &str) -> &'static str {
+    match value {
+        "token_availability_only" => "token_availability_only",
+        "helper_journal" => "helper_journal",
+        _ => "not_observed",
+    }
+}
 
 pub struct Session {
     runtime: MarmotAppRuntime,
@@ -124,17 +135,15 @@ impl Session {
             return Err("operation_id_invalid".to_string());
         }
         let recipient = account_hex(recipient)?;
-        if let Some(existing) = self.read_onboard(operation_id)? {
-            if existing
-                .get("recipient")
-                .and_then(Value::as_str)
-                != Some(recipient.as_str())
-                || existing.get("replace").and_then(Value::as_bool) != Some(replace)
+        let existing = self.read_onboard(operation_id)?;
+        if let Some(record) = existing.as_ref() {
+            if record.get("recipient").and_then(Value::as_str) != Some(recipient.as_str())
+                || record.get("replace").and_then(Value::as_bool) != Some(replace)
             {
                 return Err("operation_identity_mismatch".to_string());
             }
-            if existing.get("phase").and_then(Value::as_str) == Some("established") {
-                let account = existing
+            if record.get("phase").and_then(Value::as_str) == Some("established") {
+                let account = record
                     .get("account")
                     .and_then(Value::as_str)
                     .unwrap_or("")
@@ -142,20 +151,47 @@ impl Session {
                 if !self.account_in_storage(&account) {
                     return Err("mdk_storage_missing".to_string());
                 }
-                let mut value = existing;
+                let mut value = record.clone();
                 if let Some(object) = value.as_object_mut() {
                     object.insert("reused".to_string(), Value::Bool(true));
                 }
                 return Ok(value);
             }
         }
-        self.write_onboard(&json!({
-            "operation_id": operation_id,
-            "recipient": recipient,
-            "replace": replace,
-            "phase": "importing"
-        }))?;
-        let account = self.import_sender(nsec, relays).await?;
+        let expected = public_key_hex(&nsec)?;
+        let saved_account = existing
+            .as_ref()
+            .and_then(|value| value.get("account"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let account = if let Some(saved) = saved_account {
+            if !saved.eq_ignore_ascii_case(&expected) {
+                return Err("operation_identity_mismatch".to_string());
+            }
+            if !self.account_in_storage(&saved) {
+                return Err("mdk_storage_missing".to_string());
+            }
+            saved
+        } else {
+            self.write_onboard(&json!({
+                "operation_id": operation_id,
+                "recipient": recipient,
+                "replace": replace,
+                "phase": "importing"
+            }))?;
+            match self.import_sender(nsec, relays).await {
+                Ok(account) => account,
+                Err(error)
+                    if error.contains("account already exists")
+                        && self.account_in_storage(&expected) =>
+                {
+                    self.adopt_account(&expected)?;
+                    expected
+                }
+                Err(error) => return Err(error),
+            }
+        };
         self.write_onboard(&json!({
             "operation_id": operation_id,
             "account": account,
@@ -428,19 +464,19 @@ impl Session {
         };
         let recipient = account_hex(recipient)?;
         let payload = payload_hash(text);
-        let stored = self.read_record(alert_id)?;
+        let binding = self.read_binding(alert_id)?;
+        if let Some(value) = binding.as_ref() {
+            if !journal_identity_matches(value, project, &account, &group_hex, &payload) {
+                return Err("alert_identity_mismatch".to_string());
+            }
+        }
+        let stored = binding
+            .filter(|value| value.get("disposition").and_then(Value::as_str) != Some("released"));
         let legacy_started = stored.is_none() && self.started(alert_id)?;
         let stored_phase = stored
             .as_ref()
             .and_then(stored_phase)
             .or(legacy_started.then_some(StoredSend::Submitting));
-        let identity_matches = stored
-            .as_ref()
-            .map(|value| journal_identity_matches(value, project, &account, &group_hex, &payload))
-            .unwrap_or(true);
-        if stored.is_some() && !identity_matches {
-            return Err("alert_identity_mismatch".to_string());
-        }
         let prior = stored
             .as_ref()
             .map(read_attempts)
@@ -456,7 +492,7 @@ impl Session {
             .runtime
             .local_send_status(&account, &group, alert_id)
             .map_err(safe_error)?;
-        match reconcile_send(stored_phase, identity_matches, upstream_of(status.as_ref())) {
+        match reconcile_send(stored_phase, true, upstream_of(status.as_ref())) {
             SendStep::IdentityMismatch => Err("alert_identity_mismatch".to_string()),
             SendStep::ProjectUpstream => {
                 let status = status.ok_or_else(|| "completion_unknown".to_string())?;
@@ -613,6 +649,28 @@ impl Session {
                 ("rejected", 0, Vec::new(), Some("refused_new_members"))
             }
         };
+        let previous_message = previous
+            .and_then(|value| value.get("message_state").or_else(|| value.get("message_phase")))
+            .and_then(Value::as_str);
+        let (disposition, message_ids) = if previous_message == Some("relay_accepted") {
+            let ids = if message_ids.is_empty() {
+                previous
+                    .and_then(|value| value.get("message_ids"))
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or(message_ids)
+            } else {
+                message_ids
+            };
+            ("published", ids)
+        } else {
+            (disposition, message_ids)
+        };
         let message_published = disposition == "published";
         let tokens = if message_published {
             match self.recipient_token_count(account, group, recipient).await {
@@ -704,6 +762,33 @@ impl Session {
             if !object.contains_key("push_attempts") {
                 object.insert("push_attempts".to_string(), Value::Null);
             }
+            let evidence = object
+                .get("push_evidence")
+                .and_then(Value::as_str)
+                .map(transport_evidence)
+                .unwrap_or("not_observed");
+            object.insert(
+                "operation".to_string(),
+                json!({
+                    "projectId": object.get("project").and_then(Value::as_str).unwrap_or(""),
+                    "operationId": object.get("operation_id").and_then(Value::as_str).unwrap_or(""),
+                    "messageState": message,
+                    "messageEventId": object.get("message_event_id").cloned().unwrap_or(Value::Null),
+                    "pushState": decision.push_phase,
+                    "pushEventId": Value::Null,
+                    "evidence": evidence,
+                    "error": Value::Null,
+                    "disposition": if decision.hold { "reconcile" } else { "settled" },
+                    "retryAtMs": if decision.hold { json!(decision.delay_ms) } else { Value::Null },
+                    "phoneDelivery": false,
+                    "startedAtMs": attempts.started_at_ms,
+                    "messageAttempts": attempts.message,
+                    "unknownAttempts": attempts.unknown,
+                    "tokenWaitAttempts": attempts.token_wait,
+                    "unobservableAttempts": attempts.unobservable,
+                    "pushPublicationAttempts": Value::Null
+                }),
+            );
         }
         Ok(value)
     }
@@ -797,8 +882,8 @@ impl Session {
             .map_err(|_| "boundary_lock".to_string())
     }
 
-    fn read_record(&self, alert_id: &str) -> Result<Option<Value>, String> {
-        Ok(self.journal()?.visible(alert_id))
+    fn read_binding(&self, alert_id: &str) -> Result<Option<Value>, String> {
+        Ok(self.journal()?.get(alert_id))
     }
 
     fn write_record(&self, alert_id: &str, value: &Value) -> Result<(), String> {
@@ -816,35 +901,8 @@ impl Session {
     }
 
     fn prune_journals(&self) -> Result<(), String> {
-        let journal = self.journal()?;
-        let mut terminal = Vec::new();
-        let entries = fs::read_dir(&self.boundary).map_err(|error| format!("boundary_read: {error}"))?;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !name.ends_with(".json")
-                || name == "consumed.json"
-                || name == "conversations.json"
-                || name == "storage-epoch.json"
-            {
-                continue;
-            }
-            let id = name.trim_end_matches(".json");
-            if matches!(
-                journal.disposition(id).as_deref(),
-                Some("published" | "rejected")
-            ) {
-                let modified = entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .ok();
-                terminal.push((modified, entry.path()));
-            }
-        }
-        terminal.sort_by(|left, right| right.0.cmp(&left.0));
-        for (_, path) in terminal.into_iter().skip(JOURNAL_KEEP) {
-            let _ = fs::remove_file(path);
-        }
+        // Operation files are the deduplication index. They stay after the
+        // ciphertext is gone so a retired alert id cannot be encrypted again.
         Ok(())
     }
 

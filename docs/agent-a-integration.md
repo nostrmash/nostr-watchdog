@@ -52,6 +52,11 @@ Newline-delimited JSON on the Unix socket. Requests that carry `nsec` must not b
 | `started_at_ms` | First observation of this operation. |
 | `status_detail` | `refused_new_members` or null. |
 | `account`, `group`, `payload_sha256` | Binding checked on every retry. |
+| `operation` | Nested view for Agent C. Its `disposition` is `settled` or `reconcile`. It does not replace the journal `disposition`. |
+
+`operation` fields, camelCase: `projectId`, `operationId`, `messageState`, `messageEventId`, `pushState`, `pushEventId` (null), `evidence` (`not_observed`, `token_availability_only`, or `helper_journal`), `error` (null), `disposition` (`settled` or `reconcile`), `retryAtMs` (the recommended delay while reconciling, otherwise null), `phoneDelivery` (false), `startedAtMs`, `messageAttempts`, `unknownAttempts`, `tokenWaitAttempts`, `unobservableAttempts`, `pushPublicationAttempts` (null).
+
+Copy those counters and `retryAtMs`. Do not invent push publication attempts from token availability, from a missing warning, or by restating `unobservable`. Scheduler attempts stay Agent C's counter. A later timeout or push failure does not downgrade a `relay_accepted` application message or clear its message ids.
 
 A push-reconciliation response is not a new application-message submission. `message_attempts` stays unchanged when only push state is settled. Agent C may keep a separate scheduler-attempt counter.
 
@@ -119,11 +124,13 @@ Safe re-onboarding for Agent C:
 
 ## Journal
 
-`outbox-boundary/operations.log` is the durable index: one JSON line per update, fsynced with its directory before the call returns. `outbox-boundary/<operation-id>.json` is the direct read. A crash during a rewrite leaves a partial final line, which is ignored. A complete corrupt line or a corrupt per-alert file is an error, not a skipped record.
+`outbox-boundary/<operation-id>.json` is the durable identity, including a released attempt. Those files are not deleted when ciphertext is retired or when the log is checkpointed. `consumed.json` is read once for ids that have no file and is not deleted.
 
-Compaction rewrites the latest line for every operation id, including released ids, once the log exceeds 256 KiB. It does not delete operation ids. Per-alert files for `published` or `rejected` dispositions may be removed beyond the newest 64. The log still retains those ids. `consumed.json` is read once for migration and is not deleted. `conversations.json`, `storage-epoch.json`, and `onboard/*.json` are not compacted away.
+`outbox-boundary/operations.log` is a write-ahead log of updates since the last checkpoint. Each line is fsynced with its directory before the per-id file is replaced. On open, a torn final line — incomplete JSON or incomplete UTF-8 after the last newline — is truncated to that newline, and the file and directory are synced, before another append is allowed. A complete line that is not valid UTF-8 or JSON is `boundary_corrupt` and is not discarded. A symlink at the journal directory or the log is `boundary_symlink`.
 
-`released` means MDK did not admit the attempt. The id stays in the log and is not visible, so a clean rejection can be submitted again. An intent that was recorded before a crash stays visible, so recovery does not encrypt again.
+Checkpoint runs when the log exceeds 64 KiB, or when superseded lines are at least eight and more than twice the number of operation ids. It writes any missing per-id file, then atomically replaces the log with an empty file. It does not copy historical ids back into the log, so the next operation is one append. A crash after the empty temporary file is synced and before the rename leaves the previous log in place.
+
+`released` means MDK did not admit the attempt. The id stays, with its project, sender, group, and payload hash. The same identity may be submitted again only while MDK still has no record. A different identity or payload returns `alert_identity_mismatch`. An intent recorded before a crash stays visible, so recovery does not encrypt again. Repair of a torn line does not create an operation id from the fragment and does not erase an earlier complete intent.
 
 Manual retry of a completed cryptographic operation returns the stored record. A dead-letter reset of the scheduler counter does not authorize `SendStep::Submit` while a journal or MDK record exists.
 
@@ -172,7 +179,7 @@ Startup takes `helper.lock` before removing a socket. A socket is removed only w
 
 Configured relays are checked, including one DNS lookup, before MDK opens. MDK resolves names again and accepts domains without a lookup. That includes discovered group relays, key-package relays, notification-server hints, and inbox relays. This helper does not constrain those later connections and does not claim DNS-rebinding protection for them. Loopback is allowed only for the fixture flag.
 
-`stop` in the acceptance script signals a pid only when `ps` reports `nostr-watchdog` or `watchdog-marmot` and `lsof` shows that process listening on port 8791 or holding a socket under the acceptance state directory. A stale pid file is removed without a signal. If `lsof` is missing, the script does not signal.
+`stop` in the acceptance script signals a pid only when `ps` reports `nostr-watchdog` or `watchdog-marmot` and `lsof` shows that process listening on the configured acceptance port or holding a socket under the acceptance state directory. A stale pid file is removed without a signal. If `lsof` is missing, the script does not signal. The default listen address is `127.0.0.1:8791`. Set `WATCHDOG_ACCEPTANCE_ADDR` when that port is taken. The script generates its own sender, operator token, database, and MDK directory. It does not read `WATCHDOG_CONFIG`, Telegram credentials, or a production sender secret.
 
 ## Agent B
 
@@ -184,8 +191,6 @@ Do not add a second push publisher. If a shared encoder is extracted, it has to 
 
 `decrypt_push_token_for_test` and owner-proof verification are `pub(crate)`. The fixture unwraps the kind-1059 gift with the temporary server key and checks the kind-446 rumor against this revision. It does not decrypt the token and it does not prove APNs or FCM delivery.
 
-Membership is checked with fresh `group_members` immediately before submit. That is not a lock around the asynchronous send. `submit_text` does not return `RefusedNewMembers`. A published local-send status stays the publication record if membership changes afterwards.
-
-Two active leaves of the authorized recipient are counted by `active_recipient_tokens`. This fixture does not pair a second live device. Out-of-order token records are not reordered by this helper.
+Membership is checked with fresh `group_members` immediately before `submit_text`. Official MDK at this revision does not expose an atomic membership-and-send call. `submit_text` does not return `RefusedNewMembers`. A member can be removed, or a stale group can change, after the check and before the send commits. That race is not closed by querying membership immediately beforehand. After admission, the local-send status stays the publication record. A historical operation stays bound to its stored recipient and group and is not rerouted. A missing or replaced account or device store fails closed. An ambiguous onboarding operation does not create a second conversation. Extra devices of an authorized account are allowed by the membership rule. `active_recipient_tokens` counts two active leaves of the authorized recipient. This fixture does not pair a second live device. Out-of-order token records are not reordered by this helper.
 
 A physical locked-screen notification on the WhiteNoise relays has not been observed. Relay acceptance of the group message, gift-wrap acceptance, and a notification on the phone are three different results.
