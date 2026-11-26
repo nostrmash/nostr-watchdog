@@ -45,9 +45,55 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0010_lifecycle",
         include_str!("../../../migrations/0010_lifecycle.sql"),
     ),
+    (
+        "0011_delivery_fencing",
+        include_str!("../../../migrations/0011_delivery_fencing.sql"),
+    ),
 ];
 
-pub const SCHEMA_VERSION: &str = "0010_lifecycle";
+pub const SCHEMA_VERSION: &str = "0011_delivery_fencing";
+
+/// A row is due for terminal settlement when its immutable start is old enough
+/// or a transport-supplied counter has reached its own budget. `updated_at`
+/// is not an age. A null counter is not zero.
+pub const SETTLEMENT_PREDICATE: &str = "\
+state IN ('queued', 'retrying')
+ AND settled_at IS NULL
+ AND (claim_until IS NULL OR claim_until < ?1)
+ AND (
+   COALESCE(operation_started_at, created_at) < ?1 - 86400000
+   OR (
+     COALESCE(message_state, '') = 'completion_unknown'
+     AND (
+       (auth_ambiguous_reconciles IS NOT NULL AND auth_ambiguous_reconciles >= 4)
+       OR COALESCE(operation_started_at, created_at) < ?1 - 900000
+     )
+   )
+   OR (
+     COALESCE(message_state, '') IN ('accepted_pending', 'prepared')
+     AND (
+       (auth_message_reconciles IS NOT NULL AND auth_message_reconciles >= 8)
+       OR COALESCE(operation_started_at, created_at) < ?1 - 900000
+     )
+   )
+   OR (
+     COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
+     AND COALESCE(push_state, '') IN (
+       'unknown', '', 'not_attempted', 'token_unavailable', 'unobservable',
+       'publication_attempted', 'prepared', 'pending'
+     )
+     AND (
+       (auth_push_publications IS NOT NULL AND auth_push_publications >= 2)
+       OR (auth_push_reconciles IS NOT NULL AND auth_push_reconciles >= 2)
+       OR (
+         COALESCE(push_state, '') = 'token_unavailable'
+         AND auth_token_waits IS NOT NULL AND auth_token_waits >= 2
+       )
+       OR COALESCE(operation_started_at, created_at) < ?1 - 900000
+     )
+   )
+   OR COALESCE(push_state, '') IN ('rejected', 'terminal_failure', 'expired')
+ )";
 
 /// Columns the running binary selects. A ledger entry without the column is
 /// not ready. A column without its ledger entry is not ready either.
@@ -69,6 +115,17 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[
     ("alert_outbox", "operation_id"),
     ("alert_outbox", "claim_owner"),
     ("alert_outbox", "terminal_reason"),
+    ("alert_outbox", "completion_token"),
+    ("alert_outbox", "operation_started_at"),
+    ("alert_outbox", "message_phase_started_at"),
+    ("alert_outbox", "push_phase_started_at"),
+    ("alert_outbox", "auth_message_submissions"),
+    ("alert_outbox", "auth_message_publications"),
+    ("alert_outbox", "auth_message_reconciles"),
+    ("alert_outbox", "auth_ambiguous_reconciles"),
+    ("alert_outbox", "auth_token_waits"),
+    ("alert_outbox", "auth_push_publications"),
+    ("alert_outbox", "auth_push_reconciles"),
     ("incidents", "decision_generation"),
     ("incidents", "acked_at"),
     ("scheduler_runs", "run_owner"),
@@ -91,6 +148,7 @@ pub const REQUIRED_INDEXES: &[&str] = &[
     "alert_outbox_logical",
     "alert_outbox_operation",
     "alert_outbox_owner",
+    "alert_outbox_completion",
     "heartbeat_nonces_expiry",
     "relay_list_cache_expiry",
     "idx_marmot_push_records_group",
@@ -111,6 +169,7 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "marmot_projects",
     "marmot_push_records",
     "schema_migrations",
+    "marmot_onboard_history",
 ];
 
 /// `applied` is the migration ledger. `missing` names absent tables, columns,

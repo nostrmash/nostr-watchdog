@@ -446,7 +446,7 @@ fn explicitly_disabled(get: &impl Fn(&str) -> String, project_id: &str, destinat
     )
 }
 
-fn fallback_wanted(
+pub fn fallback_wanted(
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     project_id: &str,

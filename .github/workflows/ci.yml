@@ -100,9 +100,22 @@ jobs:
             docker exec watchdog cat /data/marmot/helper.log || true
             exit 1
           fi
+          docker exec watchdog sh -c 'echo persisted >/data/marmot/persistence-marker'
+          docker exec watchdog test -s /data/watchdog.sqlite
           docker restart watchdog
-          curl -fsS http://127.0.0.1:8787/healthz | grep -F '"status":"ok"'
-          docker exec watchdog test -d /data/marmot
+          ready=0
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:8787/healthz | grep -F '"status":"ok"'; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = "1"
+          docker exec watchdog test -s /data/watchdog.sqlite
+          docker exec watchdog test -s /data/marmot/persistence-marker
+          # A surviving directory is not Marmot conversation recovery. That check
+          # waits until the native helper is wired to this operational store.
 
   workerd:
     runs-on: ubuntu-latest
@@ -128,3 +141,12 @@ jobs:
 
       - name: Workerd scheduled suite
         run: sh tests/runtime/worker-scheduled.sh
+
+  # These stay off this branch until the named tree is integrated here.
+  # Adding them now would fail for a missing workspace, not for a product defect:
+  # - Agent A's native Marmot helper tests and executable interoperability
+  # - the MDK engine probe as its own job (wasm-worker already checks probes/mdk-engine)
+  # - Agent B's Cloudflare Marmot workspace, the OpenMLS Durable Object probe,
+  #   and a workerd MDK conversation test
+  # The SQLCipher WASM compile probe is a known incompatibility and is not required.
+  # Public relay tests stay opt-in.

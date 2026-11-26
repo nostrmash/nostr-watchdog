@@ -1,4 +1,9 @@
-FROM rust:1.100-bookworm AS build
+# linux/amd64 only. The pinned Odin compiler is the official linux amd64 tarball.
+# A build for another architecture stops here instead of linking a binary that
+# cannot run.
+FROM --platform=linux/amd64 rust:1.100-bookworm AS build
+ARG TARGETARCH=amd64
+RUN test "$TARGETARCH" = "amd64" || (echo "unsupported architecture: $TARGETARCH (linux/amd64 only)" && exit 1)
 WORKDIR /src
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates clang curl \
@@ -21,7 +26,7 @@ COPY migrations ./migrations
 RUN cargo build --release --locked -p watchdog-native \
     && cargo build --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml --bin watchdog-marmot
 
-FROM debian:bookworm-slim
+FROM --platform=linux/amd64 debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

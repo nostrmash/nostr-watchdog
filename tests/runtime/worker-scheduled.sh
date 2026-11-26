@@ -15,13 +15,6 @@ fi
 
 persist=$(mktemp -d)
 slow="$persist/slow"
-fixture_port=8765
-if command -v lsof >/dev/null 2>&1; then
-  lsof -ti "tcp:${fixture_port}" | while read -r pid; do
-    kill "$pid" 2>/dev/null || true
-  done
-  sleep 0.2
-fi
 fixture_host=$(python3 - <<'PY'
 import re, subprocess
 text = ""
@@ -44,15 +37,6 @@ print(sorted(set(usable), key=rank)[0] if usable else "127.0.0.1")
 PY
 )
 worker_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-config="$persist/wrangler.toml"
-sed \
-  -e "s#http://127.0.0.1:8765/healthcheck#http://${fixture_host}:${fixture_port}/healthcheck#" \
-  -e "s#migrations_dir = \"migrations\"#migrations_dir = \"${root}/migrations\"#" \
-  -e "s#main = \"crates/watchdog-worker/build/worker/shim.mjs\"#main = \"${root}/crates/watchdog-worker/build/worker/shim.mjs\"#" \
-  wrangler.runtime-test.toml >"$config"
-db=nostr-watchdog-runtime-test
-echo "fixture http://${fixture_host}:${fixture_port}/healthcheck"
-
 cleanup() {
   if [ -f "${persist:-}/wrangler.log" ]; then
     cp "$persist/wrangler.log" /tmp/wd-last-wrangler.log 2>/dev/null || true
@@ -72,12 +56,11 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-
-python3 - "$fixture_port" "$slow" <<'PY' &
+python3 - "$slow" "$persist/fixture.port" <<'PY' &
 import json, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-port = int(sys.argv[1])
-slow = sys.argv[2]
+slow = sys.argv[1]
+port_path = sys.argv[2]
 hits = {"n": 0}
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -101,21 +84,31 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
     def log_message(self, fmt, *args):
         return
-ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+with open(port_path, "w", encoding="utf-8") as handle:
+    handle.write(str(server.server_address[1]))
+    handle.write("\n")
+server.serve_forever()
 PY
 fixture_pid=$!
 i=0
-while [ "$i" -lt 20 ]; do
-  if python3 -c 'import socket,sys; s=socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1); s.close()' "$fixture_port" 2>/dev/null; then
-    break
-  fi
+while [ ! -s "$persist/fixture.port" ]; do
   i=$((i + 1))
+  if [ "$i" -gt 50 ] || ! kill -0 "$fixture_pid" 2>/dev/null; then
+    echo "fixture did not bind an ephemeral port" >&2
+    exit 1
+  fi
   sleep 0.1
 done
-if ! kill -0 "$fixture_pid" 2>/dev/null; then
-  echo "fixture failed to bind port ${fixture_port}" >&2
-  exit 1
-fi
+fixture_port=$(tr -d '[:space:]' <"$persist/fixture.port")
+config="$persist/wrangler.toml"
+sed \
+  -e "s#http://127.0.0.1:8765/healthcheck#http://${fixture_host}:${fixture_port}/healthcheck#" \
+  -e "s#migrations_dir = \"migrations\"#migrations_dir = \"${root}/migrations\"#" \
+  -e "s#main = \"crates/watchdog-worker/build/worker/shim.mjs\"#main = \"${root}/crates/watchdog-worker/build/worker/shim.mjs\"#" \
+  wrangler.runtime-test.toml >"$config"
+db=nostr-watchdog-runtime-test
+echo "fixture http://${fixture_host}:${fixture_port}/healthcheck"
 
 echo "building the worker bundle"
 if ! worker-build --dev --no-opt --out-dir build crates/watchdog-worker; then
@@ -357,43 +350,27 @@ status, body = post('{"progress":"cursor-a"}', older, "nonce-runtime-0000002")
 assert status == 409 and b"stale" in body, (status, body)
 PY
 
-echo "concurrent generation fence"
-python3 - "$persist" <<'PY'
-import glob, sqlite3, sys, threading
-persist = sys.argv[1]
-files = [
-    path for path in glob.glob(persist + "/v3/d1/**/*.sqlite", recursive=True)
-    if not path.endswith("metadata.sqlite")
-]
-assert len(files) == 1, files
-path = files[0]
-def connect():
-    db = sqlite3.connect(path, timeout=5)
-    db.execute("PRAGMA busy_timeout=5000")
-    return db
-db = connect()
-generation = db.execute(
-    "SELECT generation FROM monitor_state WHERE monitor_id = 'sfs-web'"
-).fetchone()[0]
-db.close()
-def bump():
-    conn = connect()
-    conn.execute(
-        "UPDATE monitor_state SET generation = generation + 1 WHERE monitor_id = 'sfs-web' AND generation = ?",
-        (generation,),
-    )
-    conn.commit()
-    conn.close()
-threads = [threading.Thread(target=bump) for _ in range(2)]
-for thread in threads:
-    thread.start()
-for thread in threads:
-    thread.join()
-found = connect().execute(
-    "SELECT generation FROM monitor_state WHERE monitor_id = 'sfs-web'"
-).fetchone()[0]
-assert found == generation + 1, (generation, found)
+echo "d1 adapter fences"
+curl -fsS --max-time 20 -H "authorization: Bearer runtime-operator-token" -H "content-type: application/json" -X POST "http://127.0.0.1:${worker_port}/v1/diagnostics/runtime-fence" -o "$persist/fence.json"
+python3 - "$persist/fence.json" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1]))
+assert body["winner"] is True, body
+assert body["loser"] is False, body
+assert body["telegramRows"] == 1, body
+assert body["rolledBack"] is True, body
+assert body["rollbackPreserved"] is True, body
+assert body["generationFirst"] is True, body
+assert body["generationSecond"] is False, body
+assert body["settled"] is True, body
+assert body["settledAgain"] is False, body
+assert body["settlementTelegram"] == 1, body
+assert body["settlementPreserved"] is True, body
+assert body["settlementBlocked"] is True, body
+assert body["settlementBlockedPreserved"] is True, body
 PY
+unauth=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${worker_port}/v1/diagnostics/runtime-fence")
+test "$unauth" = "401"
 
 echo "probe deadline"
 printf '1\n' >"$slow"

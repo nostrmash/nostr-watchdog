@@ -108,6 +108,16 @@ pub struct OutboxRow {
     pub settled_at: Option<i64>,
     pub operation_id: Option<String>,
     pub claim_owner: Option<String>,
+    pub operation_started_at: Option<i64>,
+    pub message_phase_started_at: Option<i64>,
+    pub push_phase_started_at: Option<i64>,
+    pub auth_message_submissions: Option<i64>,
+    pub auth_message_publications: Option<i64>,
+    pub auth_message_reconciles: Option<i64>,
+    pub auth_ambiguous_reconciles: Option<i64>,
+    pub auth_token_waits: Option<i64>,
+    pub auth_push_publications: Option<i64>,
+    pub auth_push_reconciles: Option<i64>,
 }
 
 #[derive(Clone, Debug)]

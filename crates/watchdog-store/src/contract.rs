@@ -138,6 +138,7 @@ pub trait OperationalStore {
         push_envelope: Option<&str>,
         logical_id: Option<&str>,
         fallback: Option<&AlertDraft>,
+        counters: &watchdog_core::delivery::AuthoritativeCounters,
         now: i64,
     ) -> Result<bool, StoreError>;
     async fn retry_dead_letter(&self, id: &str, now: i64) -> Result<RetryMode, StoreError>;
@@ -196,6 +197,13 @@ pub trait OperationalStore {
     async fn acknowledge_alert(&self, id: &str, now: i64) -> Result<bool, StoreError>;
     async fn release_open_claims(&self, runtime_id: &str, now: i64) -> Result<usize, StoreError>;
     async fn settle_expired(&self, now: i64) -> Result<usize, StoreError>;
+    async fn settlement_ids(&self, now: i64) -> Result<Vec<String>, StoreError>;
+    async fn settle_one(
+        &self,
+        id: &str,
+        now: i64,
+        fallback: Option<&AlertDraft>,
+    ) -> Result<bool, StoreError>;
     async fn expedite_destination(&self, destination: &str, now: i64) -> Result<usize, StoreError>;
     async fn record_onboarding(
         &self,

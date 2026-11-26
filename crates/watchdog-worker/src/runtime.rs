@@ -53,8 +53,19 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
     let notifier = WorkerNotifier {
         db: env.d1("DB")?,
         vars: vars.clone(),
+        timeout_ms: settings.timeout_ms.clamp(1_000, 15_000) as u64,
     };
     let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
+    if req.method() == Method::Post && path == "/v1/diagnostics/runtime-fence" {
+        if get("ENVIRONMENT") != "test" {
+            return Response::error("not_found", 404);
+        }
+        let authorization = req.headers().get("authorization").ok().flatten();
+        if !operator_authorized(&authorization, &get("OPERATOR_TOKEN")) {
+            return Response::error("unauthorized", 401);
+        }
+        return runtime_fence(&store, now_ms()).await;
+    }
     if req.method() == Method::Get && path == "/readyz" {
         let response = handle(
             &store,
@@ -99,6 +110,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
     let notifier = WorkerNotifier {
         db: env.d1("DB")?,
         vars: vars.clone(),
+        timeout_ms: settings.timeout_ms.clamp(1_000, 15_000) as u64,
     };
     let http = WorkerHttp;
     let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
@@ -121,25 +133,6 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
             console_log!("vendor cycle failed: {error}");
         }
         if now_ms() < deadline {
-            if let Err(error) = dispatch_transport(
-                &store,
-                &settings,
-                &get,
-                &notifier,
-                &SystemClock,
-                "marmot",
-                1,
-                0,
-                deadline,
-                "push",
-                "worker",
-            )
-            .await
-            {
-                console_log!("push reconciliation failed: {error}");
-            }
-        }
-        if now_ms() < deadline {
             let _ = store.prune(now_ms()).await;
         }
         return Ok(());
@@ -159,13 +152,13 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
     {
         console_log!("monitoring cycle failed: {error}");
     }
-    let dispatch_deadline = started + 20_000;
+    let message_deadline = started + 17_000;
     for (destination, critical, other) in [
         ("telegram", 2_usize, 1_usize),
         ("nostr", 2, 1),
         ("marmot", 1, 1),
     ] {
-        if now_ms() >= dispatch_deadline {
+        if message_deadline.saturating_sub(now_ms()) < 1_500 {
             break;
         }
         if let Err(error) = dispatch_transport(
@@ -177,13 +170,33 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
             destination,
             critical,
             other,
-            dispatch_deadline,
+            message_deadline,
             "delivery",
             "worker",
         )
         .await
         {
             console_log!("dispatch failed: {error}");
+        }
+    }
+    let push_deadline = started + 20_000;
+    if push_deadline.saturating_sub(now_ms()) >= 1_500 {
+        if let Err(error) = dispatch_transport(
+            &store,
+            &settings,
+            &get,
+            &notifier,
+            &SystemClock,
+            "marmot",
+            1,
+            0,
+            push_deadline,
+            "push",
+            "worker",
+        )
+        .await
+        {
+            console_log!("push reconciliation failed: {error}");
         }
     }
     Ok(())
@@ -208,6 +221,7 @@ impl HttpClient for WorkerHttp {
 struct WorkerNotifier {
     db: D1Database,
     vars: HashMap<String, String>,
+    timeout_ms: u64,
 }
 
 impl Notifier for WorkerNotifier {
@@ -259,7 +273,7 @@ impl Notifier for WorkerNotifier {
             &url,
             &headers,
             Some(body),
-            Duration::from_secs(15),
+            Duration::from_millis(self.timeout_ms),
             65_536,
         )
         .await;
@@ -853,6 +867,61 @@ fn read_config(env: &Env) -> HashMap<String, String> {
         vars.entry(canonical.to_string()).or_insert(value);
     }
     vars
+}
+
+async fn runtime_fence(store: &D1Store<'_>, now: i64) -> Result<Response> {
+    let completion = d1_store::probe_completion_fence(store, now)
+        .await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    let loaded = store
+        .load_memory("sfs-web")
+        .await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    let check = watchdog_core::domain::check_result(
+        watchdog_core::domain::MonitorStatus::Healthy,
+        None,
+        "fence",
+        None,
+        None,
+    );
+    let first = store
+        .commit_check(
+            "sfs-web",
+            "smartflowsocial",
+            loaded.generation,
+            &loaded.memory,
+            &check,
+            now,
+            &[],
+            &[],
+        )
+        .await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    let second = store
+        .commit_check(
+            "sfs-web",
+            "smartflowsocial",
+            loaded.generation,
+            &loaded.memory,
+            &check,
+            now,
+            &[],
+            &[],
+        )
+        .await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    let mut body = completion;
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "generationFirst".to_string(),
+            serde_json::json!(first.committed),
+        );
+        object.insert(
+            "generationSecond".to_string(),
+            serde_json::json!(second.committed),
+        );
+    }
+    Response::from_json(&body)
 }
 
 fn now_ms() -> i64 {

@@ -5,8 +5,8 @@ use uuid::Uuid;
 use watchdog_core::catalog::{project_by_id, telegram_chat, PROJECTS};
 use watchdog_core::clock::Clock;
 use watchdog_core::domain::{
-    next_delivery_state, AlertClass, AlertDraft, CheckResult, DeliveryState, Destination,
-    MonitorDefinition, Notice, NoticeEvent, Severity,
+    AlertClass, AlertDraft, CheckResult, DeliveryState, Destination, MonitorDefinition, Notice,
+    NoticeEvent, Severity,
 };
 use watchdog_core::format::{format_incident_message, format_telegram_notice, IncidentMessage};
 use watchdog_core::settings::{
@@ -172,6 +172,50 @@ pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C:
     work
 }
 
+pub async fn settle_due<S: OperationalStore, C: Clock>(
+    store: &S,
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    clock: &C,
+) -> Result<(), watchdog_store::StoreError> {
+    let now = clock.unix_ms();
+    let ids = store.settlement_ids(now).await?;
+    for id in ids {
+        let Some(row) = store.read_alert(&id).await? else {
+            continue;
+        };
+        let Some(severity) = Severity::parse(&row.severity) else {
+            let _ = store.settle_one(&id, now, None).await?;
+            continue;
+        };
+        let wants_fallback = watchdog_core::settings::fallback_wanted(
+            settings,
+            get,
+            &row.project_id,
+            &row.destination,
+            severity,
+            &row.alert_class,
+        ) && fallback_required(
+            matches!(
+                row.message_state.as_deref(),
+                Some("relay_accepted" | "accepted")
+            ),
+            false,
+            row.message_state.as_deref(),
+            row.push_state.as_deref(),
+            &row.destination,
+            severity,
+        );
+        let fallback = if wants_fallback {
+            fallback_draft(settings, get, &row, now)
+        } else {
+            None
+        };
+        let _ = store.settle_one(&id, now, fallback.as_ref()).await?;
+    }
+    Ok(())
+}
+
 pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
     store: &S,
     settings: &Settings,
@@ -182,7 +226,7 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
 ) -> Result<(), watchdog_store::StoreError> {
     let started = clock.unix_ms();
     let deadline = started + 15_000;
-    let _ = store.settle_expired(started).await;
+    settle_due(store, settings, get, clock).await?;
     dispatch_transport(
         store, settings, get, notifier, clock, "telegram", 2, 1, deadline, "delivery", runtime_id,
     )
@@ -215,10 +259,10 @@ pub async fn dispatch_transport<S: OperationalStore, N: Notifier, C: Clock>(
     kind: &str,
     runtime_id: &str,
 ) -> Result<(), watchdog_store::StoreError> {
-    if !settings.alerts_enabled || clock.unix_ms() >= deadline_ms {
+    if !settings.alerts_enabled || deadline_ms.saturating_sub(clock.unix_ms()) < 1_500 {
         return Ok(());
     }
-    let _ = store.settle_expired(clock.unix_ms()).await;
+    settle_due(store, settings, get, clock).await?;
     if emergency_disabled(settings, destination) {
         let _ = store
             .expedite_destination(destination, clock.unix_ms())
@@ -381,6 +425,7 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
                     None,
                     Some(&logical_notification_key(&row.dedupe_key)),
                     fallback.as_ref(),
+                    &watchdog_core::delivery::AuthoritativeCounters::unknown(),
                     now,
                 )
                 .await?;
@@ -439,60 +484,78 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
         },
     };
     let finished = clock.unix_ms();
-    let attempt = if outcome.hold_attempt {
-        watchdog_core::marmot_recovery::reconcile_attempt(row.attempt_count)
+    let started_at = row.operation_started_at.unwrap_or(row.created_at);
+    let report = watchdog_core::delivery::interpret(watchdog_core::delivery::LifecycleInput {
+        destination: &row.destination,
+        message_phase: outcome.message_phase.as_deref(),
+        push_phase: outcome.push_phase.as_deref(),
+        counters: watchdog_core::delivery::AuthoritativeCounters::unknown(),
+        age_ms: finished.saturating_sub(started_at),
+        hold: outcome.hold_attempt,
+        terminal: outcome.terminal,
+        accepted: outcome.accepted,
+    });
+    let reconciling = matches!(
+        report.decision,
+        watchdog_core::delivery::LifecycleDecision::Reconcile { .. }
+    );
+    let attempt = if reconciling {
+        row.attempt_count
     } else {
         row.attempt_count.saturating_add(1)
     };
-    let exhausted =
-        watchdog_core::marmot_recovery::reconcile_exhausted(outcome.hold_attempt, attempt);
-    let state = if outcome.accepted
-        && !fallback_required(
-            outcome.accepted,
-            outcome.hold_attempt,
-            outcome.message_phase.as_deref(),
-            outcome.push_phase.as_deref(),
-            &row.destination,
-            severity,
-        ) {
-        DeliveryState::RelayAccepted
-    } else if outcome.hold_attempt && !exhausted {
-        DeliveryState::Retrying
-    } else if outcome.accepted {
-        DeliveryState::RelayAccepted
-    } else {
-        next_delivery_state(attempt, outcome.terminal || exhausted)
+    let state = match report.decision {
+        watchdog_core::delivery::LifecycleDecision::Reconcile { .. } => DeliveryState::Retrying,
+        watchdog_core::delivery::LifecycleDecision::Accept => DeliveryState::RelayAccepted,
+        watchdog_core::delivery::LifecycleDecision::Fail => DeliveryState::Failed,
     };
-    let error = if exhausted {
-        Some(
-            watchdog_core::marmot_recovery::exhausted_push_error(
-                outcome.message_phase.as_deref(),
-                outcome.push_phase.as_deref(),
-            )
-            .to_string(),
-        )
+    let error = if report.incompatible {
+        Some("unknown_transport_state".to_string())
+    } else if matches!(
+        report.decision,
+        watchdog_core::delivery::LifecycleDecision::Fail
+    ) && outcome.error.is_none()
+    {
+        Some("reconciliation_window".to_string())
     } else {
         outcome.error.clone()
     };
-    let next_attempt = if outcome.hold_attempt && !exhausted {
-        finished + 60_000_i64.saturating_mul(attempt.min(15))
-    } else {
-        finished + watchdog_core::backoff_ms(attempt)
+    let next_attempt = match report.decision {
+        watchdog_core::delivery::LifecycleDecision::Reconcile { retry_ms } => finished + retry_ms,
+        _ => finished,
     };
-    let message_state = projected_message_state(outcome.message_phase.as_deref(), outcome.accepted);
-    let push_state = projected_push_state(outcome.push_phase.as_deref());
-    let needs_fallback = settings.telegram_mode == TelegramMode::NostrFallback
-        && row.alert_class != "test"
-        && fallback_required(
-            outcome.accepted,
-            outcome.hold_attempt,
-            message_state.or(outcome.message_phase.as_deref()),
-            push_state.or(outcome.push_phase.as_deref()),
+    let message_phase = if report.incompatible {
+        None
+    } else {
+        report
+            .message
+            .map(watchdog_core::delivery::MessageState::as_str)
+    };
+    let push_phase = if report.incompatible {
+        None
+    } else {
+        report.push.map(watchdog_core::delivery::PushState::as_str)
+    };
+    let needs_fallback = !reconciling
+        && watchdog_core::settings::fallback_wanted(
+            settings,
+            get,
+            &row.project_id,
             &row.destination,
             severity,
+            &row.alert_class,
         )
-        && route_for(settings, get, &row.project_id, severity).telegram
-        && !settings.emergency_disable_telegram;
+        && fallback_required(
+            matches!(
+                report.decision,
+                watchdog_core::delivery::LifecycleDecision::Accept
+            ),
+            false,
+            message_phase,
+            push_phase,
+            &row.destination,
+            severity,
+        );
     let fallback = if needs_fallback {
         fallback_draft(settings, get, row, finished)
     } else {
@@ -513,40 +576,17 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
             Some(
                 &serde_json::to_string(&outcome.failed_relays).unwrap_or_else(|_| "[]".to_string()),
             ),
-            outcome.message_phase.as_deref(),
-            outcome.push_phase.as_deref(),
+            message_phase,
+            push_phase,
             outcome.message_event_id.as_deref(),
             outcome.push_envelope.as_deref(),
             Some(&logical_notification_key(&row.dedupe_key)),
             fallback.as_ref(),
+            &report.counters,
             finished,
         )
         .await?;
     Ok(())
-}
-
-fn projected_message_state(phase: Option<&str>, accepted: bool) -> Option<&str> {
-    match phase {
-        Some("relay_accepted" | "message_accepted") => Some("accepted"),
-        Some("accepted_pending" | "completion_unknown") => Some("accepted_pending"),
-        Some("message_prepared") => Some("prepared"),
-        Some(_) => Some("failed"),
-        None if accepted => Some("accepted"),
-        None => None,
-    }
-}
-
-fn projected_push_state(phase: Option<&str>) -> Option<&str> {
-    match phase {
-        Some("push_trigger_accepted") => Some("accepted"),
-        Some("push_token_unavailable" | "push_unobservable" | "completion_unknown") => {
-            Some("unobservable")
-        }
-        Some("push_trigger_prepared") => Some("pending"),
-        Some("push_expired") => Some("expired"),
-        Some(_) => Some("rejected"),
-        None => None,
-    }
 }
 
 fn availability_for(get: &impl Fn(&str) -> String, destination: &str) -> TransportAvailability {

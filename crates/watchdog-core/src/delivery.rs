@@ -202,6 +202,176 @@ pub fn phase_delta(
     }
 }
 
+/// Counters copied from a transport. `None` means the transport did not observe
+/// that count. It is not zero, and it is not derived by counting phase strings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuthoritativeCounters {
+    pub message_submissions: Option<i64>,
+    pub message_publications: Option<i64>,
+    pub message_reconciles: Option<i64>,
+    pub ambiguous_reconciles: Option<i64>,
+    pub token_waits: Option<i64>,
+    pub push_publications: Option<i64>,
+    pub push_reconciles: Option<i64>,
+}
+
+impl AuthoritativeCounters {
+    pub fn unknown() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleDecision {
+    Reconcile { retry_ms: i64 },
+    Accept,
+    Fail,
+}
+
+pub struct LifecycleInput<'a> {
+    pub destination: &'a str,
+    pub message_phase: Option<&'a str>,
+    pub push_phase: Option<&'a str>,
+    pub counters: AuthoritativeCounters,
+    pub age_ms: i64,
+    pub hold: bool,
+    pub terminal: bool,
+    pub accepted: bool,
+}
+
+pub struct InterpretedTransport {
+    pub message: Option<MessageState>,
+    pub push: Option<PushState>,
+    pub incompatible: bool,
+    pub decision: LifecycleDecision,
+    pub counters: AuthoritativeCounters,
+}
+
+/// One boundary from a transport response to an operational decision.
+/// Unknown names stay unknown and retry. They do not become `rejected`.
+pub fn interpret(input: LifecycleInput<'_>) -> InterpretedTransport {
+    let incompatible = input
+        .message_phase
+        .is_some_and(|value| MessageState::parse(value).is_none())
+        || input
+            .push_phase
+            .is_some_and(|value| PushState::parse(value).is_none());
+    if incompatible {
+        return InterpretedTransport {
+            message: None,
+            push: None,
+            incompatible: true,
+            decision: LifecycleDecision::Reconcile { retry_ms: 60_000 },
+            counters: AuthoritativeCounters::unknown(),
+        };
+    }
+    let message = input.message_phase.and_then(MessageState::parse);
+    let push = input.push_phase.and_then(PushState::parse);
+    let decision = decide_lifecycle(
+        input.destination,
+        message,
+        push,
+        input.counters,
+        input.age_ms,
+        input.accepted,
+        input.terminal,
+    );
+    InterpretedTransport {
+        message,
+        push,
+        incompatible: false,
+        decision,
+        counters: input.counters,
+    }
+}
+
+fn decide_lifecycle(
+    destination: &str,
+    message: Option<MessageState>,
+    push: Option<PushState>,
+    counters: AuthoritativeCounters,
+    age_ms: i64,
+    accepted: bool,
+    terminal: bool,
+) -> LifecycleDecision {
+    let retry = |attempt: i64| LifecycleDecision::Reconcile {
+        retry_ms: bounded_retry_ms(None, attempt).unwrap_or(15_000),
+    };
+    if age_ms >= 86_400_000 {
+        return if message == Some(MessageState::RelayAccepted) {
+            LifecycleDecision::Accept
+        } else {
+            LifecycleDecision::Fail
+        };
+    }
+    if destination != "marmot" {
+        if accepted {
+            return LifecycleDecision::Accept;
+        }
+        if terminal {
+            return LifecycleDecision::Fail;
+        }
+        return retry(0);
+    }
+    match message {
+        Some(MessageState::Rejected) => return LifecycleDecision::Fail,
+        Some(MessageState::CompletionUnknown) => {
+            let attempts = counters.ambiguous_reconciles;
+            if attempts.is_some_and(|count| count >= 4) || age_ms >= 900_000 {
+                return LifecycleDecision::Fail;
+            }
+            return retry(attempts.unwrap_or(0));
+        }
+        Some(MessageState::AcceptedPending) | Some(MessageState::Prepared) => {
+            let attempts = counters.message_reconciles.or(counters.message_submissions);
+            if attempts.is_some_and(|count| count >= 8) || age_ms >= 900_000 {
+                return LifecycleDecision::Fail;
+            }
+            return retry(attempts.unwrap_or(0));
+        }
+        Some(MessageState::RelayAccepted) => {}
+        _ => {
+            if terminal {
+                return LifecycleDecision::Fail;
+            }
+            if accepted {
+                return LifecycleDecision::Accept;
+            }
+            return retry(counters.message_submissions.unwrap_or(0));
+        }
+    }
+    match push {
+        Some(PushState::Rejected | PushState::Expired | PushState::TerminalFailure) => {
+            LifecycleDecision::Accept
+        }
+        Some(PushState::NotRequired | PushState::RelayAccepted) => LifecycleDecision::Accept,
+        Some(PushState::Unobservable) => LifecycleDecision::Accept,
+        Some(PushState::TokenUnavailable) => {
+            let waits = counters.token_waits;
+            if waits.is_some_and(|count| count >= 2) || age_ms >= 900_000 {
+                LifecycleDecision::Accept
+            } else {
+                retry(waits.unwrap_or(0))
+            }
+        }
+        Some(
+            PushState::PublicationAttempted
+            | PushState::Prepared
+            | PushState::Pending
+            | PushState::NotAttempted
+            | PushState::Unknown,
+        )
+        | None => {
+            let attempts = counters.push_publications.or(counters.push_reconciles);
+            if attempts.is_some_and(|count| count >= 2) || age_ms >= 900_000 {
+                LifecycleDecision::Accept
+            } else {
+                retry(attempts.unwrap_or(0))
+            }
+        }
+    }
+}
+
 /// Recommended retry, clamped to the engine bounds. `None` means settle.
 pub fn bounded_retry_ms(recommended_ms: Option<i64>, attempt: i64) -> Option<i64> {
     let fallback =
@@ -286,6 +456,86 @@ mod tests {
         assert_eq!(delta.unobservable_attempts, 1);
         assert_eq!(delta.push_state, Some(PushState::Unobservable));
         assert!(delta.preserve_message);
+    }
+
+    #[test]
+    fn unknown_transport_state_retries_and_age_settles_without_a_counter() {
+        let young = interpret(LifecycleInput {
+            destination: "marmot",
+            message_phase: Some("completion_unknown"),
+            push_phase: None,
+            counters: AuthoritativeCounters::unknown(),
+            age_ms: 1_000,
+            hold: true,
+            terminal: false,
+            accepted: false,
+        });
+        assert!(!young.incompatible);
+        assert!(matches!(
+            young.decision,
+            LifecycleDecision::Reconcile { .. }
+        ));
+        let aged = interpret(LifecycleInput {
+            destination: "marmot",
+            message_phase: Some("completion_unknown"),
+            push_phase: None,
+            counters: AuthoritativeCounters::unknown(),
+            age_ms: 900_000,
+            hold: true,
+            terminal: false,
+            accepted: false,
+        });
+        assert_eq!(aged.decision, LifecycleDecision::Fail);
+        let unknown = interpret(LifecycleInput {
+            destination: "marmot",
+            message_phase: Some("not-a-state"),
+            push_phase: Some("relay_accepted"),
+            counters: AuthoritativeCounters::unknown(),
+            age_ms: 1,
+            hold: false,
+            terminal: true,
+            accepted: false,
+        });
+        assert!(unknown.incompatible);
+        assert!(unknown.message.is_none());
+        assert!(matches!(
+            unknown.decision,
+            LifecycleDecision::Reconcile { .. }
+        ));
+    }
+
+    #[test]
+    fn an_accepted_message_survives_push_failure_and_a_supplied_counter_is_not_invented() {
+        let mut counters = AuthoritativeCounters::unknown();
+        counters.token_waits = Some(1);
+        let waiting = interpret(LifecycleInput {
+            destination: "marmot",
+            message_phase: Some("message_accepted"),
+            push_phase: Some("push_token_unavailable"),
+            counters,
+            age_ms: 1_000,
+            hold: true,
+            terminal: false,
+            accepted: true,
+        });
+        assert_eq!(waiting.message, Some(MessageState::RelayAccepted));
+        assert_eq!(waiting.push, Some(PushState::TokenUnavailable));
+        assert!(matches!(
+            waiting.decision,
+            LifecycleDecision::Reconcile { .. }
+        ));
+        let rejected = interpret(LifecycleInput {
+            destination: "marmot",
+            message_phase: Some("relay_accepted"),
+            push_phase: Some("rejected"),
+            counters: AuthoritativeCounters::unknown(),
+            age_ms: 1_000,
+            hold: false,
+            terminal: true,
+            accepted: true,
+        });
+        assert_eq!(rejected.decision, LifecycleDecision::Accept);
+        assert_eq!(rejected.message, Some(MessageState::RelayAccepted));
     }
 
     #[test]

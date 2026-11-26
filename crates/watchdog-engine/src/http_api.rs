@@ -601,6 +601,14 @@ async fn alert_status<S: OperationalStore>(
             "operationId": row.operation_id,
             "preserveMessage": row.preserve_message,
             "settledAt": row.settled_at,
+            "operationStartedAt": row.operation_started_at,
+            "messageSubmissions": row.auth_message_submissions,
+            "messagePublications": row.auth_message_publications,
+            "messageReconciles": row.auth_message_reconciles,
+            "ambiguousReconciles": row.auth_ambiguous_reconciles,
+            "tokenWaitsAuthoritative": row.auth_token_waits,
+            "pushPublicationsAuthoritative": row.auth_push_publications,
+            "pushReconciles": row.auth_push_reconciles,
             "startedAt": row.started_at_ms,
             "updatedAt": row.updated_at,
             "messageUpdatedAt": row.message_updated_at,
@@ -678,19 +686,43 @@ async fn onboard<S: OperationalStore>(
             }),
         );
     }
+    let hook = UnconnectedMarmot.onboard(project_id, key, replace);
     json_response(
         202,
         json!({
             "projectId": project_id,
             "operationId": key,
             "replace": replace,
-            "status": "unavailable",
+            "status": if hook.available { "accepted" } else { "unavailable" },
             "phase": "unavailable",
             "engineStatus": row.engine_status,
-            "dependency": "watchdog-marmot helper onboard operation",
-            "note": "The operation id is stored. Group creation is performed by the Marmot helper or Durable Object and is not invented here.",
+            "dependency": hook.dependency,
+            "connected": hook.available,
+            "note": "The operation id is stored. This build does not call a Marmot transport. Group creation is not invented here.",
         }),
     )
+}
+
+/// Narrow hook Agent A’s helper or Agent B’s Durable Object implements later.
+/// The standalone branch uses [`UnconnectedMarmot`], which never reports success.
+pub trait MarmotControl {
+    fn onboard(&self, project_id: &str, operation_id: &str, replace: bool) -> MarmotHook;
+}
+
+pub struct MarmotHook {
+    pub available: bool,
+    pub dependency: &'static str,
+}
+
+pub struct UnconnectedMarmot;
+
+impl MarmotControl for UnconnectedMarmot {
+    fn onboard(&self, _project_id: &str, _operation_id: &str, _replace: bool) -> MarmotHook {
+        MarmotHook {
+            available: false,
+            dependency: "marmot transport is not connected on this build",
+        }
+    }
 }
 
 async fn failed<S: OperationalStore>(
