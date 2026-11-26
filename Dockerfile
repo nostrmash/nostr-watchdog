@@ -12,6 +12,9 @@ RUN apt-get update \
     && /opt/odin/odin version | tee /tmp/odin-version.txt \
     && grep -E "dev-2026-10|84bc3fc" /tmp/odin-version.txt
 ENV PATH="/opt/odin:${PATH}"
+# marmot-markdown's build script links the Odin backend with the toolchain's
+# opt, rust-lld, and llvm-ar. Those ship in the llvm-tools component.
+RUN rustup component add llvm-tools
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY migrations ./migrations
