@@ -1,0 +1,22 @@
+name = "marmot-sender-probe"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-11-26"
+workers_dev = false
+
+[observability]
+enabled = true
+
+[observability.traces]
+enabled = true
+
+[vars]
+MARMOT_ALLOW_LOOPBACK = "0"
+
+[durable_objects]
+bindings = [
+  { name = "MARMOT_SENDER", class_name = "MarmotSender" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MarmotSender"]

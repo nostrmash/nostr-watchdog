@@ -1,0 +1,36 @@
+[package]
+name = "marmot-worker-runtime"
+version = "0.1.0"
+description = "Official MDK session over the Durable Object storage provider."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+cgka-engine = { workspace = true }
+cgka-traits = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hex = { workspace = true }
+hkdf = { workspace = true }
+k256 = { workspace = true }
+mdk-do-storage = { path = "../storage" }
+nostr = { workspace = true, features = ["nip59"] }
+secp256k1 = { version = "0.30", default-features = false, features = ["std", "global-context"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+transport-nostr-peeler = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+js-sys = "0.3"
+openmls = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
