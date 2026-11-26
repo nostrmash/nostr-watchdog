@@ -28,11 +28,14 @@ struct Gate {
     publish: Option<Publish>,
     pull: Option<Pull>,
     hide: bool,
+    follow_push: bool,
 }
 
 struct Pull {
     relays: Vec<String>,
     filters: Vec<Value>,
+    purpose: String,
+    operation_id: String,
 }
 
 struct Publish {
@@ -164,10 +167,18 @@ impl DurableObject for MarmotSender {
         if !valid_name(&project) {
             return Response::error("sender name is invalid", 400);
         }
-        let bytes = req.bytes().await?;
-        if bytes.len() > MAX_BODY {
-            return Response::error("request body is too large", 413);
+        if let Some(length) = req.headers().get("content-length")? {
+            if length.parse::<usize>().unwrap_or(usize::MAX) > MAX_BODY {
+                return Response::error("request body is too large", 413);
+            }
         }
+        let bytes = match read_limited(&mut req).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.to_string().contains("too large") => {
+                return Response::error("request body is too large", 413);
+            }
+            Err(error) => return Err(error),
+        };
         let command: Command = serde_json::from_slice(&bytes).map_err(|_| Error::RustError("invalid json".into()))?;
         let sql = self.sql.clone();
         let allow_loopback = self.allow_loopback;
@@ -187,10 +198,91 @@ impl DurableObject for MarmotSender {
         }
         if let Some(pull) = gate.pull {
             let mut events = Vec::new();
-            for filter in pull.filters {
-                if let Ok(found) = relay::fetch_events(&pull.relays, filter, allow_loopback).await {
+            for filter in &pull.filters {
+                if let Ok(found) = relay::fetch_events(&pull.relays, filter.clone(), allow_loopback).await {
                     events.extend(found);
                 }
+            }
+            if pull.purpose == "establish" {
+                let relays = pull.relays.clone();
+                let operation_id = pull.operation_id.clone();
+                let sql = self.sql.clone();
+                let project_for_group = project.clone();
+                let created = self
+                    .state
+                    .block_concurrency_while(async move {
+                        Ok(establish_from(
+                            &sql,
+                            storage_key,
+                            &project_for_group,
+                            &operation_id,
+                            relays,
+                            events,
+                        )
+                        .await)
+                    })
+                    .await?;
+                let mut response = created.map_err(|error| Error::RustError(sanitize(&error)))?;
+                let relays = response
+                    .get("publicationRelays")
+                    .and_then(|value| value.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if let Some(welcomes) = response.get("welcomes").and_then(|value| value.as_array()).cloned() {
+                    for welcome in welcomes {
+                        let message: TransportMessage = serde_json::from_value(welcome)
+                            .map_err(|error| Error::RustError(error.to_string()))?;
+                        let event = Session::transport_json(&message)
+                            .map_err(|error| Error::RustError(error.to_string()))?;
+                        let outcome = relay::publish_event(&relays, &event, allow_loopback)
+                            .await
+                            .unwrap_or_else(|_| "unobservable".into());
+                        let event_id = event
+                            .get("id")
+                            .and_then(|item| item.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let destination = relays.first().cloned().unwrap_or_default();
+                        let sql = self.sql.clone();
+                        let operation_id = response["operationId"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        let project_for_ack = project.clone();
+                        let ack = self
+                            .state
+                            .block_concurrency_while(async move {
+                                Ok(acknowledge(
+                                    &sql,
+                                    storage_key,
+                                    &project_for_ack,
+                                    &operation_id,
+                                    "message",
+                                    &outcome,
+                                    &event_id,
+                                    &destination,
+                                )
+                                .await)
+                            })
+                            .await?;
+                        if let Ok(phase) = ack {
+                            response["messagePhase"] = json!(phase);
+                            response["messageState"] = json!(phase);
+                        }
+                    }
+                }
+                if let Some(map) = response.as_object_mut() {
+                    map.remove("publicationRelays");
+                    if !allow_loopback {
+                        map.remove("welcomes");
+                    }
+                }
+                return Response::from_json(&response);
             }
             let sql = self.sql.clone();
             let project_for_sync = project.clone();
@@ -205,9 +297,16 @@ impl DurableObject for MarmotSender {
         }
         let mut response = gate.response;
         if let Some(publish) = gate.publish {
-            let accepted = relay::publish_event(&publish.relays, &publish.event, allow_loopback)
+            let outcome = relay::publish_event(&publish.relays, &publish.event, allow_loopback)
                 .await
-                .unwrap_or(false);
+                .unwrap_or_else(|_| "unobservable".into());
+            let event_id = publish
+                .event
+                .get("id")
+                .and_then(|item| item.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let destination = publish.relays.first().cloned().unwrap_or_default();
             let sql = self.sql.clone();
             let operation_id = publish.operation_id.clone();
             let project_for_ack = project.clone();
@@ -224,7 +323,9 @@ impl DurableObject for MarmotSender {
                         &project_for_ack,
                         &operation_id,
                         kind,
-                        accepted,
+                        &outcome,
+                        &event_id,
+                        &destination,
                     )
                     .await)
                 })
@@ -232,8 +333,78 @@ impl DurableObject for MarmotSender {
             if let Ok(phase) = ack {
                 if kind == "message" {
                     response["messagePhase"] = json!(phase);
+                    response["messageState"] = json!(phase);
                 } else {
                     response["pushPhase"] = json!(phase);
+                    response["pushState"] = json!(phase);
+                }
+            }
+        }
+        if gate.follow_push && response["messagePhase"] == "relay_accepted" {
+            if let Some(operation_id) = response["operationId"].as_str().map(str::to_string) {
+                let sql = self.sql.clone();
+                let project_for_push = project.clone();
+                let prepared = self
+                    .state
+                    .block_concurrency_while(async move {
+                        Ok(prepare_push(
+                            &sql,
+                            storage_key,
+                            &project_for_push,
+                            &operation_id,
+                            allow_loopback,
+                        )
+                        .await)
+                    })
+                    .await?;
+                if let Ok((jobs, phase)) = prepared {
+                    if jobs.is_empty() {
+                        if let Some(phase) = phase {
+                            response["pushPhase"] = json!(phase);
+                            response["pushState"] = json!(phase);
+                        }
+                    }
+                    for (event, relays) in jobs {
+                        let outcome = relay::publish_event(&relays, &event, allow_loopback)
+                            .await
+                            .unwrap_or_else(|_| "unobservable".into());
+                        let event_id = event
+                            .get("id")
+                            .and_then(|item| item.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let recorded_event = event_id.clone();
+                        let destination = relays.first().cloned().unwrap_or_default();
+                        let sql = self.sql.clone();
+                        let operation_id = response["operationId"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        let project_for_ack = project.clone();
+                        let ack = self
+                            .state
+                            .block_concurrency_while(async move {
+                                Ok(acknowledge(
+                                    &sql,
+                                    storage_key,
+                                    &project_for_ack,
+                                    &operation_id,
+                                    "push",
+                                    &outcome,
+                                    &event_id,
+                                    &destination,
+                                )
+                                .await)
+                            })
+                            .await?;
+                        if let Ok(phase) = ack {
+                            if response["pushPhase"] != "relay_accepted" {
+                                response["pushPhase"] = json!(phase);
+                                response["pushState"] = json!(phase);
+                                response["pushEventId"] = json!(recorded_event);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -254,10 +425,14 @@ async fn execute(
             publish: None,
             pull: None,
             hide: false,
+            follow_push: false,
         });
     }
     if command.op == "sync" {
         return sync_plan(sql, storage_key, allow_loopback, project, &command);
+    }
+    if command.op == "establish" {
+        return establish_plan(sql, storage_key, allow_loopback, project, &command);
     }
     if command.op == "cas_self_test" {
         return Ok(Gate {
@@ -265,6 +440,7 @@ async fn execute(
             publish: None,
             pull: None,
             hide: false,
+            follow_push: false,
         });
     }
     if command.op == "stale_write" {
@@ -273,6 +449,7 @@ async fn execute(
             publish: None,
             pull: None,
             hide: false,
+            follow_push: false,
         });
     }
     let loaded = load(sql)?;
@@ -317,15 +494,140 @@ async fn execute(
             publish: None,
             pull: None,
             hide: true,
+            follow_push: false,
         });
     }
     let publish = publish_job(&session, &command, &body, allow_loopback)?;
+    let follow_push = command.op == "deliver" || command.op == "reconcile";
+    let mut body = body;
+    if matches!(command.op.as_str(), "deliver" | "reconcile") {
+        if let Some(map) = body.as_object_mut() {
+            map.remove("message");
+            map.remove("trigger");
+            map.remove("welcomes");
+        }
+    }
     Ok(Gate {
         response: body,
         publish,
         pull: None,
         hide: false,
+        follow_push,
     })
+}
+
+fn establish_plan(
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    allow_loopback: bool,
+    project: &str,
+    command: &Command,
+) -> std::result::Result<Gate, String> {
+    let Some(row) = load(sql)? else {
+        return Err("account is not initialized".into());
+    };
+    let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
+        .map_err(|error| error.to_string())?;
+    let binding = session.binding().map_err(|error| error.to_string())?;
+    let operation = command
+        .operation_id
+        .clone()
+        .or(command.operation_id_camel.clone())
+        .unwrap_or_else(|| "establish".into());
+    if binding.group_id_hex.is_some() {
+        return Ok(Gate {
+            response: json!({
+                "ok": true,
+                "operationId": operation,
+                "groupBound": true,
+                "groupIdHex": binding.group_id_hex,
+                "pubkey": session.public_key_hex(),
+                "disposition": "settled",
+                "phoneDelivery": false
+            }),
+            publish: None,
+            pull: None,
+            hide: false,
+            follow_push: false,
+        });
+    }
+    let relays = if command.relays.is_empty() {
+        binding.relays
+    } else {
+        command.relays.clone()
+    };
+    relay::validate_relays(&relays, allow_loopback)?;
+    if binding.recipient_hex.len() != 64 {
+        return Err("recipient is not configured".into());
+    }
+    Ok(Gate {
+        response: json!({}),
+        publish: None,
+        pull: Some(Pull {
+            filters: vec![json!({
+                "kinds": [30443],
+                "authors": [binding.recipient_hex],
+                "limit": 5
+            })],
+            relays,
+            purpose: "establish".into(),
+            operation_id: operation,
+        }),
+        hide: false,
+        follow_push: false,
+    })
+}
+
+async fn establish_from(
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    project: &str,
+    operation_id: &str,
+    relays: Vec<String>,
+    events: Vec<Value>,
+) -> std::result::Result<Value, String> {
+    let Some(row) = load(sql)? else {
+        return Err("account is not initialized".into());
+    };
+    let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
+        .map_err(|error| error.to_string())?;
+    let binding = session.binding().map_err(|error| error.to_string())?;
+    if binding.group_id_hex.is_some() {
+        return Ok(json!({
+            "ok": true,
+            "operationId": operation_id,
+            "groupBound": true,
+            "groupIdHex": binding.group_id_hex,
+            "disposition": "settled"
+        }));
+    }
+    let mut package = None;
+    for event in events {
+        if let Ok(found) = Session::key_package_from_relay_event(&event, &binding.recipient_hex) {
+            package = Some(found);
+            break;
+        }
+    }
+    let package = package.ok_or("recipient key package was not found")?;
+    let (group_id, welcomes) = session
+        .create_group(operation_id, "watchdog", vec![package], relays.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    persist_session(sql, storage_key, project, &session, row.revision as u64)?;
+    Ok(outcome(
+        operation_id,
+        "accepted_pending",
+        welcomes.first().map(Session::message_id_hex),
+        "not_required",
+        None,
+        "prepared_welcome",
+        false,
+        json!({
+            "groupIdHex": hex::encode(group_id.as_slice()),
+            "welcomes": welcomes,
+            "publicationRelays": relays
+        }),
+    ))
 }
 
 fn sync_plan(
@@ -355,8 +657,14 @@ fn sync_plan(
     Ok(Gate {
         response: json!({}),
         publish: None,
-        pull: Some(Pull { relays, filters }),
+        pull: Some(Pull {
+            relays,
+            filters,
+            purpose: "sync".into(),
+            operation_id: String::new(),
+        }),
         hide: false,
+        follow_push: false,
     })
 }
 
@@ -518,17 +826,25 @@ async fn dispatch(
             let chats = session.ingest(message).await.map_err(|error| error.to_string())?;
             Ok(json!({"chats": chats}))
         }
-        "send" => {
+        "send" | "deliver" => {
             let operation = operation_id.clone().or(command.operation_id_camel.clone()).ok_or("operationId is required")?;
-            let group_id = decode_group(command.group_id_hex.clone().or(command.group_id_hex_camel.clone()))?;
+            let group_id = if command.op == "deliver" {
+                let bound = session.binding().map_err(|error| error.to_string())?;
+                decode_group(bound.group_id_hex)?
+            } else {
+                decode_group(command.group_id_hex.clone().or(command.group_id_hex_camel.clone()))?
+            };
             let text = command.text.clone().unwrap_or_default();
             if text.len() > 16 * 1024 {
                 return Err("alert text is too large".into());
             }
-            let message = session
-                .send_chat(&operation, &group_id, &text)
-                .await
-                .map_err(|error| error.to_string())?;
+            let message = match session.send_chat(&operation, &group_id, &text).await {
+                Ok(message) => message,
+                Err(marmot_worker_runtime::SessionError::Retired(_)) => {
+                    return retired_outcome(session, &operation);
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             let stored = session
                 .storage()
                 .publication(&operation)
@@ -572,6 +888,9 @@ async fn dispatch(
             ))
         }
         "ack" | "confirm" => {
+            if !allow_loopback {
+                return Err("synthetic acknowledgement is test-only".into());
+            }
             let operation = operation_id.ok_or("operationId is required")?;
             let accepted = command.accepted.unwrap_or(true);
             session
@@ -620,7 +939,59 @@ async fn dispatch(
                 ),
             ))
         }
+        "reconcile" => {
+            let operation = operation_id.ok_or("operationId is required")?;
+            if let Some(stored) = session
+                .storage()
+                .publication(&operation)
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(outcome(
+                    &operation,
+                    &stored.message_phase,
+                    Some(Session::message_id_hex(&stored.message)),
+                    &stored.push_phase,
+                    stored.push_event_id.clone(),
+                    "reconcile",
+                    stored.message_phase == "relay_accepted"
+                        && matches!(
+                            stored.push_phase.as_str(),
+                            "relay_accepted" | "rejected" | "not_required" | "terminal_failure" | "expired"
+                        ),
+                    with_counters(
+                        json!({"message": stored.message}),
+                        stored.message_attempts,
+                        stored.push_attempts,
+                        stored.started_at_ms,
+                    ),
+                ));
+            }
+            retired_outcome(session, &operation)
+        }
+        "readiness" => {
+            let binding = session.binding().map_err(|error| error.to_string())?;
+            let tokens = if let Some(group) = binding.group_id_hex.clone() {
+                session
+                    .select_push_tokens(&decode_group(Some(group))?)
+                    .map(|rows| rows.len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            Ok(json!({
+                "ok": true,
+                "account": true,
+                "pubkey": session.public_key_hex(),
+                "groupBound": binding.group_id_hex.is_some(),
+                "recipient": binding.recipient_hex,
+                "recipientTokenCount": tokens,
+                "phoneDelivery": false
+            }))
+        }
         "stage_push" => {
+            if !allow_loopback {
+                return Err("token injection is test-only".into());
+            }
             let operation = operation_id.ok_or("operationId is required")?;
             let server = command.server_pubkey_hex.clone().ok_or("serverPubkeyHex is required")?;
             let token = hex::decode(command.encrypted_token_hex.clone().unwrap_or_default())
@@ -662,6 +1033,11 @@ fn publish_job(
     allow_loopback: bool,
 ) -> std::result::Result<Option<Publish>, String> {
     if !command.publish {
+        return Ok(None);
+    }
+    let publishing_trigger = command.op == "stage_push";
+    if !publishing_trigger && body.get("messagePhase").and_then(|value| value.as_str()) == Some("relay_accepted")
+    {
         return Ok(None);
     }
     let relays = if command.relays.is_empty() {
@@ -707,7 +1083,9 @@ async fn acknowledge(
     project: &str,
     operation_id: &str,
     kind: &str,
-    accepted: bool,
+    outcome: &str,
+    event_id: &str,
+    destination: &str,
 ) -> std::result::Result<String, String> {
     let Some(row) = load(sql)? else {
         return Err("account is not initialized".into());
@@ -715,32 +1093,98 @@ async fn acknowledge(
     let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
         .map_err(|error| error.to_string())?;
     let phase = if kind == "push" {
-        let phase = if accepted { "relay_accepted" } else { "rejected" };
+        let phase = match outcome {
+            "relay_accepted" => "relay_accepted",
+            "rejected" => "rejected",
+            _ => "unobservable",
+        };
+        if let Some(stored) = session
+            .storage()
+            .publication(operation_id)
+            .map_err(|error| error.to_string())?
+        {
+            if let Some(bytes) = stored.push_trigger.as_deref() {
+                let prepared = push_event_ids(bytes);
+                if phase == "relay_accepted"
+                    && !prepared.is_empty()
+                    && !prepared.iter().any(|item| item == event_id)
+                {
+                    return Err("push acknowledgement does not match the prepared trigger".into());
+                }
+            }
+        }
         session
-            .note_push(operation_id, phase, None)
+            .note_push(operation_id, phase, Some(event_id.to_owned()))
             .map_err(|error| error.to_string())?;
         phase.to_owned()
-    } else if accepted {
-        session
-            .note_publication(operation_id, true)
-            .await
-            .map_err(|error| error.to_string())?;
-        "relay_accepted".into()
     } else {
+        let message_outcome = match outcome {
+            "relay_accepted" => "relay_accepted",
+            "rejected" => "rejected",
+            _ => "completion_unknown",
+        };
+        let already_accepted = session
+            .storage()
+            .publication(operation_id)
+            .map_err(|error| error.to_string())?
+            .map(|stored| stored.message_phase == "relay_accepted")
+            .unwrap_or(false);
+        if !already_accepted {
+            session
+                .mark_message_publication(operation_id)
+                .map_err(|error| error.to_string())?;
+        }
         session
-            .note_publication(operation_id, false)
+            .note_message_outcome(operation_id, message_outcome, event_id, destination, event_id)
             .await
             .map_err(|error| error.to_string())?;
-        "completion_unknown".into()
+        session
+            .storage()
+            .publication(operation_id)
+            .map_err(|error| error.to_string())?
+            .map(|stored| stored.message_phase)
+            .unwrap_or_else(|| message_outcome.to_owned())
     };
-    let revision = advance(&session, Some(row.revision as u64))?;
-    let floors = floor_map(&session)?;
+    persist_session(sql, storage_key, project, &session, row.revision as u64)?;
+    Ok(phase)
+}
+
+fn push_event_ids(bytes: &[u8]) -> Vec<String> {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    if let Some(id) = value.get("id").and_then(|item| item.as_str()) {
+        ids.push(id.to_owned());
+    }
+    if let Some(id) = value.pointer("/event/id").and_then(|item| item.as_str()) {
+        ids.push(id.to_owned());
+    }
+    if let Some(items) = value.as_array() {
+        for item in items {
+            if let Some(id) = item.pointer("/event/id").and_then(|value| value.as_str()) {
+                ids.push(id.to_owned());
+            }
+        }
+    }
+    ids
+}
+
+fn persist_session(
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    project: &str,
+    session: &Session,
+    revision: u64,
+) -> std::result::Result<(), String> {
+    let next = advance(session, Some(revision))?;
+    let floors = floor_map(session)?;
     let sealed = session.seal(&storage_key, project).map_err(|error| error.to_string())?;
     let writer = writer_id()?;
     store(
         sql,
-        Some(row.revision as u64),
-        revision,
+        Some(revision),
+        next,
         &writer,
         &session.public_key_hex(),
         &floors,
@@ -749,7 +1193,176 @@ async fn acknowledge(
     for hook in session.take_commit_hooks() {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
     }
-    Ok(phase)
+    Ok(())
+}
+
+async fn prepare_push(
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    project: &str,
+    operation_id: &str,
+    allow_loopback: bool,
+) -> std::result::Result<(Vec<(Value, Vec<String>)>, Option<String>), String> {
+    let Some(row) = load(sql)? else {
+        return Err("account is not initialized".into());
+    };
+    let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
+        .map_err(|error| error.to_string())?;
+    let stored = session
+        .storage()
+        .publication(operation_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("publication missing")?;
+    if stored.message_phase != "relay_accepted" {
+        return Ok((Vec::new(), Some(stored.push_phase)));
+    }
+    if stored.push_phase == "relay_accepted" {
+        return Ok((Vec::new(), Some("relay_accepted".into())));
+    }
+    if let Some(bytes) = stored.push_trigger.as_deref() {
+        if let Some(jobs) = stored_push_jobs(bytes) {
+            return Ok((jobs, None));
+        }
+    }
+    let binding = session.binding().map_err(|error| error.to_string())?;
+    let Some(group_hex) = binding.group_id_hex else {
+        session
+            .note_token_wait(operation_id)
+            .map_err(|error| error.to_string())?;
+        persist_session(sql, storage_key, project, &session, row.revision as u64)?;
+        return Ok((Vec::new(), Some("token_unavailable".into())));
+    };
+    let tokens = session
+        .select_push_tokens(&decode_group(Some(group_hex))?)
+        .map_err(|error| error.to_string())?;
+    if tokens.is_empty() {
+        session
+            .note_token_wait(operation_id)
+            .map_err(|error| error.to_string())?;
+        persist_session(sql, storage_key, project, &session, row.revision as u64)?;
+        return Ok((Vec::new(), Some("token_unavailable".into())));
+    }
+    let directories = session
+        .storage()
+        .server_relays()
+        .map_err(|error| error.to_string())?;
+    let mut order = Vec::new();
+    let mut grouped: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+    let mut hints: HashMap<String, Vec<String>> = HashMap::new();
+    for wake in tokens {
+        if !grouped.contains_key(&wake.server_pubkey_hex) {
+            order.push(wake.server_pubkey_hex.clone());
+        }
+        if let Some(hint) = wake.relay_hint.clone() {
+            if relay::validate_relay(&hint, allow_loopback).is_ok() {
+                let entry = hints.entry(wake.server_pubkey_hex.clone()).or_default();
+                if !entry.contains(&hint) {
+                    entry.push(hint);
+                }
+            }
+        }
+        grouped
+            .entry(wake.server_pubkey_hex)
+            .or_default()
+            .push(wake.encrypted_token);
+    }
+    let mut jobs = Vec::new();
+    let mut envelope = Vec::new();
+    for server in order {
+        let mut relays = hints.remove(&server).unwrap_or_default();
+        if relays.is_empty() {
+            if let Some(found) = directories.iter().find(|item| item.server_pubkey_hex == server && !item.negative) {
+                relays = found
+                    .relays
+                    .iter()
+                    .filter(|url| relay::validate_relay(url, allow_loopback).is_ok())
+                    .cloned()
+                    .collect();
+            }
+        }
+        if relays.is_empty() {
+            continue;
+        }
+        let tokens = grouped.remove(&server).unwrap_or_default();
+        let mut offset = 0;
+        while offset < tokens.len() {
+            let end = (offset + 18).min(tokens.len());
+            let event = notification_gift_wrap(&server, &tokens[offset..end])
+                .await
+                .map_err(|error| error.to_string())?;
+            let event = serde_json::to_value(&event).map_err(|error| error.to_string())?;
+            envelope.push(json!({"event": event, "relays": relays}));
+            jobs.push((event, relays.clone()));
+            offset = end;
+        }
+    }
+    if jobs.is_empty() {
+        session
+            .note_push(operation_id, "unobservable", None)
+            .map_err(|error| error.to_string())?;
+        persist_session(sql, storage_key, project, &session, row.revision as u64)?;
+        return Ok((Vec::new(), Some("unobservable".into())));
+    }
+    let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
+    session
+        .stage_push(operation_id, &bytes)
+        .map_err(|error| error.to_string())?;
+    persist_session(sql, storage_key, project, &session, row.revision as u64)?;
+    Ok((jobs, None))
+}
+
+fn stored_push_jobs(bytes: &[u8]) -> Option<Vec<(Value, Vec<String>)>> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let items = value.as_array()?;
+    if items.is_empty() || items.iter().any(|item| item.get("event").is_none()) {
+        return None;
+    }
+    Some(
+        items
+            .iter()
+            .filter_map(|item| {
+                let relays = item
+                    .get("relays")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|relay| relay.as_str().map(str::to_owned))
+                    .collect();
+                Some((item.get("event")?.clone(), relays))
+            })
+            .collect(),
+    )
+}
+
+async fn read_limited(req: &mut Request) -> Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    let mut stream = req.stream()?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| Error::RustError(error.to_string()))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_BODY {
+            return Err(Error::RustError("request body is too large".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn retired_outcome(session: &Session, operation: &str) -> std::result::Result<Value, String> {
+    let stone = session
+        .storage()
+        .tombstone(operation)
+        .map_err(|error| error.to_string())?
+        .ok_or("retired operation has no record")?;
+    Ok(outcome(
+        operation,
+        &stone.message_phase,
+        Some(stone.message_event_id),
+        &stone.push_phase,
+        stone.push_event_id,
+        "retired",
+        true,
+        json!({"retired": true, "resubmittable": false}),
+    ))
 }
 
 fn with_counters(extra: Value, message_attempts: u64, push_attempts: u64, started_at_ms: u64) -> Value {
@@ -785,7 +1398,12 @@ fn outcome(
         "evidence": evidence,
         "error": null,
         "settled": settled,
+        "messageState": message_phase,
+        "pushState": push_phase,
+        "disposition": if settled { "settled" } else { "reconcile" },
+        "retryAtMs": if settled { 0 } else { 15_000 },
         "reconcileAfterMs": if settled { 0 } else { 15_000 },
+        "phoneDelivery": false,
         "messageAttempts": 1,
         "pushAttempts": 0
     });

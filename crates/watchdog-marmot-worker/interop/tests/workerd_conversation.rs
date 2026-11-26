@@ -20,9 +20,13 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use cgka_traits::{KeyPackageSource, MessageId, TransportMessage};
 use marmot_worker_interop::OfficialRecipient;
-use marmot_worker_runtime::push::{self, Platform};
+use marmot_worker_runtime::push::{self, Platform, TokenRecord};
+use nostr::event::FinalizeEvent;
+use nostr::nips::nip59::UnwrappedGift;
+use nostr::prelude::{EventBuilder, Kind, Tag, Timestamp};
 use nostr::key::{Keys, SecretKey};
 use serde_json::{Value, json};
+use sha2::Digest;
 
 const SENDER: &str = "workerdtest";
 const TOKEN: &str = "local-test-token";
@@ -199,13 +203,32 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
     let server_hex = hex::encode(server_keys.public_key().to_bytes());
     let device_token = b"fcm-device-token".to_vec();
     let encrypted = push::encrypt_token(Platform::Fcm, &device_token, &server_hex).expect("encrypt token");
+    let too_early = post_status(json!({
+        "op": "stage_push",
+        "operationId": "alert-1",
+        "serverPubkeyHex": server_hex,
+        "encryptedTokenHex": hex::encode(&encrypted)
+    }));
+    assert_eq!(too_early.0, 400, "{}", too_early.1);
+    assert!(too_early.1.contains("accepted"), "{}", too_early.1);
+    let published_message = post(json!({
+        "op": "send",
+        "operationId": "alert-1",
+        "groupIdHex": group_hex,
+        "text": "relay down",
+        "publish": true,
+        "relays": [relay_url]
+    }));
+    assert_eq!(published_message["messagePhase"], "relay_accepted", "{published_message}");
+    assert_eq!(published_message["messageEventId"], first["messageEventId"]);
+    assert_eq!(published_message["messageAttempts"].as_u64().unwrap(), 1, "{published_message}");
     let staged = post(json!({
         "op": "stage_push",
         "operationId": "alert-1",
         "serverPubkeyHex": server_hex,
         "encryptedTokenHex": hex::encode(&encrypted)
     }));
-    assert_eq!(staged["messagePhase"], "accepted_pending", "{staged}");
+    assert_eq!(staged["messagePhase"], "relay_accepted", "{staged}");
     assert_eq!(staged["pushPhase"], "prepared");
     assert_eq!(staged["messageEventId"], first["messageEventId"]);
     let opened = push::unwrap_notification(
@@ -233,7 +256,7 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
         "encryptedTokenHex": hex::encode(&encrypted)
     }));
     assert_eq!(pushed["pushPhase"], "relay_accepted", "{pushed}");
-    assert_eq!(pushed["messagePhase"], "accepted_pending", "{pushed}");
+    assert_eq!(pushed["messagePhase"], "relay_accepted", "{pushed}");
     assert_eq!(pushed["messageEventId"], first["messageEventId"]);
     let stats = relay_stats(&relay.http);
     assert!(stats["counts"]["1059"].as_u64().unwrap_or(0) >= 1, "{stats}");
@@ -355,7 +378,7 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
         "text": "after restart"
     }));
     assert_eq!(same["message"], after["message"]);
-    assert!(same["messageAttempts"].as_u64().unwrap() >= 2, "{same}");
+    assert_eq!(same["messageAttempts"].as_u64().unwrap(), 1, "{same}");
 
     let commit = post(json!({
         "op": "self_update",
@@ -416,6 +439,43 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
         "sync did not decrypt the relay reply: {synced}"
     );
 
+    let prepared = post(json!({
+        "op": "send",
+        "operationId": "alert-ambiguous",
+        "groupIdHex": group_hex,
+        "text": "ambiguous"
+    }));
+    let unknown = post(json!({
+        "op": "send",
+        "operationId": "alert-ambiguous",
+        "groupIdHex": group_hex,
+        "text": "ambiguous",
+        "publish": true,
+        "relays": ["ws://127.0.0.1:9"]
+    }));
+    assert_eq!(unknown["messagePhase"], "completion_unknown", "{unknown}");
+    assert_eq!(unknown["message"], prepared["message"]);
+    let accepted = post(json!({
+        "op": "send",
+        "operationId": "alert-ambiguous",
+        "groupIdHex": group_hex,
+        "text": "ambiguous",
+        "publish": true,
+        "relays": [relay_url]
+    }));
+    assert_eq!(accepted["messagePhase"], "relay_accepted", "{accepted}");
+    assert_eq!(accepted["message"], prepared["message"]);
+    let kept = post(json!({
+        "op": "send",
+        "operationId": "alert-ambiguous",
+        "groupIdHex": group_hex,
+        "text": "ambiguous",
+        "publish": true,
+        "relays": ["ws://127.0.0.1:9"]
+    }));
+    assert_eq!(kept["messagePhase"], "relay_accepted", "{kept}");
+    assert_eq!(kept["message"], prepared["message"]);
+
     let status = post(json!({"op": "status"}));
     eprintln!(
         "wasm_bytes={wasm_bytes} database_bytes={} send_ms={send_ms} revision={}",
@@ -426,6 +486,321 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
     stop_child(&mut relay.child);
     std::mem::forget(workerd_guard);
     std::mem::forget(relay_guard);
+}
+
+#[tokio::test]
+#[ignore = "starts wrangler and discovers a real key package and token gossip"]
+async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
+    let worker_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../worker");
+    let shim = worker_dir.join("build/worker/shim.mjs");
+    assert!(shim.is_file(), "worker bundle is missing at {}", shim.display());
+    write_dev_vars(&worker_dir);
+    let persist = worker_dir.join(".wrangler/autonomous");
+    let _ = fs::remove_dir_all(&persist);
+    fs::create_dir_all(&persist).expect("persist dir");
+    free_port(PORT);
+    let mut relay = start_relay(&worker_dir);
+    let relay_url = relay.url.clone();
+    let relay_guard = KillProcess(relay.child.id());
+    let mut workerd = start_workerd(&worker_dir, &persist);
+    let mut workerd_guard = KillProcess(workerd.id());
+    let sender = "autonomous";
+
+    let native = OfficialRecipient::generate().expect("recipient");
+    let recipient = native.public_key_hex();
+    let onboard = post_to(sender, json!({
+        "op": "onboard",
+        "projectId": sender,
+        "operationId": "onboarding-operation-id",
+        "recipient": recipient,
+        "relays": [relay_url]
+    }));
+    assert_eq!(onboard["ok"], true, "{onboard}");
+
+    let mut package = native.fresh_key_package().await.expect("key package");
+    package.source = None;
+    let digest = hex::encode(sha2::Sha256::digest(&package.bytes));
+    let key_event = EventBuilder::new(
+        Kind::Custom(30443),
+        base64::engine::general_purpose::STANDARD.encode(&package.bytes),
+    )
+    .tags([
+        Tag::custom("d", ["watchdog".to_owned()]),
+        Tag::custom("client", ["nostr-watchdog".to_owned()]),
+        Tag::custom("mls_protocol_version", ["1.0".to_owned()]),
+        Tag::custom("i", [digest]),
+    ])
+    .custom_created_at(Timestamp::now())
+    .finalize(native.keys())
+    .expect("sign key package");
+    key_event.verify().expect("key package verifies");
+    publish_value(&worker_dir, &relay_url, &persist, &serde_json::to_value(&key_event).unwrap());
+
+    let established = post_to(sender, json!({
+        "op": "establish",
+        "operationId": "establish-1"
+    }));
+    assert_eq!(established["ok"], true, "{established}");
+    let group_hex = established["groupIdHex"].as_str().unwrap().to_owned();
+    let welcome: TransportMessage =
+        serde_json::from_value(established["welcomes"][0].clone()).expect("welcome");
+    native.join_welcome(welcome).await.expect("join discovered welcome");
+    let group = group_from_hex(&group_hex);
+    let leaf = native.own_leaf(&group).expect("recipient leaf");
+
+    let server_secret = SecretKey::from_slice(&[9u8; 32]).expect("server");
+    let server_keys = Keys::new(server_secret.clone());
+    let server_hex = hex::encode(server_keys.public_key().to_bytes());
+    let encrypted = push::encrypt_token(Platform::Fcm, b"fcm-device-token", &server_hex).expect("encrypt");
+    let mut forged = token_record(
+        &group_hex,
+        &recipient,
+        leaf,
+        &server_hex,
+        &relay_url,
+        b"forged",
+        &encrypted,
+    );
+    forged.owner_sig = "11".repeat(64);
+    publish_gossip(&worker_dir, &relay_url, &persist, &native, &group, 447, &json!({
+        "v": "marmot-push-v1",
+        "tokens": [gossip_entry(&forged)]
+    }).to_string()).await;
+    let ignored = post_to(sender, json!({"op": "sync", "relays": [relay_url]}));
+    assert_eq!(ignored["ok"].as_bool().unwrap_or(true) || ignored.get("chats").is_some(), true);
+    let empty = post_to(sender, json!({"op": "readiness"}));
+    assert_eq!(empty["recipientTokenCount"].as_u64().unwrap_or(99), 0, "{empty}");
+
+    let mut record = token_record(
+        &group_hex,
+        &recipient,
+        leaf,
+        &server_hex,
+        &relay_url,
+        b"fcm-device-token",
+        &encrypted,
+    );
+    record.owner_sig = push::sign_owner_proof(native.keys(), &record, false).expect("owner proof");
+    publish_gossip(&worker_dir, &relay_url, &persist, &native, &group, 447, &json!({
+        "v": "marmot-push-v1",
+        "tokens": [gossip_entry(&record)]
+    }).to_string()).await;
+    let _synced = post_to(sender, json!({"op": "sync", "relays": [relay_url]}));
+    let ready = post_to(sender, json!({"op": "readiness"}));
+    assert_eq!(ready["recipientTokenCount"].as_u64().unwrap(), 1, "{ready}");
+
+    let delivered = post_to(sender, json!({
+        "op": "deliver",
+        "operationId": "alert-auto",
+        "text": "wake",
+        "publish": true
+    }));
+    assert_eq!(delivered["messagePhase"], "relay_accepted", "{delivered}");
+    assert_eq!(delivered["pushPhase"], "relay_accepted", "{delivered}");
+    assert!(delivered.get("message").is_none(), "{delivered}");
+    assert!(delivered.get("trigger").is_none(), "{delivered}");
+    assert_eq!(delivered["messageAttempts"].as_u64().unwrap(), 1, "{delivered}");
+    let trigger = gift_wraps(&worker_dir, &relay_url)
+        .into_iter()
+        .find(|event| {
+            event["kind"] == 1059 && UnwrappedGift::from_gift_wrap(
+                &server_keys,
+                &serde_json::from_value(event.clone()).unwrap(),
+            ).is_ok()
+        })
+        .expect("official gift unwrap");
+    let opened = UnwrappedGift::from_gift_wrap(
+        &server_keys,
+        &serde_json::from_value(trigger).unwrap(),
+    )
+    .expect("notification rumor");
+    assert_eq!(opened.rumor.kind, Kind::Custom(446));
+    assert!(opened.rumor.tags.iter().any(|tag| tag.as_slice().get(1).map(String::as_str) == Some("marmot-push-v1")));
+
+    let removal = {
+        let mut tombstone = record.clone();
+        tombstone.removed = true;
+        tombstone.encrypted_token.clear();
+        tombstone.owner_sig = push::sign_owner_proof(native.keys(), &tombstone, true).expect("removal proof");
+        tombstone
+    };
+    publish_gossip(&worker_dir, &relay_url, &persist, &native, &group, 449, &json!({
+        "v": "marmot-push-v1",
+        "removals": [gossip_entry(&removal)]
+    }).to_string()).await;
+    let _revoked = post_to(sender, json!({"op": "sync", "relays": [relay_url]}));
+    let after_revoke = post_to(sender, json!({
+        "op": "deliver",
+        "operationId": "alert-revoked",
+        "text": "revoked",
+        "publish": true
+    }));
+    assert_eq!(after_revoke["messagePhase"], "relay_accepted", "{after_revoke}");
+    assert_eq!(after_revoke["pushPhase"], "token_unavailable", "{after_revoke}");
+
+    let dead = push::encrypt_token(Platform::Fcm, b"other-device", &server_hex).expect("second token");
+    let mut dead_record = token_record(
+        &group_hex,
+        &recipient,
+        leaf,
+        &server_hex,
+        "ws://127.0.0.1:9",
+        b"other-device",
+        &dead,
+    );
+    dead_record.owner_ts += 1;
+    dead_record.owner_sig = push::sign_owner_proof(native.keys(), &dead_record, false).expect("dead proof");
+    publish_gossip(&worker_dir, &relay_url, &persist, &native, &group, 447, &json!({
+        "v": "marmot-push-v1",
+        "tokens": [gossip_entry(&dead_record)]
+    }).to_string()).await;
+    let _dead_sync = post_to(sender, json!({"op": "sync", "relays": [relay_url]}));
+    let failed = post_to(sender, json!({
+        "op": "deliver",
+        "operationId": "alert-fail",
+        "text": "push down",
+        "publish": true
+    }));
+    assert_eq!(failed["messagePhase"], "relay_accepted", "{failed}");
+    assert_eq!(failed["pushPhase"], "unobservable", "{failed}");
+    let failed_event = failed["messageEventId"].clone();
+    let stored = post_to(sender, json!({"op": "publication", "operationId": "alert-fail"}));
+    let stored_message = stored["message"].clone();
+
+    stop_child(&mut workerd);
+    assert!(port_closed(PORT));
+    workerd = start_workerd(&worker_dir, &persist);
+    workerd_guard.0 = workerd.id();
+    let reconciled = post_to(sender, json!({
+        "op": "reconcile",
+        "operationId": "alert-fail",
+        "publish": true
+    }));
+    assert_eq!(reconciled["messagePhase"], "relay_accepted", "{reconciled}");
+    assert_eq!(reconciled["messageEventId"], failed_event, "{reconciled}");
+    assert!(reconciled.get("message").is_none(), "{reconciled}");
+    let again = post_to(sender, json!({"op": "publication", "operationId": "alert-fail"}));
+    assert_eq!(again["message"], stored_message, "reconcile minted a second ciphertext");
+
+    let fresh = post_to(sender, json!({
+        "op": "deliver",
+        "operationId": "alert-new",
+        "text": "second",
+        "publish": true
+    }));
+    assert_eq!(fresh["messagePhase"], "relay_accepted", "{fresh}");
+    assert_ne!(fresh["messageEventId"], failed_event);
+
+    stop_child(&mut workerd);
+    stop_child(&mut relay.child);
+    std::mem::forget(workerd_guard);
+    std::mem::forget(relay_guard);
+}
+
+fn post_to(sender: &str, body: Value) -> Value {
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let (status, text) = post_raw(PORT, sender, &bytes, true);
+    assert_eq!(status, 200, "{text}");
+    serde_json::from_str(&text).unwrap_or_else(|_| panic!("{text}"))
+}
+
+fn token_record(
+    group_hex: &str,
+    member: &str,
+    leaf: u32,
+    server: &str,
+    relay_url: &str,
+    plaintext: &[u8],
+    encrypted: &[u8],
+) -> TokenRecord {
+    TokenRecord {
+        group_id_hex: group_hex.to_owned(),
+        member_id_hex: member.to_owned(),
+        leaf_index: leaf,
+        platform: Platform::Fcm,
+        token_fingerprint: push::token_fingerprint(Platform::Fcm, plaintext),
+        server_pubkey_hex: server.to_owned(),
+        relay_hint: Some(relay_url.to_owned()),
+        owner_ts: 1_700_000_000,
+        encrypted_token: encrypted.to_vec(),
+        owner_sig: String::new(),
+        removed: false,
+    }
+}
+
+fn gossip_entry(record: &TokenRecord) -> Value {
+    json!({
+        "member_id_hex": record.member_id_hex,
+        "leaf_index": record.leaf_index,
+        "platform": record.platform.name(),
+        "token_fingerprint": record.token_fingerprint,
+        "server_pubkey_hex": record.server_pubkey_hex,
+        "relay_hint": record.relay_hint,
+        "encrypted_token": base64::engine::general_purpose::STANDARD.encode(&record.encrypted_token),
+        "owner_ts": record.owner_ts,
+        "owner_sig": record.owner_sig
+    })
+}
+
+async fn publish_gossip(
+    worker_dir: &Path,
+    relay_url: &str,
+    persist: &Path,
+    native: &OfficialRecipient,
+    group: &cgka_traits::GroupId,
+    kind: u64,
+    content: &str,
+) {
+    let message = native.send_app(group, kind, content).await.expect("gossip");
+    publish_value(worker_dir, relay_url, persist, &serde_json::to_value(&message).unwrap());
+}
+
+fn publish_value(worker_dir: &Path, relay_url: &str, persist: &Path, message: &Value) {
+    let event = if message.get("payload").is_some() {
+        nostr_event(message)
+    } else {
+        message.clone()
+    };
+    let path = persist.join(format!("event-{}.json", event["id"].as_str().unwrap_or("event")));
+    fs::write(&path, serde_json::to_vec(&event).unwrap()).unwrap();
+    let published = Command::new("node")
+        .arg(worker_dir.join("publish-event.mjs"))
+        .arg(relay_url)
+        .arg(&path)
+        .output()
+        .expect("publish");
+    assert!(
+        published.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&published.stdout),
+        String::from_utf8_lossy(&published.stderr)
+    );
+}
+
+fn gift_wraps(worker_dir: &Path, relay_url: &str) -> Vec<Value> {
+    let script = r#"
+import { WebSocket } from "ws";
+const ws = new WebSocket(process.argv[1]);
+const timer = setTimeout(() => process.exit(1), 5000);
+ws.on("open", () => ws.send(JSON.stringify(["REQ", "s", {kinds: [1059], limit: 10}])));
+ws.on("message", (data) => {
+  const msg = JSON.parse(data.toString());
+  if (msg[0] === "EVENT") console.log(JSON.stringify(msg[2]));
+  if (msg[0] === "EOSE") {
+    clearTimeout(timer);
+    ws.close();
+  }
+});
+"#;
+    let output = Command::new("node")
+        .current_dir(worker_dir)
+        .args(["--input-type=module", "-e", script, relay_url])
+        .output()
+        .expect("list gift wraps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 struct KillProcess(u32);

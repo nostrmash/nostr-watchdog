@@ -38,7 +38,7 @@ The storage key is the ChaCha20-Poly1305 key for the account snapshot. Associate
 
 `POST /marmot?sender=<projectId>`
 
-The sender is 1 to 128 characters from `[A-Za-z0-9_:-]`. Any other path is 404. The body limit is 256 KiB. A larger body is 413. The response is JSON and stays within the same order of size as one prepared transport message.
+The sender is 1 to 128 characters from `[A-Za-z0-9_:-]`. Any other path is 404. The body limit is 256 KiB. Authentication and `Content-Length` are checked before the body is read. The body is then streamed and the read stops at 256 KiB. A larger body is 413. `deliver`, `reconcile`, and `readiness` do not return prepared ciphertext, token records, or encrypted wake capabilities.
 
 Authentication is `Authorization: Bearer <MARMOT_OPERATOR_TOKEN>`, compared in constant time. A missing or wrong token is 401 `unauthorized`. `http` is rejected with 403 unless the loopback test flag is set and the host is `127.0.0.1`, `localhost`, or `::1`.
 
@@ -46,9 +46,69 @@ Errors that contain `nsec`, `bearer`, or `token`, and errors longer than 180 cha
 
 The cryptographic mutation and its SQLite write run inside `blockConcurrencyWhile`. Relay I/O runs after that gate, then a second gate records the acknowledgement. Returning an application error does not reset the object. A crash after the sealed row is written is recovered by retrying the same operation id.
 
+## Production interface
+
+Agent C sends one of these operations. It does not sequence `send`, `ack`, `stage_push`, or a caller-supplied token. `publish: true` asks the object to perform the relay I/O. The object chooses destinations from the account binding and from validated token hints. A caller cannot substitute an arbitrary host for a notification trigger.
+
+### establish
+
+```json
+{ "op": "establish", "operationId": "establish-1" }
+```
+
+Requires a prior `onboard` with the recipient public key and the account relays. The object pulls kind 30443 authored by that recipient, checks the event signature and the author, and rejects a package for any other account. It creates the group once, persists every Welcome, and publishes each Welcome to the account relays. A repeated call returns the bound group and does not create another conversation. An interrupted call retries the same operation id and reuses the persisted Welcomes.
+
+### deliver
+
+```json
+{
+  "op": "deliver",
+  "operationId": "alert-1",
+  "text": "relay down",
+  "publish": true
+}
+```
+
+The object encrypts to the bound group, persists that ciphertext, publishes the application event, and records the relay result against that event id. Only after `messageState` is `relay_accepted` does it select the recipient's current tokens and publish the kind 1059 triggers. Tokens come from kind 447, 448, and 449 gossip ingested from the group. The sender's own tokens are excluded. Selection checks group, member, leaf, and server again at send time. Triggers go to the token's validated relay hint, or else to that server's cached kind 10050 relays. They are not sent to the group or discovery relays. A missing token sets `pushState` to `token_unavailable` and leaves the message accepted. A timeout or disconnect sets `completion_unknown` for the message and `unobservable` for the push. An explicit relay `OK false` is `rejected`. A later failure does not downgrade `relay_accepted`. Ordinary retry republishes the stored bytes and does not encrypt again.
+
+### reconcile
+
+```json
+{ "op": "reconcile", "operationId": "alert-1", "publish": true }
+```
+
+Loads the stored operation. It does not create a ciphertext. If the message is still unpublished it publishes the stored event. If the message is accepted and the push is not, it publishes the stored trigger. A retired operation returns its historical phases and `"resubmittable": false`.
+
+### readiness
+
+```json
+{ "op": "readiness" }
+```
+
+Returns `account`, `pubkey`, `groupBound`, `recipient`, and `recipientTokenCount`. It does not return token bytes.
+
+### Outcome
+
+`messagePhase` and `messageState` use the same vocabulary: `not_submitted`, `prepared`, `accepted_pending`, `relay_accepted`, `rejected`, `completion_unknown`. `pushPhase` and `pushState` use `unknown`, `not_required`, `not_attempted`, `token_unavailable`, `prepared`, `pending`, `publication_attempted`, `relay_accepted`, `rejected`, `expired`, `unobservable`, `terminal_failure`. `disposition` is `settled` or `reconcile`. `retryAtMs` and `reconcileAfterMs` are 15000 while reconcile is required and 0 when settled. `phoneDelivery` is always false. A relay OK is not phone delivery.
+
+Counters, present when the operation row exists:
+
+| Field | Advances when |
+| --- | --- |
+| `messageAttempts` | a new ciphertext is stored |
+| `messagePublicationAttempts` | a network publication of that message starts |
+| `messageReconcileAttempts` | an open message phase changes |
+| `unknownAttempts` | the message becomes `completion_unknown` or the push becomes `unknown` |
+| `tokenWaitAttempts` | the push becomes `token_unavailable` |
+| `pushPublicationAttempts` | a trigger is stored or a push publication starts |
+| `unobservableAttempts` | the push becomes `unobservable` |
+| `pushAttempts` | the push reaches `relay_accepted`, `rejected`, or `unobservable` |
+
+Reading status does not increment these. `startedAtMs` is immutable. `updatedAtMs` changes when the row changes. `operationAgeMs` is wall time since `startedAtMs`. Unknown counters stay omitted rather than being invented. Agent C owns `attempt_count` for its scheduler. This object does not.
+
 ## Commands
 
-The body is JSON. `operationId` is the stable operation id. `projectId` on `onboard` must equal the `sender` query.
+The body is JSON. `operationId` is the stable operation id. `projectId` on `onboard` must equal the `sender` query. `ack`, `stage_push` with `serverPubkeyHex` and `encryptedTokenHex`, `fault`, `cas_self_test`, and `stale_write` exist only when `MARMOT_ALLOW_LOOPBACK=1`. A production caller cannot confirm a relay by sending `"accepted": true`, and cannot inject a wake capability.
 
 ### onboard
 
@@ -104,7 +164,7 @@ Response includes `bytesHex`, `protocolProfile: "current"`, `pubkey`, and a sign
 
 The sender and the configured recipient are required. Every current member must be the sender, the recipient, or an extra authorized device recorded at onboarding. The engine call sets `expected_epoch` to the current epoch pin and `only_to_members` to that authorized set. A missing recipient, an unauthorized member, or an unsettled epoch fails the send and returns no new ciphertext.
 
-The same operation id, group, kind, and payload returns the original transport message and increments `messageAttempts`. A different payload is `alert ... is already bound to a different payload`. A different group or kind is `operation ... is already bound to a different group or kind`.
+The same operation id, group, kind, and payload returns the original transport message and does not increment `messageAttempts`. A different payload is `alert ... is already bound to a different payload`. A different group or kind is `operation ... is already bound to a different group or kind`. A retired id returns the historical result and does not encrypt again.
 
 ### ingest, sync, ack, publication, self_update, stage_push
 
@@ -112,13 +172,13 @@ The same operation id, group, kind, and payload returns the original transport m
 
 `sync` reads the prepared relay filters outside the cryptographic section, pulls at most 32 frames per filter, then ingests inside a second gate. Filters are kind 445 for the stored Nostr group id and kind 1059 addressed to this account. Relays come from the command or from the account binding.
 
-`ack` is `{ "op": "ack", "operationId": "alert-1", "accepted": true }`. `accepted: true` records relay acceptance. Official `confirm_published` runs only when the stored operation still needs it, which is a commit, not an application message. `accepted: false` sets `completion_unknown` and keeps the original ciphertext. A later retry of the same operation id returns that ciphertext.
+`ack` is test-only. `{ "op": "ack", "operationId": "alert-1", "accepted": true }` records acceptance without a relay response. Production acceptance comes from the relay `OK` for the prepared event id. Official `confirm_published` runs only when the stored operation still needs it, which is a commit, not an application message. `accepted: false` sets `completion_unknown` and keeps the original ciphertext.
 
 `publication` reads the stored operation and does not encrypt again.
 
 `self_update` prepares one commit under the operation id. Retry returns the same commit. `ack` with `accepted: true` is the MDK confirmation.
 
-`stage_push` takes `serverPubkeyHex` and `encryptedTokenHex`. The token is the marmot-push-v1 ciphertext (1084 bytes), not a raw APNs or FCM token. The response `trigger` is the kind 1059 gift wrap. A second call returns the original trigger bytes and does not change the application message or its event id. `"publish": true` publishes that same gift wrap. A rejected or failed push leaves the application message accepted.
+`stage_push` is test-only and is refused unless the application message is already `relay_accepted`. It takes `serverPubkeyHex` and `encryptedTokenHex`, the marmot-push-v1 ciphertext (1084 bytes), not a raw APNs or FCM token. A second call returns the original trigger. A failed push leaves the application message accepted.
 
 `cas_self_test` and `stale_write` are storage probes. `fault` is `before_store` or `after_store` and is rejected unless the loopback flag is set. `before_store` drops the in-memory result and writes nothing. `after_store` writes the snapshot and returns 500 without the ciphertext.
 
@@ -144,7 +204,7 @@ The same operation id, group, kind, and payload returns the original transport m
 
 `messagePhase` is one of `not_submitted`, `prepared`, `accepted_pending`, `relay_accepted`, `rejected`, `completion_unknown`. This object emits `not_submitted` for onboarding, `accepted_pending` after a durable cryptographic write, `relay_accepted` after a recorded relay OK, and `completion_unknown` when publication was attempted and not accepted. `prepared` is the stored default for a row that has not been advanced. `rejected` is reserved for an MDK rejection of the application message.
 
-`pushPhase` is one of `unknown`, `not_required`, `not_attempted`, `token_unavailable`, `prepared`, `pending`, `publication_attempted`, `relay_accepted`, `rejected`, `expired`, `unobservable`, `terminal_failure`. This object emits `not_required`, `not_attempted`, `prepared`, `relay_accepted`, and `rejected`. It does not infer `token_unavailable`, `expired`, `unobservable`, or `terminal_failure`; those belong to the scheduler when it has evidence this object does not. Counters that this object cannot observe are omitted, not reported as zero. `messageAttempts` and `pushAttempts` are the Durable Object counters. Agent C may keep a separate scheduler-attempt counter.
+`pushPhase` matches `pushState`. This object emits `token_unavailable` when no authorized token remains, `unobservable` when a trigger publication times out or disconnects, and `relay_accepted` when the relay returns OK for the stored gift wrap. `expired` and `terminal_failure` are not inferred here. Counters this object cannot observe are omitted. Agent C may keep a separate scheduler-attempt counter.
 
 `settled: false` means Agent C should reconcile. `reconcileAfterMs` is 15000 while unsettled and 0 when settled. Recommended scheduler policy, applied by Agent C rather than by this object:
 
@@ -173,7 +233,7 @@ Commit callbacks queued by MDK are held through the transaction and run only aft
 
 The in-memory provider implements the synchronous storage trait. `backend()` returns `Sqlite` because the upstream enum has no other variant. That is not SQLCipher. The pinned MDK revision does not export its storage-contract harness. The local tests cover transaction rollback, the pending-reference high-water mark, commit-callback rollback, and authenticated-snapshot rejection.
 
-Journal rows live in the snapshot. The same operation id cannot change group, kind, payload hash, or ciphertext. Phase updates of the same ciphertext are allowed. The journal keeps 64 terminal rows and refuses to grow past 128.
+Journal rows live in the snapshot. The same operation id cannot change group, kind, payload hash, or ciphertext. Phase updates of the same ciphertext are allowed. The journal keeps 64 rows. A row leaves the journal only when the message is `relay_accepted` or `rejected` and the push phase is not `unknown`, `not_attempted`, `prepared`, `pending`, or `publication_attempted`. The removed row becomes a tombstone bound to the project, sender, recipient, group, operation type, operation id, payload hash, and the terminal phases. The tombstone has no ciphertext. A retry of that id returns the historical result. The journal refuses to grow past 128 open rows. The tombstone table refuses to grow past 4096 rather than forgetting an id.
 
 ## Relay transport
 
@@ -181,7 +241,11 @@ Destinations are 1 to 4 URLs. `wss` is allowed for a public host. `ws` and `wss`
 
 ## Push
 
-The logical token slot is group, member identity, MLS leaf index, platform, and notification-server public key. The token fingerprint is not part of the slot. A newer owner timestamp replaces the slot. An equal timestamp uses the canonical record digest. An owner proof is required before a record is admitted. A removed record is a tombstone and blocks an older record from returning. The sender path stores the encrypted token and the gift wrap, not the raw device token.
+The logical token slot is group, member identity, MLS leaf index, platform, and notification-server public key. The token fingerprint is `sha256:` plus 24 hex characters and is not part of the slot. A newer owner timestamp replaces the slot. An equal timestamp uses the canonical record digest. An owner proof is required before a record is admitted. A removed record is a tombstone and blocks an older record from returning. The sender stores the encrypted wake capability, not the raw device token.
+
+Leaf identity uses the engine's own leaf and, for a two-member group whose own leaf is 0 or 1, the other member at `1 - own`. An ingested application message can also carry `sender_leaf_index`. Selection uses that set. This is not a projection of every MLS leaf in a larger group.
+
+Kind 10050 relays, when observed, are cached per notification server, including a negative observation. A hint that fails the destination policy is ignored. There is no separate notification-server relay-list kind in the pinned specification; the fallback is the server's ordinary NIP-17 inbox.
 
 ## What was executed
 
@@ -196,18 +260,25 @@ The official SQLite recipient test, the push layout test, the snapshot tests, an
 WASM and the local Durable Object:
 
 ```text
-CARGO_INCREMENTAL=0 cargo build -p marmot-worker --target wasm32-unknown-unknown --offline
-cd worker
-CARGO_TARGET_DIR=../target CARGO_INCREMENTAL=0 worker-build --dev --no-opt --out-dir build .
+cd crates/watchdog-marmot-worker/worker
+CARGO_INCREMENTAL=0 worker-build --release
 cargo test -p marmot-worker-interop --offline --test workerd_conversation -- --ignored --nocapture
 ```
 
-That ignored test starts workerd with this config, talks to `POST /marmot`, and uses `SqliteAccountStorage` plus `NostrMlsPeeler` in the test process. It generates a kind 30443 key package inside workerd, creates a group, delivers the welcome, exchanges application messages in both directions, publishes a key package and a push gift wrap to the loopback fixture, ingests a reply through `sync`, injects crashes before and after the SQLite write, runs two overlapping sends, stops workerd, restarts it on the same persist directory, repeats an alert id, advances the epoch, and continues. The passing run reported `wasm_bytes=38116373`, `database_bytes=352256`, and `send_ms=116`. The wasm figure is the unoptimized dev bundle. wasm-opt was not run. A release measurement was not taken.
+`worker-build --release` writes the wasm and then fails to move its staging directory (`Resource deadlock avoided`). The wasm is already at `worker/build/index_bg.wasm`, and `worker/build/worker/shim.mjs` is copied into place for the local test. Nothing was deployed.
+
+The persistent conversation test and `autonomous_delivery_discovers_tokens_and_publishes_the_trigger` both passed against that optimized bundle in workerd. The second test publishes a recipient kind 30443 key package to the loopback relay, lets `establish` discover and verify it, joins the published Welcome, sends kind 447 and 449 gossip from the official native client, and calls `deliver` without a caller-supplied token. The trigger was unwrapped with `UnwrappedGift::from_gift_wrap`. A revoked token produced `token_unavailable`. A hint to a closed loopback port produced `unobservable` without a second ciphertext. After a workerd restart, `reconcile` returned the same message event. A later alert used a new event id. The conversation test also rejects `stage_push` while the message is `accepted_pending`, records a dead-port publication as `completion_unknown`, and keeps `relay_accepted` when a later attempt fails. That run reported `wasm_bytes=10651998`, `database_bytes=364544`, and `send_ms=35`.
+
+The optimized wasm is 10,651,998 bytes. `gzip -c` of that file is 4,098,316 bytes. Cloudflare's current Workers limit, from the platform limits page, is 64 MiB uncompressed on both Free and Paid. There is no compressed-size limit. This bundle is under that size limit. The same page limits startup to 1 second, isolate memory to 128 MB, and CPU to 10 ms on Free or 30 seconds by default on Paid (raisable to 5 minutes). Startup time, isolate memory, and CPU time were not measured on Cloudflare because this bundle was not deployed. The 35 ms figure is local workerd wall time for one send, not platform CPU time.
+
+A storage test inserts 80 terminal rows. The open push row stays in the journal. An older accepted row becomes a tombstone, and writing a different ciphertext for that id fails.
 
 ## Remaining limits
 
-- Periodic maintenance stays off. Renewal is the `key_package` command.
-- Recipient replacement after a group exists is refused. A membership-removal race and a live sender rotation are not separate tests.
-- The legacy `GroupCreated` confirmation path is implemented and was not the path this Current-profile run used. The run used `FoundingGroupCreated`, which does not confirm before publication.
-- The loopback fixture does not check Nostr signatures. The Worker still publishes the signed events MDK produced. No public relay was contacted.
+- Periodic MLS maintenance stays off. A `key_package` command can renew one package. The object does not rotate identities or create extra groups by itself.
+- In a group larger than two members, leaf indexes are known for this account and for a sender whose application message carries `sender_leaf_index`. Other leaves are not inferred.
+- Restoring a backup of the snapshot and the epoch-floor column together still rolls the group back. If that state cannot be shown to be current, re-onboard instead of replaying it.
+- The relay client rejects non-public hosts, `.example`, `.local`, and `.internal`. It does not implement a separate DNS-rebinding defense beyond that destination check and the requirement that production use `wss`. Loopback is unreachable unless `MARMOT_ALLOW_LOOPBACK=1`.
+- The loopback fixture does not check Nostr signatures. Key-package admission verifies the signature in the object. No public relay was contacted in this run. Phone delivery was not claimed.
+- `worker-build` fails to move its staging directory after writing the wasm (`Resource deadlock avoided`). The local test copies `shim.mjs` into `build/worker/`.
 - An upstream storage-contract harness is not available at this revision. SQLCipher remains unusable for `wasm32-unknown-unknown`; the Durable Object does not depend on it.

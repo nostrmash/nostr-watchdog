@@ -27,7 +27,10 @@ use cgka_traits::{
 };
 use k256::schnorr::SigningKey;
 use k256::schnorr::signature::hazmat::PrehashSigner;
-use mdk_do_storage::{AccountBinding, MemoryMdkStorage, PersistError, PreparedPublication, SealBinding};
+use mdk_do_storage::{
+    AccountBinding, MemoryMdkStorage, PersistError, PreparedPublication, PublicationRecord, SealBinding,
+    StoredWake,
+};
 use nostr::key::{Keys, SecretKey};
 use sha2::{Digest, Sha256};
 use transport_nostr_peeler::NostrMlsPeeler;
@@ -48,6 +51,10 @@ pub enum SessionError {
     IdentityMismatch,
     #[error("operation {operation_id} is already bound to a different group or kind")]
     OperationConflict { operation_id: String },
+    #[error("operation {0} is retired and cannot be encrypted again")]
+    Retired(String),
+    #[error("push requires an accepted application message")]
+    PushBeforeAcceptance,
     #[error("recipient is not a current group member")]
     RecipientAbsent,
     #[error("group contains a member outside the authorized set")]
@@ -197,6 +204,16 @@ impl Session {
             };
             return Ok((existing.group_id, welcomes));
         }
+        if self
+            .binding()?
+            .group_id_hex
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Err(SessionError::Engine(
+                "conversation already exists".into(),
+            ));
+        }
         let mut nostr_group_id = [0u8; 32];
         getrandom::getrandom(&mut nostr_group_id).map_err(|_| SessionError::Random)?;
         let routing = NostrRoutingV1::new(nostr_group_id, relays.clone())
@@ -241,6 +258,10 @@ impl Session {
                 &relays,
             )
             .map_err(map_storage)?;
+        let mut binding = self.binding()?;
+        binding.group_id_hex = Some(hex::encode(group_id.as_slice()));
+        binding.nostr_group_hex = Some(hex::encode(nostr_group_id));
+        self.storage.set_binding(binding, false).map_err(map_storage)?;
         self.storage
             .put_publication(blank_publication(
                 operation_id,
@@ -291,10 +312,26 @@ impl Session {
             .map_err(map_storage)?;
         let mut chats = Vec::new();
         for event in events {
-            if let GroupEvent::MessageReceived { payload, .. } = event {
+            if let GroupEvent::MessageReceived {
+                payload,
+                group_id,
+                sender_leaf_index,
+                sender,
+                ..
+            } = event
+            {
                 if let Ok(app) = MarmotAppEvent::decode(&payload) {
                     if app.kind == MARMOT_APP_EVENT_KIND_CHAT {
-                        chats.push(app.content);
+                        chats.push(app.content.clone());
+                    }
+                    if matches!(app.kind, 447 | 448 | 449) {
+                        self.observe_gossip(
+                            &group_id,
+                            app.kind,
+                            &app.content,
+                            sender_leaf_index,
+                            &hex::encode(sender.as_slice()),
+                        )?;
                     }
                 }
             }
@@ -313,7 +350,18 @@ impl Session {
         text: &str,
     ) -> Result<TransportMessage, SessionError> {
         let payload_sha256 = hash_text(text);
-        if let Some(mut existing) = self.storage.publication(alert_id).map_err(map_storage)? {
+        if let Some(retired) = self.storage.tombstone(alert_id).map_err(map_storage)? {
+            if retired.payload_sha256 != payload_sha256
+                || retired.group_id != *group_id
+                || retired.operation_kind != "chat"
+            {
+                return Err(SessionError::OperationConflict {
+                    operation_id: alert_id.to_owned(),
+                });
+            }
+            return Err(SessionError::Retired(alert_id.to_owned()));
+        }
+        if let Some(existing) = self.storage.publication(alert_id).map_err(map_storage)? {
             if existing.payload_sha256 != payload_sha256 {
                 return Err(SessionError::AlertConflict {
                     alert_id: alert_id.to_owned(),
@@ -324,10 +372,7 @@ impl Session {
                     operation_id: alert_id.to_owned(),
                 });
             }
-            existing.message_attempts = existing.message_attempts.saturating_add(1);
-            let message = existing.message.clone();
-            self.storage.put_publication(existing).map_err(map_storage)?;
-            return Ok(message);
+            return Ok(existing.message);
         }
         let binding = self.binding()?;
         if binding.recipient_hex.len() != 64 {
@@ -467,7 +512,11 @@ impl Session {
             .map_err(map_engine)?;
         existing.pending_ref = Some(pending);
         existing.confirmed = true;
+        if existing.message_phase != "relay_accepted" {
+            existing.message_reconcile_attempts = existing.message_reconcile_attempts.saturating_add(1);
+        }
         existing.message_phase = "relay_accepted".into();
+        existing.updated_at_ms = clock::unix_ms();
         self.storage.put_publication(existing).map_err(map_storage)?;
         self.note_epochs()?;
         let _ = self.storage.bump_revision().map_err(map_storage)?;
@@ -494,6 +543,38 @@ impl Session {
             .finalize(&self.keys)
             .map_err(|error| SessionError::Engine(error.to_string()))?;
         serde_json::to_value(&event).map_err(|error| SessionError::Engine(error.to_string()))
+    }
+
+    /// Accept a relay key-package event only when it is signed by the configured recipient.
+    pub fn key_package_from_relay_event(
+        value: &serde_json::Value,
+        recipient_hex: &str,
+    ) -> Result<KeyPackage, SessionError> {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        let event: nostr::event::Event = serde_json::from_value(value.clone())
+            .map_err(|error| SessionError::Engine(error.to_string()))?;
+        if event.kind != nostr::event::Kind::Custom(30443) {
+            return Err(SessionError::Engine(
+                "key package kind is not 30443".into(),
+            ));
+        }
+        if hex::encode(event.pubkey.to_bytes()) != recipient_hex.to_ascii_lowercase() {
+            return Err(SessionError::Engine(
+                "key package belongs to a different account".into(),
+            ));
+        }
+        event
+            .verify()
+            .map_err(|error| SessionError::Engine(error.to_string()))?;
+        let bytes = STANDARD
+            .decode(event.content.as_str())
+            .map_err(|error| SessionError::Engine(error.to_string()))?;
+        let mut package = KeyPackage::new(bytes).with_protocol_profile(ProtocolProfile::Current);
+        package.source = Some(cgka_traits::KeyPackageSource {
+            event_id: cgka_traits::MessageId::new(event.id.to_bytes().to_vec()),
+        });
+        Ok(package)
     }
 
     pub fn transport_json(message: &TransportMessage) -> Result<serde_json::Value, SessionError> {
@@ -524,6 +605,8 @@ impl Session {
             if !accepted {
                 let mut held = existing;
                 held.message_phase = "completion_unknown".into();
+                held.unknown_attempts = held.unknown_attempts.saturating_add(1);
+                held.updated_at_ms = clock::unix_ms();
                 self.storage.put_publication(held).map_err(map_storage)?;
                 let _ = self.storage.bump_revision().map_err(map_storage)?;
                 return Ok(());
@@ -531,13 +614,14 @@ impl Session {
             return self.confirm(operation_id).await;
         }
         let mut held = existing;
-        held.message_phase = if accepted {
-            "relay_accepted"
+        if accepted {
+            held.message_phase = "relay_accepted".into();
+            held.message_reconcile_attempts = held.message_reconcile_attempts.saturating_add(1);
         } else {
-            "completion_unknown"
+            held.message_phase = "completion_unknown".into();
+            held.unknown_attempts = held.unknown_attempts.saturating_add(1);
         }
-        .into();
-        held.confirmed = accepted;
+        held.updated_at_ms = clock::unix_ms();
         self.storage.put_publication(held).map_err(map_storage)?;
         let _ = self.storage.bump_revision().map_err(map_storage)?;
         Ok(())
@@ -549,6 +633,9 @@ impl Session {
         let Some(mut existing) = self.storage.publication(alert_id).map_err(map_storage)? else {
             return Err(SessionError::MissingPublication(alert_id.to_owned()));
         };
+        if existing.message_phase != "relay_accepted" {
+            return Err(SessionError::PushBeforeAcceptance);
+        }
         if let Some(stored) = existing.push_trigger.clone() {
             return Ok(stored);
         }
@@ -556,6 +643,8 @@ impl Session {
         existing.push_trigger = Some(trigger.to_vec());
         existing.push_phase = "prepared".into();
         existing.push_published = false;
+        existing.push_publication_attempts = existing.push_publication_attempts.saturating_add(1);
+        existing.updated_at_ms = clock::unix_ms();
         self.storage.put_publication(existing).map_err(map_storage)?;
         let stored = self.storage.publication(alert_id).map_err(map_storage)?;
         if stored.as_ref().and_then(|row| row.push_trigger.clone()).as_deref() != Some(trigger) {
@@ -578,12 +667,31 @@ impl Session {
         let Some(mut existing) = self.storage.publication(alert_id).map_err(map_storage)? else {
             return Err(SessionError::MissingPublication(alert_id.to_owned()));
         };
+        if existing.push_phase == "relay_accepted" {
+            return Ok(());
+        }
         let message = existing.message.clone();
         let message_phase = existing.message_phase.clone();
+        if existing.push_phase != phase {
+            if phase == "publication_attempted" {
+                existing.push_publication_attempts = existing.push_publication_attempts.saturating_add(1);
+            }
+            if phase == "unobservable" {
+                existing.unobservable_attempts = existing.unobservable_attempts.saturating_add(1);
+            }
+            if phase == "token_unavailable" {
+                existing.token_wait_attempts = existing.token_wait_attempts.saturating_add(1);
+            }
+            if matches!(phase, "relay_accepted" | "rejected" | "unobservable") {
+                existing.push_attempts = existing.push_attempts.saturating_add(1);
+            }
+        }
         existing.push_phase = phase.to_owned();
         existing.push_published = phase == "relay_accepted";
-        existing.push_attempts = existing.push_attempts.saturating_add(1);
-        existing.push_event_id = event_id;
+        if event_id.is_some() {
+            existing.push_event_id = event_id;
+        }
+        existing.updated_at_ms = clock::unix_ms();
         self.storage.put_publication(existing).map_err(map_storage)?;
         let stored = self.storage.publication(alert_id).map_err(map_storage)?.unwrap();
         if stored.message != message || stored.message_phase != message_phase {
@@ -592,6 +700,174 @@ impl Session {
             ));
         }
         Ok(())
+    }
+
+    pub fn mark_message_publication(&self, operation_id: &str) -> Result<(), SessionError> {
+        let Some(mut existing) = self.storage.publication(operation_id).map_err(map_storage)? else {
+            return Err(SessionError::MissingPublication(operation_id.to_owned()));
+        };
+        existing.message_publication_attempts = existing.message_publication_attempts.saturating_add(1);
+        existing.updated_at_ms = clock::unix_ms();
+        self.storage.put_publication(existing).map_err(map_storage)?;
+        Ok(())
+    }
+
+    /// Record a relay result for the exact prepared event. A later failure cannot
+    /// downgrade an acceptance, and an unrelated event id is refused.
+    pub async fn note_message_outcome(
+        &self,
+        operation_id: &str,
+        outcome: &str,
+        event_id: &str,
+        destination: &str,
+        attempt_id: &str,
+    ) -> Result<(), SessionError> {
+        let Some(mut existing) = self.storage.publication(operation_id).map_err(map_storage)? else {
+            return Err(SessionError::MissingPublication(operation_id.to_owned()));
+        };
+        if !event_matches_publication(&existing, event_id) {
+            return Err(SessionError::Engine(
+                "acknowledgement does not match the prepared event".into(),
+            ));
+        }
+        if existing
+            .publications
+            .iter()
+            .any(|record| record.event_id == event_id && record.phase == "relay_accepted")
+        {
+            return Ok(());
+        }
+        existing.publications.push(PublicationRecord {
+            attempt_id: attempt_id.to_owned(),
+            event_id: event_id.to_owned(),
+            role: existing.operation_kind.clone(),
+            destination: destination.to_owned(),
+            phase: outcome.to_owned(),
+        });
+        let welcome_ids = existing
+            .welcomes
+            .iter()
+            .filter_map(transport_event_id)
+            .collect::<Vec<_>>();
+        if existing.operation_kind == "welcome" && !welcome_ids.is_empty() {
+            let all_accepted = welcome_ids.iter().all(|id| {
+                existing
+                    .publications
+                    .iter()
+                    .any(|record| record.event_id == *id && record.phase == "relay_accepted")
+            });
+            if all_accepted && existing.message_phase != "relay_accepted" {
+                existing.message_phase = "relay_accepted".into();
+                existing.message_reconcile_attempts =
+                    existing.message_reconcile_attempts.saturating_add(1);
+            } else if outcome == "completion_unknown" && existing.message_phase != "relay_accepted" {
+                existing.message_phase = "completion_unknown".into();
+                existing.unknown_attempts = existing.unknown_attempts.saturating_add(1);
+            } else if outcome == "rejected" && existing.message_phase != "relay_accepted" {
+                existing.message_phase = "rejected".into();
+            }
+        } else if existing.message_phase != "relay_accepted" {
+            match outcome {
+                "relay_accepted" => {
+                    existing.message_phase = "relay_accepted".into();
+                    existing.message_reconcile_attempts =
+                        existing.message_reconcile_attempts.saturating_add(1);
+                }
+                "rejected" => existing.message_phase = "rejected".into(),
+                "completion_unknown" => {
+                    existing.message_phase = "completion_unknown".into();
+                    existing.unknown_attempts = existing.unknown_attempts.saturating_add(1);
+                }
+                _ => {
+                    return Err(SessionError::Engine(
+                        "publication outcome is not recognized".into(),
+                    ))
+                }
+            }
+        }
+        existing.updated_at_ms = clock::unix_ms();
+        let needs_confirm = existing.needs_mdk_confirm && existing.message_phase == "relay_accepted";
+        self.storage.put_publication(existing).map_err(map_storage)?;
+        if needs_confirm {
+            self.confirm(operation_id).await?;
+        }
+        Ok(())
+    }
+
+    pub fn select_push_tokens(&self, group_id: &GroupId) -> Result<Vec<StoredWake>, SessionError> {
+        let binding = self.binding()?;
+        let leaves = self.active_leaves(group_id)?;
+        let sender = self.public_key_hex();
+        let allowed = std::iter::once(binding.recipient_hex.clone())
+            .chain(binding.extra_recipients.into_iter())
+            .collect::<Vec<_>>();
+        let group_hex = hex::encode(group_id.as_slice());
+        let mut selected = Vec::new();
+        for wake in self.storage.wakes().map_err(map_storage)? {
+            if wake.removed || wake.group_id_hex != group_hex || wake.member_id_hex == sender {
+                continue;
+            }
+            if !allowed.iter().any(|member| member == &wake.member_id_hex) {
+                continue;
+            }
+            if !leaves
+                .iter()
+                .any(|(member, leaf)| member == &wake.member_id_hex && *leaf == wake.leaf_index)
+            {
+                continue;
+            }
+            selected.push(wake);
+        }
+        Ok(selected)
+    }
+
+    pub fn note_token_wait(&self, alert_id: &str) -> Result<(), SessionError> {
+        self.note_push(alert_id, "token_unavailable", None)
+    }
+
+    fn observe_gossip(
+        &self,
+        group_id: &GroupId,
+        kind: u64,
+        content: &str,
+        sender_leaf: Option<u32>,
+        sender_hex: &str,
+    ) -> Result<(), SessionError> {
+        let group_hex = hex::encode(group_id.as_slice());
+        let records = push::records_from_gossip(kind, &group_hex, content)
+            .map_err(|error| SessionError::Engine(error))?;
+        let mut leaves = self.active_leaves(group_id)?;
+        if let Some(leaf) = sender_leaf {
+            leaves.push((sender_hex.to_owned(), leaf));
+        }
+        let mut directory = directory_from_wakes(&self.storage.wakes().map_err(map_storage)?);
+        for record in records {
+            if record.member_id_hex == self.public_key_hex() {
+                continue;
+            }
+            let _ = directory.admit(record, &leaves);
+        }
+        self.storage
+            .put_wakes(wakes_from_directory(&directory))
+            .map_err(map_storage)?;
+        Ok(())
+    }
+
+    fn active_leaves(&self, group_id: &GroupId) -> Result<Vec<(String, u32)>, SessionError> {
+        let engine = self.engine()?;
+        let own = engine.own_leaf_index(group_id).map_err(map_engine)?;
+        let members = engine.members(group_id).map_err(map_engine)?;
+        let mut leaves = vec![(self.public_key_hex(), own)];
+        if members.len() == 2 && own <= 1 {
+            let other = 1 - own;
+            for member in &members {
+                let hex_id = member_hex(member);
+                if hex_id != self.public_key_hex() {
+                    leaves.push((hex_id, other));
+                }
+            }
+        }
+        Ok(leaves)
     }
 
     fn bind(storage: MemoryMdkStorage, secret: [u8; 32]) -> Result<Self, SessionError> {
@@ -698,6 +974,83 @@ fn unix_now() -> u64 {
     clock::unix_secs()
 }
 
+fn event_matches_publication(row: &PreparedPublication, event_id: &str) -> bool {
+    transport_event_id(&row.message).as_deref() == Some(event_id)
+        || row
+            .welcomes
+            .iter()
+            .any(|welcome| transport_event_id(welcome).as_deref() == Some(event_id))
+}
+
+fn transport_event_id(message: &TransportMessage) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(&message.payload).ok()?;
+    value
+        .get("id")
+        .and_then(|item| item.as_str())
+        .map(str::to_owned)
+}
+
+fn directory_from_wakes(wakes: &[StoredWake]) -> push::PushDirectory {
+    let mut directory = push::PushDirectory::default();
+    for wake in wakes {
+        let Ok(platform) = push::Platform::from_name(&wake.platform) else {
+            continue;
+        };
+        let record = push::TokenRecord {
+            group_id_hex: wake.group_id_hex.clone(),
+            member_id_hex: wake.member_id_hex.clone(),
+            leaf_index: wake.leaf_index,
+            platform,
+            token_fingerprint: wake.token_fingerprint.clone(),
+            server_pubkey_hex: wake.server_pubkey_hex.clone(),
+            relay_hint: wake.relay_hint.clone(),
+            owner_ts: wake.owner_ts,
+            encrypted_token: wake.encrypted_token.clone(),
+            owner_sig: wake.owner_sig.clone(),
+            removed: wake.removed,
+        };
+        let leaves = [(record.member_id_hex.clone(), record.leaf_index)];
+        let _ = directory.admit(record, &leaves);
+    }
+    directory
+}
+
+fn wakes_from_directory(directory: &push::PushDirectory) -> Vec<StoredWake> {
+    directory
+        .records()
+        .iter()
+        .map(|record| StoredWake {
+            group_id_hex: record.group_id_hex.clone(),
+            member_id_hex: record.member_id_hex.clone(),
+            leaf_index: record.leaf_index,
+            platform: record.platform.name().to_owned(),
+            token_fingerprint: record.token_fingerprint.clone(),
+            server_pubkey_hex: record.server_pubkey_hex.clone(),
+            relay_hint: record.relay_hint.clone(),
+            owner_ts: record.owner_ts,
+            encrypted_token: record.encrypted_token.clone(),
+            owner_sig: record.owner_sig.clone(),
+            removed: record.removed,
+        })
+        .collect()
+}
+
+pub fn publication_counters(row: &PreparedPublication) -> serde_json::Value {
+    serde_json::json!({
+        "messageAttempts": row.message_attempts,
+        "messagePublicationAttempts": row.message_publication_attempts,
+        "messageReconcileAttempts": row.message_reconcile_attempts,
+        "unknownAttempts": row.unknown_attempts,
+        "tokenWaitAttempts": row.token_wait_attempts,
+        "pushPublicationAttempts": row.push_publication_attempts,
+        "unobservableAttempts": row.unobservable_attempts,
+        "pushAttempts": row.push_attempts,
+        "operationAgeMs": clock::unix_ms().saturating_sub(row.started_at_ms),
+        "startedAtMs": row.started_at_ms,
+        "updatedAtMs": row.updated_at_ms,
+    })
+}
+
 fn member_hex(member: &cgka_traits::group::Member) -> String {
     hex::encode(member.id.as_slice())
 }
@@ -745,8 +1098,16 @@ fn blank_publication(
         push_phase: push_phase.to_owned(),
         push_event_id: None,
         started_at_ms: clock::unix_ms(),
+        updated_at_ms: clock::unix_ms(),
         message_attempts: 1,
+        message_publication_attempts: 0,
+        message_reconcile_attempts: 0,
+        unknown_attempts: 0,
+        token_wait_attempts: 0,
+        push_publication_attempts: 0,
+        unobservable_attempts: 0,
         push_attempts: 0,
+        publications: Vec::new(),
     }
 }
 

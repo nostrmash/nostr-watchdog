@@ -77,6 +77,9 @@ pub(crate) struct State {
     pub transport_fanouts: Vec<DurableTransportFanout>,
     pub periodic: PeriodicMaintenancePolicy,
     pub journal: Vec<PreparedPublication>,
+    pub operation_tombstones: Vec<OperationTombstone>,
+    pub wakes: Vec<StoredWake>,
+    pub server_relays: Vec<ServerRelays>,
     pub floors: HashMap<GroupId, u64>,
     pub account_secret: Option<Zeroizing<Vec<u8>>>,
     pub revision: u64,
@@ -148,6 +151,9 @@ impl State {
             transport_fanouts: Vec::new(),
             periodic: PeriodicMaintenancePolicy::Disabled,
             journal: Vec::new(),
+            operation_tombstones: Vec::new(),
+            wakes: Vec::new(),
+            server_relays: Vec::new(),
             floors: HashMap::new(),
             account_secret: None,
             revision: 0,
@@ -540,6 +546,9 @@ impl State {
             periodic: self.periodic,
             mls: encode_pairs(mls),
             journal: self.journal.clone(),
+            operation_tombstones: self.operation_tombstones.clone(),
+            wakes: self.wakes.clone(),
+            server_relays: self.server_relays.clone(),
             floors: self
                 .floors
                 .iter()
@@ -697,6 +706,9 @@ impl State {
         state.transport_fanouts = saved.transport_fanouts;
         state.periodic = saved.periodic;
         state.journal = saved.journal;
+        state.operation_tombstones = saved.operation_tombstones;
+        state.wakes = saved.wakes;
+        state.server_relays = saved.server_relays;
         for floor in saved.floors {
             state.floors.insert(floor.group_id, floor.epoch);
         }
@@ -1005,6 +1017,12 @@ pub(crate) struct SavedState {
     #[serde(default)]
     pub journal: Vec<PreparedPublication>,
     #[serde(default)]
+    pub operation_tombstones: Vec<OperationTombstone>,
+    #[serde(default)]
+    pub wakes: Vec<StoredWake>,
+    #[serde(default)]
+    pub server_relays: Vec<ServerRelays>,
+    #[serde(default)]
     pub floors: Vec<SavedFloor>,
     #[serde(default)]
     pub account_secret_hex: Option<String>,
@@ -1062,9 +1080,85 @@ pub struct PreparedPublication {
     #[serde(default)]
     pub started_at_ms: u64,
     #[serde(default)]
+    pub updated_at_ms: u64,
+    #[serde(default)]
     pub message_attempts: u64,
     #[serde(default)]
+    pub message_publication_attempts: u64,
+    #[serde(default)]
+    pub message_reconcile_attempts: u64,
+    #[serde(default)]
+    pub unknown_attempts: u64,
+    #[serde(default)]
+    pub token_wait_attempts: u64,
+    #[serde(default)]
+    pub push_publication_attempts: u64,
+    #[serde(default)]
+    pub unobservable_attempts: u64,
+    #[serde(default)]
     pub push_attempts: u64,
+    #[serde(default)]
+    pub publications: Vec<PublicationRecord>,
+}
+
+/// One correlated relay attempt. Acceptance of a different event cannot confirm this one.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicationRecord {
+    pub attempt_id: String,
+    pub event_id: String,
+    pub role: String,
+    pub destination: String,
+    pub phase: String,
+}
+
+/// Compact identity kept after the ciphertext journal drops a terminal row.
+/// It carries no ciphertext, so a later retry cannot encrypt again.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationTombstone {
+    pub alert_id: String,
+    pub operation_kind: String,
+    pub payload_sha256: [u8; 32],
+    pub group_id: GroupId,
+    pub message_phase: String,
+    pub message_event_id: String,
+    pub push_phase: String,
+    pub push_event_id: Option<String>,
+    pub started_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub message_attempts: u64,
+    pub message_publication_attempts: u64,
+    pub message_reconcile_attempts: u64,
+    pub unknown_attempts: u64,
+    pub token_wait_attempts: u64,
+    pub push_publication_attempts: u64,
+    pub unobservable_attempts: u64,
+    pub push_attempts: u64,
+}
+
+/// Encrypted wake capability. The raw device token is not stored.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredWake {
+    pub group_id_hex: String,
+    pub member_id_hex: String,
+    pub leaf_index: u32,
+    pub platform: String,
+    pub token_fingerprint: String,
+    pub server_pubkey_hex: String,
+    #[serde(default)]
+    pub relay_hint: Option<String>,
+    pub owner_ts: i64,
+    pub encrypted_token: Vec<u8>,
+    pub owner_sig: String,
+    pub removed: bool,
+}
+
+/// Kind 10050 inbox relays observed for a notification server.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerRelays {
+    pub server_pubkey_hex: String,
+    pub relays: Vec<String>,
+    pub observed_at_ms: u64,
+    pub negative: bool,
 }
 
 fn default_operation_kind() -> String {

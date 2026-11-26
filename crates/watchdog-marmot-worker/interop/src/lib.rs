@@ -112,6 +112,40 @@ impl OfficialRecipient {
         Ok(chats(events))
     }
 
+    pub async fn send_app(
+        &self,
+        group_id: &GroupId,
+        kind: u64,
+        content: &str,
+    ) -> Result<TransportMessage, String> {
+        let mut engine = self.engine()?;
+        let app = MarmotAppEvent::new(self.public_key_hex(), unix_now(), kind, Vec::new(), content);
+        let payload = app.encode().map_err(|error| error.to_string())?;
+        let result = engine
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+                expected_epoch: None,
+                only_to_members: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        match result {
+            SendResult::ApplicationMessage { msg, .. } => Ok(msg),
+            other => Err(format!("official client application message returned {other:?}")),
+        }
+    }
+
+    pub fn own_leaf(&self, group_id: &GroupId) -> Result<u32, String> {
+        self.engine()?
+            .own_leaf_index(group_id)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn keys(&self) -> &Keys {
+        &self.keys
+    }
+
     pub async fn send_chat(&self, group_id: &GroupId, text: &str) -> Result<TransportMessage, String> {
         let mut engine = self.engine()?;
         let app = MarmotAppEvent::new(self.public_key_hex(), unix_now(), MARMOT_APP_EVENT_KIND_CHAT, Vec::new(), text);

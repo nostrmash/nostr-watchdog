@@ -52,10 +52,18 @@ impl Platform {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Apns => "apns",
             Self::Fcm => "fcm",
+        }
+    }
+
+    pub fn from_name(value: &str) -> Result<Self, String> {
+        match value {
+            "apns" => Ok(Self::Apns),
+            "fcm" => Ok(Self::Fcm),
+            _ => Err("unsupported push platform".into()),
         }
     }
 
@@ -106,6 +114,10 @@ impl PushDirectory {
         self.insert_ordered(record)
     }
 
+    pub fn records(&self) -> &[TokenRecord] {
+        &self.records
+    }
+
     pub fn revoke(&mut self, mut tombstone: TokenRecord, leaves: &[(String, u32)]) -> Result<(), String> {
         tombstone.removed = true;
         tombstone.encrypted_token.clear();
@@ -116,8 +128,14 @@ impl PushDirectory {
         let digest = record_digest(&record)?;
         if let Some(existing) = self.records.iter_mut().find(|item| same_slot(item, &record)) {
             let existing_digest = record_digest(existing)?;
-            let newer = record.owner_ts > existing.owner_ts
-                || (record.owner_ts == existing.owner_ts && digest > existing_digest);
+            let newer = if record.removed && !existing.removed {
+                record.owner_ts >= existing.owner_ts
+            } else if existing.removed && !record.removed {
+                record.owner_ts > existing.owner_ts
+            } else {
+                record.owner_ts > existing.owner_ts
+                    || (record.owner_ts == existing.owner_ts && digest > existing_digest)
+            };
             if !newer {
                 return Ok(());
             }
@@ -271,6 +289,92 @@ pub async fn notification_gift_wrap(
     NostrTransportEvent::from_nostr_event(&gift).map_err(|error| error.to_string())
 }
 
+/// Decode kind 447, 448, or 449 content into owner-signed wake records.
+/// The caller still has to admit them against the current leaf set.
+pub fn records_from_gossip(
+    kind: u64,
+    group_id_hex: &str,
+    content: &str,
+) -> Result<Vec<TokenRecord>, String> {
+    if content.len() > 64 * 1024 {
+        return Err("push gossip is too large".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(content).map_err(|_| "push gossip is not json".to_owned())?;
+    if value.get("v").and_then(|item| item.as_str()) != Some(PUSH_VERSION) {
+        return Err("unsupported push token gossip version".into());
+    }
+    let (removed, entries) = match kind {
+        447 | 448 => (false, value.get("tokens")),
+        449 => (true, value.get("removals")),
+        _ => return Err("unsupported push token gossip kind".into()),
+    };
+    let entries = entries.and_then(|item| item.as_array()).cloned().unwrap_or_default();
+    if entries.len() > 32 {
+        return Err("push gossip array is too large".into());
+    }
+    let mut records = Vec::new();
+    for entry in entries {
+        let member_id_hex = entry
+            .get("member_id_hex")
+            .and_then(|item| item.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let server_pubkey_hex = entry
+            .get("server_pubkey_hex")
+            .and_then(|item| item.as_str())
+            .unwrap_or("")
+            .to_owned();
+        if member_id_hex.len() != 64 || server_pubkey_hex.len() != 64 {
+            continue;
+        }
+        let platform = match Platform::from_name(
+            entry.get("platform").and_then(|item| item.as_str()).unwrap_or(""),
+        ) {
+            Ok(platform) => platform,
+            Err(_) => continue,
+        };
+        let encrypted_token = if removed {
+            Vec::new()
+        } else {
+            match BASE64.decode(
+                entry
+                    .get("encrypted_token")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or(""),
+            ) {
+                Ok(bytes) if bytes.len() == ENCRYPTED_TOKEN_LEN => bytes,
+                _ => continue,
+            }
+        };
+        records.push(TokenRecord {
+            group_id_hex: group_id_hex.to_owned(),
+            member_id_hex,
+            leaf_index: entry.get("leaf_index").and_then(|item| item.as_u64()).unwrap_or(0) as u32,
+            platform,
+            token_fingerprint: entry
+                .get("token_fingerprint")
+                .and_then(|item| item.as_str())
+                .unwrap_or("")
+                .to_owned(),
+            server_pubkey_hex,
+            relay_hint: entry
+                .get("relay_hint")
+                .and_then(|item| item.as_str())
+                .map(str::to_owned),
+            owner_ts: entry.get("owner_ts").and_then(|item| item.as_i64()).unwrap_or(0),
+            encrypted_token,
+            owner_sig: entry
+                .get("owner_sig")
+                .and_then(|item| item.as_str())
+                .unwrap_or("")
+                .to_owned(),
+            removed,
+        });
+    }
+    Ok(records)
+}
+
 pub fn unwrap_notification(
     server_keys: &Keys,
     event_json: &[u8],
@@ -315,8 +419,7 @@ fn owner_proof_event(record: &TokenRecord, removal: bool) -> Result<UnsignedEven
     Ok(event)
 }
 
-#[cfg(test)]
-fn fingerprint(platform: Platform, token: &[u8]) -> String {
+pub fn token_fingerprint(platform: Platform, token: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update([platform.byte()]);
     hasher.update(token);
@@ -457,7 +560,7 @@ mod tests {
             member_id_hex: leaves[0].0.clone(),
             leaf_index: 0,
             platform: Platform::Fcm,
-            token_fingerprint: fingerprint(Platform::Fcm, &token),
+            token_fingerprint: token_fingerprint(Platform::Fcm, &token),
             server_pubkey_hex: server_hex.clone(),
             relay_hint: Some("wss://relay.example".into()),
             owner_ts: 1_700_000_000_000,
@@ -476,7 +579,7 @@ mod tests {
         let mut older = record.clone();
         older.owner_ts -= 1;
         older.encrypted_token = vec![0; ENCRYPTED_TOKEN_LEN];
-        older.token_fingerprint = fingerprint(Platform::Fcm, b"old");
+        older.token_fingerprint = token_fingerprint(Platform::Fcm, b"old");
         older.owner_sig = sign_owner_proof(&owner, &older, false).unwrap();
         directory.admit(older, &leaves).unwrap();
         assert_eq!(directory.records[0].encrypted_token, encrypted);
@@ -484,7 +587,7 @@ mod tests {
         let mut newer = record.clone();
         newer.owner_ts += 1;
         newer.encrypted_token = replacement.clone();
-        newer.token_fingerprint = fingerprint(Platform::Fcm, b"fcm-replacement");
+        newer.token_fingerprint = token_fingerprint(Platform::Fcm, b"fcm-replacement");
         newer.owner_sig = sign_owner_proof(&owner, &newer, false).unwrap();
         directory.admit(newer, &leaves).unwrap();
         assert_eq!(directory.records[0].encrypted_token, replacement);

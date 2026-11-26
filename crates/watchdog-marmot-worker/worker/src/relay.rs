@@ -41,38 +41,42 @@ pub fn validate_relay(value: &str, allow_loopback: bool) -> Result<(), String> {
     }
 }
 
+/// `relay_accepted` is an explicit OK. `rejected` is an explicit false OK.
+/// Timeout and disconnection are `unobservable`, not a rejection.
 pub async fn publish_event(
     relays: &[String],
     event: &Value,
     allow_loopback: bool,
-) -> Result<bool, String> {
+) -> Result<String, String> {
     validate_relays(relays, allow_loopback)?;
     let encoded = serde_json::to_vec(event).map_err(|error| error.to_string())?;
     if encoded.len() > MAX_EVENT_BYTES {
         return Err("relay event exceeds the size limit".into());
     }
-    let mut accepted = false;
-    let mut saw_response = false;
+    let mut explicit_reject = false;
     for relay in relays {
         match one_socket(relay, json!(["EVENT", event]), false).await {
             Ok(frames) => {
-                saw_response = true;
                 if frames.iter().any(|frame| {
                     frame.get(0).and_then(|item| item.as_str()) == Some("OK")
                         && frame.get(2).and_then(|item| item.as_bool()) == Some(true)
                 }) {
-                    accepted = true;
+                    return Ok("relay_accepted".into());
+                }
+                if frames.iter().any(|frame| {
+                    frame.get(0).and_then(|item| item.as_str()) == Some("OK")
+                        && frame.get(2).and_then(|item| item.as_bool()) == Some(false)
+                }) {
+                    explicit_reject = true;
                 }
             }
             Err(_) => {}
         }
     }
-    if accepted {
-        Ok(true)
-    } else if saw_response {
-        Err("relay rejected the event".into())
+    if explicit_reject {
+        Ok("rejected".into())
     } else {
-        Err("relay publication was not acknowledged".into())
+        Ok("unobservable".into())
     }
 }
 

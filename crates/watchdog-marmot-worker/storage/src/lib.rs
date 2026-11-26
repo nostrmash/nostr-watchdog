@@ -49,7 +49,10 @@ use state::{
     Forgotten, GroupImage, SnapKey, State, export_mls, import_mls, is_key_package_storage_key,
 };
 
-pub use state::{AccountBinding, PreparedPublication};
+pub use state::{
+    AccountBinding, OperationTombstone, PreparedPublication, PublicationRecord, ServerRelays,
+    StoredWake,
+};
 
 const KEY_PACKAGE_LABEL: &[u8] = b"KeyPackage";
 
@@ -147,6 +150,10 @@ impl MemoryMdkStorage {
         })
     }
 
+    pub fn journal_len(&self) -> StorageResult<usize> {
+        Ok(self.lock()?.state.journal.len())
+    }
+
     pub fn publication(&self, alert_id: &str) -> StorageResult<Option<PreparedPublication>> {
         Ok(self
             .lock()?
@@ -159,6 +166,24 @@ impl MemoryMdkStorage {
 
     pub fn put_publication(&self, publication: PreparedPublication) -> StorageResult<()> {
         self.mutate(|state| {
+            if let Some(existing) = state
+                .operation_tombstones
+                .iter()
+                .find(|row| row.alert_id == publication.alert_id)
+            {
+                if existing.payload_sha256 != publication.payload_sha256
+                    || existing.group_id != publication.group_id
+                    || existing.operation_kind != publication.operation_kind
+                {
+                    return Err(StorageError::Backend(
+                        "operation id is already bound to a different group, payload, or ciphertext"
+                            .into(),
+                    ));
+                }
+                return Err(StorageError::Backend(
+                    "operation is retired and cannot be encrypted again".into(),
+                ));
+            }
             if let Some(existing) = state
                 .journal
                 .iter()
@@ -176,7 +201,42 @@ impl MemoryMdkStorage {
                 }
             }
             upsert_alert(&mut state.journal, publication);
-            trim_journal(&mut state.journal)?;
+            trim_journal(state)?;
+            Ok(())
+        })
+    }
+
+    pub fn tombstone(&self, alert_id: &str) -> StorageResult<Option<OperationTombstone>> {
+        Ok(self
+            .lock()?
+            .state
+            .operation_tombstones
+            .iter()
+            .find(|row| row.alert_id == alert_id)
+            .cloned())
+    }
+
+    pub fn wakes(&self) -> StorageResult<Vec<StoredWake>> {
+        Ok(self.lock()?.state.wakes.clone())
+    }
+
+    pub fn put_wakes(&self, wakes: Vec<StoredWake>) -> StorageResult<()> {
+        if wakes.len() > 256 {
+            return Err(StorageError::Backend("wake directory is full".into()));
+        }
+        self.mutate(|state| {
+            state.wakes = wakes;
+            Ok(())
+        })
+    }
+
+    pub fn server_relays(&self) -> StorageResult<Vec<ServerRelays>> {
+        Ok(self.lock()?.state.server_relays.clone())
+    }
+
+    pub fn put_server_relays(&self, relays: Vec<ServerRelays>) -> StorageResult<()> {
+        self.mutate(|state| {
+            state.server_relays = relays;
             Ok(())
         })
     }
@@ -1638,25 +1698,67 @@ impl StorageProvider for MemoryMdkStorage {
     }
 }
 
-fn trim_journal(rows: &mut Vec<PreparedPublication>) -> StorageResult<()> {
-    if rows.len() <= state::MAX_JOURNAL {
+fn trim_journal(state: &mut state::State) -> StorageResult<()> {
+    if state.journal.len() <= state::MAX_JOURNAL {
         return Ok(());
     }
     let mut index = 0;
-    while rows.len() > state::MAX_JOURNAL && index < rows.len() {
-        let phase = rows[index].message_phase.as_str();
-        if phase == "relay_accepted" || phase == "rejected" {
-            rows.remove(index);
+    while state.journal.len() > state::MAX_JOURNAL && index < state.journal.len() {
+        let phase = state.journal[index].message_phase.as_str();
+        let push_open = matches!(
+            state.journal[index].push_phase.as_str(),
+            "unknown" | "not_attempted" | "prepared" | "pending" | "publication_attempted"
+        );
+        if (phase == "relay_accepted" || phase == "rejected") && !push_open {
+            let row = state.journal.remove(index);
+            remember_tombstone(state, &row);
         } else {
             index += 1;
         }
     }
-    if rows.len() > state::MAX_JOURNAL.saturating_mul(2) {
+    if state.journal.len() > state::MAX_JOURNAL.saturating_mul(2) {
         return Err(StorageError::Backend(
             "publication journal exceeded its bound".into(),
         ));
     }
+    if state.operation_tombstones.len() > 4096 {
+        return Err(StorageError::Backend(
+            "operation identity table exceeded its bound".into(),
+        ));
+    }
     Ok(())
+}
+
+fn remember_tombstone(state: &mut state::State, row: &PreparedPublication) {
+    let tombstone = OperationTombstone {
+        alert_id: row.alert_id.clone(),
+        operation_kind: row.operation_kind.clone(),
+        payload_sha256: row.payload_sha256,
+        group_id: row.group_id.clone(),
+        message_phase: row.message_phase.clone(),
+        message_event_id: hex::encode(row.message.id.as_slice()),
+        push_phase: row.push_phase.clone(),
+        push_event_id: row.push_event_id.clone(),
+        started_at_ms: row.started_at_ms,
+        updated_at_ms: row.updated_at_ms,
+        message_attempts: row.message_attempts,
+        message_publication_attempts: row.message_publication_attempts,
+        message_reconcile_attempts: row.message_reconcile_attempts,
+        unknown_attempts: row.unknown_attempts,
+        token_wait_attempts: row.token_wait_attempts,
+        push_publication_attempts: row.push_publication_attempts,
+        unobservable_attempts: row.unobservable_attempts,
+        push_attempts: row.push_attempts,
+    };
+    if let Some(existing) = state
+        .operation_tombstones
+        .iter_mut()
+        .find(|item| item.alert_id == tombstone.alert_id)
+    {
+        *existing = tombstone;
+    } else {
+        state.operation_tombstones.push(tombstone);
+    }
 }
 
 fn upsert_alert(rows: &mut Vec<PreparedPublication>, row: PreparedPublication) {
@@ -1787,5 +1889,62 @@ mod tests {
             })
             .unwrap();
         assert_eq!(storage.drain_commit_hooks().len(), 1);
+    }
+
+    #[test]
+    fn terminal_rows_leave_tombstones_and_cannot_be_encrypted_again() {
+        let storage = MemoryMdkStorage::empty();
+        let mut held = sample_publication(0);
+        held.push_phase = "prepared".into();
+        storage.put_publication(held).unwrap();
+        for id in 1..80 {
+            storage.put_publication(sample_publication(id)).unwrap();
+        }
+        assert!(storage.publication("alert-0").unwrap().is_some());
+        assert!(storage.tombstone("alert-1").unwrap().is_some());
+        assert!(storage.journal_len().unwrap() <= state::MAX_JOURNAL);
+        let mut again = sample_publication(1);
+        again.message.payload = vec![9];
+        assert!(storage.put_publication(again).is_err());
+    }
+
+    fn sample_publication(id: u8) -> PreparedPublication {
+        use cgka_traits::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
+        PreparedPublication {
+            alert_id: format!("alert-{id}"),
+            operation_kind: "chat".into(),
+            payload_sha256: [id; 32],
+            group_id: GroupId::new(vec![1, 2, 3, 4]),
+            message: TransportMessage {
+                id: MessageId::new(vec![id]),
+                payload: vec![id],
+                timestamp: Timestamp(1),
+                causal_deps: Vec::new(),
+                source: TransportSource("nostr".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![1],
+                },
+            },
+            confirmed: false,
+            message_phase: "relay_accepted".into(),
+            pending_ref: None,
+            needs_mdk_confirm: false,
+            welcomes: Vec::new(),
+            push_trigger: None,
+            push_published: false,
+            push_phase: "not_required".into(),
+            push_event_id: None,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            message_attempts: 1,
+            message_publication_attempts: 1,
+            message_reconcile_attempts: 1,
+            unknown_attempts: 0,
+            token_wait_attempts: 0,
+            push_publication_attempts: 0,
+            unobservable_attempts: 0,
+            push_attempts: 0,
+            publications: Vec::new(),
+        }
     }
 }
