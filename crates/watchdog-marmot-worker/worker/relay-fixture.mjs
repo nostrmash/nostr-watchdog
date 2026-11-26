@@ -7,6 +7,7 @@ import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 
 const port = Number(process.env.PORT || 0);
+const fault = process.env.RELAY_FAULT || "";
 const events = new Map();
 
 function address(event) {
@@ -78,6 +79,21 @@ sockets.on("connection", (socket) => {
         }
       }
       events.set(event.id, event);
+      if (fault === "unrelated-only") {
+        socket.send(JSON.stringify(["OK", "unrelated-event-id", true, ""]));
+        return;
+      }
+      if (fault === "reject") {
+        socket.send(JSON.stringify(["OK", event.id, false, "blocked: auth-required"]));
+        return;
+      }
+      if (fault === "unrelated-then-ok") {
+        socket.send(JSON.stringify(["OK", "unrelated-event-id", true, ""]));
+        setTimeout(() => {
+          socket.send(JSON.stringify(["OK", event.id, true, ""]));
+        }, 40);
+        return;
+      }
       socket.send(JSON.stringify(["OK", event.id, true, ""]));
       for (const client of clients) {
         for (const [sub, filters] of client.subs) {

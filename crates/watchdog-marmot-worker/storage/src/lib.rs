@@ -50,8 +50,8 @@ use state::{
 };
 
 pub use state::{
-    AccountBinding, OperationTombstone, PreparedPublication, PublicationRecord, ServerRelays,
-    StoredWake,
+    AccountBinding, ObservedLeaf, OperationTombstone, PreparedPublication, PublicationRecord,
+    ServerRelays, StoredWake, SyncCursor,
 };
 
 const KEY_PACKAGE_LABEL: &[u8] = b"KeyPackage";
@@ -166,6 +166,13 @@ impl MemoryMdkStorage {
 
     pub fn put_publication(&self, publication: PreparedPublication) -> StorageResult<()> {
         self.mutate(|state| {
+            if !state.tombstones_indexed
+                && state.tombstone_high_water > state.operation_tombstones.len() as u64
+            {
+                return Err(StorageError::Backend(
+                    "deduplication state is not loaded".into(),
+                ));
+            }
             if let Some(existing) = state
                 .operation_tombstones
                 .iter()
@@ -214,6 +221,136 @@ impl MemoryMdkStorage {
             .iter()
             .find(|row| row.alert_id == alert_id)
             .cloned())
+    }
+
+    pub fn welcome_publication(&self) -> StorageResult<Option<PreparedPublication>> {
+        Ok(self
+            .lock()?
+            .state
+            .journal
+            .iter()
+            .find(|row| row.operation_kind == "welcome")
+            .cloned())
+    }
+
+    pub fn export_tombstones(&self) -> StorageResult<Vec<OperationTombstone>> {
+        Ok(self.lock()?.state.operation_tombstones.clone())
+    }
+
+    /// Load the SQL operation index and keep it out of the next sealed snapshot.
+    /// Fewer rows than the snapshot high-water mark fails closed.
+    pub fn install_indexed_tombstones(
+        &self,
+        rows: Vec<OperationTombstone>,
+    ) -> StorageResult<()> {
+        self.mutate(|state| {
+            let mut merged = rows;
+            for existing in std::mem::take(&mut state.operation_tombstones) {
+                if !merged.iter().any(|row| row.alert_id == existing.alert_id) {
+                    merged.push(existing);
+                }
+            }
+            if (merged.len() as u64) < state.tombstone_high_water {
+                return Err(StorageError::Backend(
+                    "deduplication state is incomplete".into(),
+                ));
+            }
+            state.tombstone_high_water = merged.len() as u64;
+            state.operation_tombstones = merged;
+            state.tombstones_indexed = true;
+            Ok(())
+        })
+    }
+
+    pub fn tombstone_status(&self) -> StorageResult<(u64, Option<u64>)> {
+        let bag = self.lock()?;
+        let used = bag.state.operation_tombstones.len() as u64;
+        let remaining = if bag.state.tombstones_indexed {
+            None
+        } else {
+            Some((state::SNAPSHOT_TOMBSTONE_LIMIT as u64).saturating_sub(used))
+        };
+        Ok((used, remaining))
+    }
+
+    pub fn observed_leaves(&self) -> StorageResult<Vec<state::ObservedLeaf>> {
+        Ok(self.lock()?.state.observed_leaves.clone())
+    }
+
+    pub fn observe_leaf(
+        &self,
+        group_id_hex: &str,
+        member_id_hex: &str,
+        leaf_index: u32,
+        epoch: u64,
+    ) -> StorageResult<()> {
+        self.mutate(|state| {
+            if state.observed_leaves.len() > 1_024 {
+                return Err(StorageError::Backend(
+                    "observed leaf table exceeded its bound".into(),
+                ));
+            }
+            for existing in state.observed_leaves.iter_mut() {
+                if existing.group_id_hex == group_id_hex
+                    && existing.leaf_index == leaf_index
+                    && existing.member_id_hex != member_id_hex
+                    && epoch >= existing.epoch
+                {
+                    existing.removed = true;
+                }
+            }
+            if let Some(existing) = state.observed_leaves.iter_mut().find(|leaf| {
+                leaf.group_id_hex == group_id_hex
+                    && leaf.member_id_hex == member_id_hex
+                    && leaf.leaf_index == leaf_index
+            }) {
+                if epoch >= existing.epoch {
+                    existing.epoch = epoch;
+                    existing.removed = false;
+                }
+                return Ok(());
+            }
+            state.observed_leaves.push(state::ObservedLeaf {
+                group_id_hex: group_id_hex.to_owned(),
+                member_id_hex: member_id_hex.to_owned(),
+                leaf_index,
+                epoch,
+                removed: false,
+            });
+            Ok(())
+        })
+    }
+
+    pub fn retire_leaf(&self, group_id_hex: &str, leaf_index: u32) -> StorageResult<()> {
+        self.mutate(|state| {
+            for leaf in state.observed_leaves.iter_mut() {
+                if leaf.group_id_hex == group_id_hex && leaf.leaf_index == leaf_index {
+                    leaf.removed = true;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn sync_cursors(&self) -> StorageResult<Vec<state::SyncCursor>> {
+        Ok(self.lock()?.state.sync_cursors.clone())
+    }
+
+    pub fn put_sync_cursor(&self, cursor: state::SyncCursor) -> StorageResult<()> {
+        self.mutate(|state| {
+            if let Some(existing) = state
+                .sync_cursors
+                .iter_mut()
+                .find(|item| item.stream == cursor.stream)
+            {
+                *existing = cursor;
+            } else if state.sync_cursors.len() >= 32 {
+                return Err(StorageError::Backend("sync cursor table is full".into()));
+            } else {
+                state.sync_cursors.push(cursor);
+            }
+            Ok(())
+        })
     }
 
     pub fn wakes(&self) -> StorageResult<Vec<StoredWake>> {
@@ -1721,7 +1858,9 @@ fn trim_journal(state: &mut state::State) -> StorageResult<()> {
             "publication journal exceeded its bound".into(),
         ));
     }
-    if state.operation_tombstones.len() > 4096 {
+    if !state.tombstones_indexed
+        && state.operation_tombstones.len() > state::SNAPSHOT_TOMBSTONE_LIMIT
+    {
         return Err(StorageError::Backend(
             "operation identity table exceeded its bound".into(),
         ));
@@ -1906,6 +2045,93 @@ mod tests {
         let mut again = sample_publication(1);
         again.message.payload = vec![9];
         assert!(storage.put_publication(again).is_err());
+    }
+
+    #[test]
+    fn more_than_4096_identities_stay_out_of_the_snapshot_and_block_reencryption() {
+        let mut live = state::State::new();
+        live.tombstones_indexed = true;
+        for id in 0..4_100u32 {
+            remember_tombstone(&mut live, &wide_publication(id));
+        }
+        assert_eq!(live.operation_tombstones.len(), 4_100);
+        let exported = live.operation_tombstones.clone();
+        let saved = live.save(&[]).expect("save indexed snapshot");
+        assert!(saved.operation_tombstones.is_empty());
+        assert_eq!(saved.tombstone_high_water, 4_100);
+        let document = Document {
+            format: persist::FORMAT_VERSION,
+            state: saved,
+        };
+        let restored = MemoryMdkStorage::from_document(document).expect("reload");
+        let error = restored
+            .put_publication(wide_publication(9_999))
+            .expect_err("missing index fails closed");
+        assert!(error.to_string().contains("not loaded"), "{error}");
+        let short = restored
+            .install_indexed_tombstones(vec![exported[0].clone()])
+            .expect_err("short index fails closed");
+        assert!(short.to_string().contains("incomplete"), "{short}");
+        restored
+            .install_indexed_tombstones(exported)
+            .expect("load the operation index");
+        let retired = restored
+            .put_publication(wide_publication(1))
+            .expect_err("retired identity");
+        assert!(retired.to_string().contains("retired"), "{retired}");
+        restored
+            .put_publication(wide_publication(9_999))
+            .expect("a new operation is still admitted");
+        let again = MemoryMdkStorage::from_document(restored.to_document().unwrap()).unwrap();
+        let missing = again
+            .put_publication(wide_publication(1))
+            .expect_err("a restart without the index fails closed");
+        assert!(missing.to_string().contains("not loaded"), "{missing}");
+        again
+            .install_indexed_tombstones(again.export_tombstones().unwrap())
+            .expect_err("the snapshot no longer carries the identities");
+    }
+
+    fn wide_publication(id: u32) -> PreparedPublication {
+        use cgka_traits::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&id.to_le_bytes());
+        PreparedPublication {
+            alert_id: format!("alert-{id}"),
+            operation_kind: "chat".into(),
+            payload_sha256: hash,
+            group_id: GroupId::new(vec![1, 2, 3, 4]),
+            message: TransportMessage {
+                id: MessageId::new(id.to_le_bytes().to_vec()),
+                payload: id.to_le_bytes().to_vec(),
+                timestamp: Timestamp(1),
+                causal_deps: Vec::new(),
+                source: TransportSource("nostr".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![1],
+                },
+            },
+            confirmed: false,
+            message_phase: "relay_accepted".into(),
+            pending_ref: None,
+            needs_mdk_confirm: false,
+            welcomes: Vec::new(),
+            push_trigger: None,
+            push_published: false,
+            push_phase: "not_required".into(),
+            push_event_id: None,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            message_attempts: 1,
+            message_publication_attempts: 1,
+            message_reconcile_attempts: 1,
+            unknown_attempts: 0,
+            token_wait_attempts: 0,
+            push_publication_attempts: 0,
+            unobservable_attempts: 0,
+            push_attempts: 0,
+            publications: Vec::new(),
+        }
     }
 
     fn sample_publication(id: u8) -> PreparedPublication {

@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cgka_traits::storage::GroupStorage;
 use cgka_traits::{GroupId, KeyPackage, KeyPackageSource, MessageId, TransportMessage};
+use marmot_worker_runtime::inbox::{self, InboxChoice};
+use marmot_worker_runtime::publication::{self, revalidate_trigger_envelope};
 use marmot_worker_runtime::push::notification_gift_wrap;
-use marmot_worker_runtime::Session;
+use marmot_worker_runtime::{OperationTombstone, ServerRelays, Session};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use worker::*;
@@ -34,8 +36,10 @@ struct Gate {
 struct Pull {
     relays: Vec<String>,
     filters: Vec<Value>,
+    streams: Vec<String>,
     purpose: String,
     operation_id: String,
+    fault: Option<String>,
 }
 
 struct Publish {
@@ -128,6 +132,14 @@ impl DurableObject for MarmotSender {
             None,
         )
         .expect("create marmot_account");
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS marmot_operation (
+                alert_id TEXT PRIMARY KEY,
+                record TEXT NOT NULL
+            )",
+            None,
+        )
+        .expect("create marmot_operation");
         let storage_key = env
             .secret("MARMOT_STORAGE_KEY")
             .ok()
@@ -198,6 +210,41 @@ impl DurableObject for MarmotSender {
         }
         if let Some(pull) = gate.pull {
             let mut events = Vec::new();
+            if pull.purpose == "sync" {
+                let mut pages = Vec::new();
+                let mut chats = Vec::new();
+                for (index, filter) in pull.filters.iter().enumerate() {
+                    let Ok(found) = relay::fetch_events(&pull.relays, filter.clone(), allow_loopback).await else {
+                        continue;
+                    };
+                    let stream = pull
+                        .streams
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| format!("sync-{index}"));
+                    let sql = self.sql.clone();
+                    let project_for_sync = project.clone();
+                    let ingested = self
+                        .state
+                        .block_concurrency_while(async move {
+                            Ok(ingest_pulled(
+                                &sql,
+                                storage_key,
+                                &project_for_sync,
+                                found,
+                                &stream,
+                            )
+                            .await)
+                        })
+                        .await?;
+                    let ingested = ingested.map_err(|error| Error::RustError(sanitize(&error)))?;
+                    if let Some(found) = ingested.get("chats").and_then(|value| value.as_array()) {
+                        chats.extend(found.clone());
+                    }
+                    pages.push(ingested);
+                }
+                return Response::from_json(&json!({"pages": pages, "chats": chats}));
+            }
             for filter in &pull.filters {
                 if let Ok(found) = relay::fetch_events(&pull.relays, filter.clone(), allow_loopback).await {
                     events.extend(found);
@@ -223,6 +270,18 @@ impl DurableObject for MarmotSender {
                     })
                     .await?;
                 let mut response = created.map_err(|error| Error::RustError(sanitize(&error)))?;
+                if pull.fault.as_deref() == Some("before_welcome_publish") {
+                    response = apply_projection(
+                        &self.state,
+                        &self.sql,
+                        storage_key,
+                        &project,
+                        allow_loopback,
+                        response,
+                    )
+                    .await?;
+                    return Response::from_json(&response);
+                }
                 let relays = response
                     .get("publicationRelays")
                     .and_then(|value| value.as_array())
@@ -239,111 +298,107 @@ impl DurableObject for MarmotSender {
                             .map_err(|error| Error::RustError(error.to_string()))?;
                         let event = Session::transport_json(&message)
                             .map_err(|error| Error::RustError(error.to_string()))?;
-                        let outcome = relay::publish_event(&relays, &event, allow_loopback)
-                            .await
-                            .unwrap_or_else(|_| "unobservable".into());
-                        let event_id = event
-                            .get("id")
-                            .and_then(|item| item.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let destination = relays.first().cloned().unwrap_or_default();
-                        let sql = self.sql.clone();
                         let operation_id = response["operationId"]
                             .as_str()
                             .unwrap_or_default()
                             .to_string();
-                        let project_for_ack = project.clone();
-                        let ack = self
-                            .state
-                            .block_concurrency_while(async move {
-                                Ok(acknowledge(
-                                    &sql,
-                                    storage_key,
-                                    &project_for_ack,
-                                    &operation_id,
-                                    "message",
-                                    &outcome,
-                                    &event_id,
-                                    &destination,
-                                )
-                                .await)
-                            })
-                            .await?;
-                        if let Ok(phase) = ack {
-                            response["messagePhase"] = json!(phase);
-                            response["messageState"] = json!(phase);
-                        }
+                        let phase = publish_and_record(
+                            &self.state,
+                            &self.sql,
+                            storage_key,
+                            &project,
+                            &operation_id,
+                            "message",
+                            &relays,
+                            &event,
+                            allow_loopback,
+                        )
+                        .await?;
+                        response["messagePhase"] = json!(phase);
+                        response["messageState"] = json!(phase);
                     }
                 }
-                if let Some(map) = response.as_object_mut() {
-                    map.remove("publicationRelays");
-                    if !allow_loopback {
-                        map.remove("welcomes");
-                    }
-                }
+                response = apply_projection(
+                    &self.state,
+                    &self.sql,
+                    storage_key,
+                    &project,
+                    allow_loopback,
+                    response,
+                )
+                .await?;
                 return Response::from_json(&response);
             }
-            let sql = self.sql.clone();
-            let project_for_sync = project.clone();
-            let ingested = self
-                .state
-                .block_concurrency_while(async move {
-                    Ok(ingest_pulled(&sql, storage_key, &project_for_sync, events).await)
-                })
-                .await?;
-            let ingested = ingested.map_err(|error| Error::RustError(sanitize(&error)))?;
-            return Response::from_json(&ingested);
+            return Response::error("pull purpose is not recognized", 400);
         }
         let mut response = gate.response;
+        if response.get("welcomes").and_then(|value| value.as_array()).is_some()
+            && response.get("publicationRelays").and_then(|value| value.as_array()).is_some_and(|items| !items.is_empty())
+        {
+            let relays = response
+                .get("publicationRelays")
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if let Some(welcomes) = response.get("welcomes").and_then(|value| value.as_array()).cloned() {
+                for welcome in welcomes {
+                    let message: TransportMessage = serde_json::from_value(welcome)
+                        .map_err(|error| Error::RustError(error.to_string()))?;
+                    let event = Session::transport_json(&message)
+                        .map_err(|error| Error::RustError(error.to_string()))?;
+                    let operation_id = response["operationId"].as_str().unwrap_or_default().to_string();
+                    let phase = publish_and_record(
+                        &self.state,
+                        &self.sql,
+                        storage_key,
+                        &project,
+                        &operation_id,
+                        "message",
+                        &relays,
+                        &event,
+                        allow_loopback,
+                    )
+                    .await?;
+                    response["messagePhase"] = json!(phase);
+                    response["messageState"] = json!(phase);
+                }
+            }
+        }
         if let Some(publish) = gate.publish {
-            let outcome = relay::publish_event(&publish.relays, &publish.event, allow_loopback)
-                .await
-                .unwrap_or_else(|_| "unobservable".into());
-            let event_id = publish
-                .event
-                .get("id")
-                .and_then(|item| item.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let destination = publish.relays.first().cloned().unwrap_or_default();
-            let sql = self.sql.clone();
-            let operation_id = publish.operation_id.clone();
-            let project_for_ack = project.clone();
             let kind = match publish.kind {
                 PublishKind::Message => "message",
                 PublishKind::Push => "push",
             };
-            let ack = self
-                .state
-                .block_concurrency_while(async move {
-                    Ok(acknowledge(
-                        &sql,
-                        storage_key,
-                        &project_for_ack,
-                        &operation_id,
-                        kind,
-                        &outcome,
-                        &event_id,
-                        &destination,
-                    )
-                    .await)
-                })
-                .await?;
-            if let Ok(phase) = ack {
-                if kind == "message" {
-                    response["messagePhase"] = json!(phase);
-                    response["messageState"] = json!(phase);
-                } else {
-                    response["pushPhase"] = json!(phase);
-                    response["pushState"] = json!(phase);
-                }
+            let phase = publish_and_record(
+                &self.state,
+                &self.sql,
+                storage_key,
+                &project,
+                &publish.operation_id,
+                kind,
+                &publish.relays,
+                &publish.event,
+                allow_loopback,
+            )
+            .await?;
+            if kind == "message" {
+                response["messagePhase"] = json!(phase);
+                response["messageState"] = json!(phase);
+            } else {
+                response["pushPhase"] = json!(phase);
+                response["pushState"] = json!(phase);
             }
         }
         if gate.follow_push && response["messagePhase"] == "relay_accepted" {
             if let Some(operation_id) = response["operationId"].as_str().map(str::to_string) {
                 let sql = self.sql.clone();
                 let project_for_push = project.clone();
+                let operation_for_push = operation_id.clone();
                 let prepared = self
                     .state
                     .block_concurrency_while(async move {
@@ -351,13 +406,54 @@ impl DurableObject for MarmotSender {
                             &sql,
                             storage_key,
                             &project_for_push,
-                            &operation_id,
+                            &operation_for_push,
                             allow_loopback,
+                            false,
                         )
                         .await)
                     })
                     .await?;
-                if let Ok((jobs, phase)) = prepared {
+                let mut prepared = prepared.map_err(|error| Error::RustError(sanitize(&error)))?;
+                if !prepared.discover.is_empty() && !prepared.discovery_relays.is_empty() {
+                    let mut found = Vec::new();
+                    for server in &prepared.discover {
+                        let filter = json!({"kinds": [10050], "authors": [server], "limit": 8});
+                        if let Ok(events) = relay::fetch_events(&prepared.discovery_relays, filter, allow_loopback).await {
+                            found.extend(events);
+                        }
+                    }
+                    let sql = self.sql.clone();
+                    let project_for_inbox = project.clone();
+                    let servers = prepared.discover.clone();
+                    let admitted = self
+                        .state
+                        .block_concurrency_while(async move {
+                            Ok(admit_inboxes(&sql, storage_key, &project_for_inbox, &servers, found, allow_loopback).await)
+                        })
+                        .await?;
+                    let _ = admitted.map_err(|error| Error::RustError(sanitize(&error)))?;
+                    let sql = self.sql.clone();
+                    let project_for_push = project.clone();
+                    let operation_for_push = operation_id.clone();
+                    prepared = self
+                        .state
+                        .block_concurrency_while(async move {
+                            Ok(prepare_push(
+                                &sql,
+                                storage_key,
+                                &project_for_push,
+                                &operation_for_push,
+                                allow_loopback,
+                                true,
+                            )
+                            .await)
+                        })
+                        .await?
+                        .map_err(|error| Error::RustError(sanitize(&error)))?;
+                }
+                let jobs = prepared.jobs;
+                let phase = prepared.phase;
+                if true {
                     if jobs.is_empty() {
                         if let Some(phase) = phase {
                             response["pushPhase"] = json!(phase);
@@ -365,50 +461,137 @@ impl DurableObject for MarmotSender {
                         }
                     }
                     for (event, relays) in jobs {
-                        let outcome = relay::publish_event(&relays, &event, allow_loopback)
-                            .await
-                            .unwrap_or_else(|_| "unobservable".into());
-                        let event_id = event
-                            .get("id")
-                            .and_then(|item| item.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let recorded_event = event_id.clone();
-                        let destination = relays.first().cloned().unwrap_or_default();
-                        let sql = self.sql.clone();
                         let operation_id = response["operationId"]
                             .as_str()
                             .unwrap_or_default()
                             .to_string();
-                        let project_for_ack = project.clone();
-                        let ack = self
-                            .state
-                            .block_concurrency_while(async move {
-                                Ok(acknowledge(
-                                    &sql,
-                                    storage_key,
-                                    &project_for_ack,
-                                    &operation_id,
-                                    "push",
-                                    &outcome,
-                                    &event_id,
-                                    &destination,
-                                )
-                                .await)
-                            })
-                            .await?;
-                        if let Ok(phase) = ack {
-                            if response["pushPhase"] != "relay_accepted" {
-                                response["pushPhase"] = json!(phase);
-                                response["pushState"] = json!(phase);
-                                response["pushEventId"] = json!(recorded_event);
+                        let phase = publish_and_record(
+                            &self.state,
+                            &self.sql,
+                            storage_key,
+                            &project,
+                            &operation_id,
+                            "push",
+                            &relays,
+                            &event,
+                            allow_loopback,
+                        )
+                        .await?;
+                        response["pushPhase"] = json!(phase);
+                        response["pushState"] = json!(phase);
+                        if let Some(event_id) = event.get("id").and_then(|item| item.as_str()) {
+                            if response["pushEventId"].is_null() {
+                                response["pushEventId"] = json!(event_id);
                             }
                         }
                     }
                 }
             }
         }
+        response = apply_projection(
+            &self.state,
+            &self.sql,
+            storage_key,
+            &project,
+            allow_loopback,
+            response,
+        )
+        .await?;
         Response::from_json(&response)
+    }
+}
+
+async fn apply_projection(
+    state: &State,
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    project: &str,
+    allow_loopback: bool,
+    mut response: Value,
+) -> Result<Value> {
+    if let Some(operation_id) = response["operationId"].as_str().map(str::to_owned) {
+        let sql_view = sql.clone();
+        let project_view = project.to_owned();
+        let projected = state
+            .block_concurrency_while(async move {
+                Ok(project_stored(&sql_view, storage_key, &project_view, &operation_id))
+            })
+            .await?;
+        if let Ok(projected) = projected {
+            overlay_projection(&mut response, projected);
+        }
+    }
+    if let Some(map) = response.as_object_mut() {
+        map.remove("publicationRelays");
+        if !allow_loopback {
+            map.remove("welcomes");
+            map.remove("message");
+            map.remove("trigger");
+        }
+    }
+    Ok(response)
+}
+
+fn project_stored(
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    project: &str,
+    operation_id: &str,
+) -> std::result::Result<Value, String> {
+    let (session, _row) = open_account(sql, storage_key, project)?;
+    session
+        .project_operation(operation_id)
+        .map_err(|error| error.to_string())
+}
+
+fn overlay_projection(response: &mut Value, projected: Value) {
+    let Some(map) = response.as_object_mut() else {
+        return;
+    };
+    let Some(projected) = projected.as_object() else {
+        return;
+    };
+    for key in [
+        "ok",
+        "messagePhase",
+        "messageState",
+        "pushPhase",
+        "pushState",
+        "pushEventId",
+        "messageEventId",
+        "disposition",
+        "settled",
+        "retryAfterMs",
+        "retryAtMs",
+        "reconcileAfterMs",
+        "error",
+        "evidence",
+        "phoneDelivery",
+        "pushRetryable",
+        "triggers",
+        "messageAttempts",
+        "messagePublicationAttempts",
+        "messageReconcileAttempts",
+        "unknownAttempts",
+        "tokenWaitAttempts",
+        "pushPublicationAttempts",
+        "unobservableAttempts",
+        "pushAttempts",
+        "operationAgeMs",
+        "startedAtMs",
+        "updatedAtMs",
+        "resubmittable",
+    ] {
+        if key == "evidence" {
+            let kind = projected.get(key).and_then(|value| value.as_str()).unwrap_or("");
+            if kind == "partial_push" || kind == "retired" {
+                map.insert(key.to_owned(), json!(kind));
+            }
+            continue;
+        }
+        if let Some(value) = projected.get(key) {
+            map.insert(key.to_owned(), value.clone());
+        }
     }
 }
 
@@ -435,6 +618,9 @@ async fn execute(
         return establish_plan(sql, storage_key, allow_loopback, project, &command);
     }
     if command.op == "cas_self_test" {
+        if !allow_loopback {
+            return Err("diagnostic commands are test-only".into());
+        }
         return Ok(Gate {
             response: cas_self_test(sql)?,
             publish: None,
@@ -444,6 +630,9 @@ async fn execute(
         });
     }
     if command.op == "stale_write" {
+        if !allow_loopback {
+            return Err("diagnostic commands are test-only".into());
+        }
         return Ok(Gate {
             response: stale_write(sql)?,
             publish: None,
@@ -457,7 +646,7 @@ async fn execute(
     if fault.is_some() && !allow_loopback {
         return Err("fault injection is test-only".into());
     }
-    let (session, created) = open_session(&loaded, storage_key, project, &command)?;
+    let (session, created) = open_session(sql, &loaded, storage_key, project, &command)?;
     if let Some(row) = &loaded {
         let declared = parse_floors(&row.floors)?;
         if declared != floor_map(&session)? {
@@ -468,25 +657,14 @@ async fn execute(
     if fault.as_deref() == Some("before_store") {
         return Err("crash_injected:before_store".into());
     }
-    let revision = advance(&session, loaded.as_ref().map(|row| row.revision as u64))?;
     remember_consistent(&session)?;
-    let floors = floor_map(&session)?;
-    let sealed = session
-        .seal(&storage_key, project)
-        .map_err(|error| error.to_string())?;
-    let writer = writer_id()?;
-    store(
+    commit_account(
         sql,
+        storage_key,
+        project,
+        &session,
         loaded.as_ref().map(|row| row.revision as u64),
-        revision,
-        &writer,
-        &session.public_key_hex(),
-        &floors,
-        &sealed,
     )?;
-    for hook in session.take_commit_hooks() {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
-    }
     let _ = created;
     if fault.as_deref() == Some("after_store") {
         return Ok(Gate {
@@ -523,11 +701,10 @@ fn establish_plan(
     project: &str,
     command: &Command,
 ) -> std::result::Result<Gate, String> {
-    let Some(row) = load(sql)? else {
-        return Err("account is not initialized".into());
-    };
-    let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
-        .map_err(|error| error.to_string())?;
+    if command.fault.is_some() && !allow_loopback {
+        return Err("fault injection is test-only".into());
+    }
+    let (session, _row) = open_account(sql, storage_key, project)?;
     let binding = session.binding().map_err(|error| error.to_string())?;
     let operation = command
         .operation_id
@@ -536,25 +713,17 @@ fn establish_plan(
         .unwrap_or_else(|| "establish".into());
     if binding.group_id_hex.is_some() {
         return Ok(Gate {
-            response: json!({
-                "ok": true,
-                "operationId": operation,
-                "groupBound": true,
-                "groupIdHex": binding.group_id_hex,
-                "pubkey": session.public_key_hex(),
-                "disposition": "settled",
-                "phoneDelivery": false
-            }),
+            response: recovery_response(&session, &operation)?,
             publish: None,
             pull: None,
             hide: false,
             follow_push: false,
         });
     }
-    let relays = if command.relays.is_empty() {
-        binding.relays
-    } else {
+    let relays = if allow_loopback && !command.relays.is_empty() {
         command.relays.clone()
+    } else {
+        binding.relays.clone()
     };
     relay::validate_relays(&relays, allow_loopback)?;
     if binding.recipient_hex.len() != 64 {
@@ -570,8 +739,10 @@ fn establish_plan(
                 "limit": 5
             })],
             relays,
+            streams: vec!["key-packages".into()],
             purpose: "establish".into(),
             operation_id: operation,
+            fault: command.fault.clone(),
         }),
         hide: false,
         follow_push: false,
@@ -586,20 +757,10 @@ async fn establish_from(
     relays: Vec<String>,
     events: Vec<Value>,
 ) -> std::result::Result<Value, String> {
-    let Some(row) = load(sql)? else {
-        return Err("account is not initialized".into());
-    };
-    let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
-        .map_err(|error| error.to_string())?;
+    let (session, row) = open_account(sql, storage_key, project)?;
     let binding = session.binding().map_err(|error| error.to_string())?;
     if binding.group_id_hex.is_some() {
-        return Ok(json!({
-            "ok": true,
-            "operationId": operation_id,
-            "groupBound": true,
-            "groupIdHex": binding.group_id_hex,
-            "disposition": "settled"
-        }));
+        return recovery_response(&session, operation_id);
     }
     let mut package = None;
     for event in events {
@@ -637,31 +798,63 @@ fn sync_plan(
     project: &str,
     command: &Command,
 ) -> std::result::Result<Gate, String> {
-    let Some(row) = load(sql)? else {
-        return Err("account is not initialized".into());
-    };
-    let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
-        .map_err(|error| error.to_string())?;
+    let (session, _row) = open_account(sql, storage_key, project)?;
     let binding = session.binding().map_err(|error| error.to_string())?;
-    let relays = if command.relays.is_empty() {
-        binding.relays
-    } else {
+    let relays = if allow_loopback && !command.relays.is_empty() {
         command.relays.clone()
+    } else {
+        binding.relays.clone()
     };
     relay::validate_relays(&relays, allow_loopback)?;
+    let stored_cursors = session.storage().sync_cursors().map_err(|error| error.to_string())?;
+    let cursors = stored_cursors
+        .iter()
+        .map(|cursor| CursorView {
+            stream: cursor.stream.clone(),
+            since: cursor.since,
+            until: cursor.until,
+            caught_up: cursor.caught_up,
+        })
+        .collect::<Vec<_>>();
     let mut filters = Vec::new();
-    if let Some(group) = binding.nostr_group_hex {
-        filters.push(json!({"kinds": [445], "#h": [group], "limit": 20}));
+    let mut streams = Vec::new();
+    if let Some(group) = binding.nostr_group_hex.clone() {
+        filters.push(cursor_filter(
+            json!({"kinds": [445], "#h": [group.clone()], "limit": 20}),
+            cursor_since(&cursors, "group-445"),
+            cursor_until(&cursors, "group-445"),
+        ));
+        streams.push("group-445".into());
+        filters.push(cursor_filter(
+            json!({"kinds": [447, 448, 449], "#h": [group], "limit": 20}),
+            cursor_since(&cursors, "group-gossip"),
+            cursor_until(&cursors, "group-gossip"),
+        ));
+        streams.push("group-gossip".into());
     }
-    filters.push(json!({"kinds": [1059], "#p": [session.public_key_hex()], "limit": 20}));
+    filters.push(cursor_filter(
+        json!({"kinds": [1059], "#p": [session.public_key_hex()], "limit": 20}),
+        cursor_since(&cursors, "inbox-1059"),
+        cursor_until(&cursors, "inbox-1059"),
+    ));
+    streams.push("inbox-1059".into());
     Ok(Gate {
-        response: json!({}),
+        response: json!({
+            "syncCursors": cursors.iter().map(|cursor| json!({
+                "stream": cursor.stream,
+                "since": cursor.since,
+                "until": cursor.until,
+                "caughtUp": cursor.caught_up
+            })).collect::<Vec<_>>()
+        }),
         publish: None,
         pull: Some(Pull {
             relays,
             filters,
+            streams,
             purpose: "sync".into(),
             operation_id: String::new(),
+            fault: None,
         }),
         hide: false,
         follow_push: false,
@@ -673,36 +866,73 @@ async fn ingest_pulled(
     storage_key: [u8; 32],
     project: &str,
     events: Vec<Value>,
+    stream: &str,
 ) -> std::result::Result<Value, String> {
-    let Some(row) = load(sql)? else {
-        return Err("account is not initialized".into());
-    };
-    let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
-        .map_err(|error| error.to_string())?;
+    let (session, row) = open_account(sql, storage_key, project)?;
     let mut chats = Vec::new();
+    let mut created = Vec::new();
+    let mut failed = false;
     for event in events {
+        let stamp = event.get("created_at").and_then(|value| value.as_u64()).unwrap_or(0);
         match session.ingest_event(event).await {
-            Ok(mut found) => chats.append(&mut found),
-            Err(_) => {}
+            Ok(mut found) => {
+                chats.append(&mut found);
+                created.push(stamp);
+            }
+            Err(_) => failed = true,
         }
     }
-    let revision = advance(&session, Some(row.revision as u64))?;
-    let floors = floor_map(&session)?;
-    let sealed = session.seal(&storage_key, project).map_err(|error| error.to_string())?;
-    let writer = writer_id()?;
-    store(
-        sql,
-        Some(row.revision as u64),
-        revision,
-        &writer,
-        &session.public_key_hex(),
-        &floors,
-        &sealed,
-    )?;
-    Ok(json!({"chats": chats, "ingested": chats.len()}))
+    session
+        .note_sync_page(stream, &created, 20, !failed)
+        .map_err(|error| error.to_string())?;
+    commit_account(sql, storage_key, project, &session, Some(row.revision as u64))?;
+    Ok(json!({
+        "stream": stream,
+        "chats": chats,
+        "ingested": chats.len(),
+        "failed": failed
+    }))
+}
+
+struct CursorView {
+    stream: String,
+    since: u64,
+    until: Option<u64>,
+    caught_up: bool,
+}
+
+fn cursor_since(cursors: &[CursorView], stream: &str) -> u64 {
+    cursors
+        .iter()
+        .find(|cursor| cursor.stream == stream)
+        .map(|cursor| cursor.since)
+        .unwrap_or(0)
+}
+
+fn cursor_until(cursors: &[CursorView], stream: &str) -> Option<u64> {
+    cursors
+        .iter()
+        .find(|cursor| cursor.stream == stream)
+        .and_then(|cursor| cursor.until)
+}
+
+fn cursor_filter(mut filter: Value, since: u64, until: Option<u64>) -> Value {
+    if since == 0 && until.is_none() {
+        return filter;
+    }
+    if let Some(map) = filter.as_object_mut() {
+        if since > 0 {
+            map.insert("since".into(), json!(since));
+        }
+        if let Some(until) = until {
+            map.insert("until".into(), json!(until));
+        }
+    }
+    filter
 }
 
 fn open_session(
+    sql: &SqlStorage,
     loaded: &Option<Row>,
     storage_key: [u8; 32],
     project: &str,
@@ -717,6 +947,7 @@ fn open_session(
                 return Err("sender_identity_mismatch".into());
             }
         }
+        hydrate(sql, &session)?;
         return Ok((session, false));
     }
     if command.op != "onboard" && command.op != "init" {
@@ -726,6 +957,7 @@ fn open_session(
         Some(secret) => Session::import(parse_secret(secret)?).map_err(|error| error.to_string())?,
         None => Session::generate().map_err(|error| error.to_string())?,
     };
+    hydrate(sql, &session)?;
     Ok((session, true))
 }
 
@@ -775,19 +1007,20 @@ async fn dispatch(
                 }),
             ))
         }
-        "key_package" => {
-            let package = session
-                .fresh_key_package()
+        "key_package" | "maintain" => {
+            let event = session
+                .ensure_key_package_event()
                 .await
                 .map_err(|error| error.to_string())?;
-            let event = session
-                .signed_key_package_event(&package)
-                .map_err(|error| error.to_string())?;
+            let bytes_hex = Session::encoded_package_hex(&event).map_err(|error| error.to_string())?;
             Ok(json!({
-                "bytesHex": hex::encode(package.bytes),
+                "ok": true,
+                "operationId": "key-package",
+                "bytesHex": bytes_hex,
                 "protocolProfile": "current",
                 "pubkey": session.public_key_hex(),
-                "event": event
+                "event": event,
+                "maintenance": "republish_stored_key_package"
             }))
         }
         "create_group" => {
@@ -978,6 +1211,8 @@ async fn dispatch(
             } else {
                 0
             };
+            let onboarding = session.onboarding_view().map_err(|error| error.to_string())?;
+            let (used, remaining) = session.storage().tombstone_status().map_err(|error| error.to_string())?;
             Ok(json!({
                 "ok": true,
                 "account": true,
@@ -985,6 +1220,9 @@ async fn dispatch(
                 "groupBound": binding.group_id_hex.is_some(),
                 "recipient": binding.recipient_hex,
                 "recipientTokenCount": tokens,
+                "onboarding": onboarding,
+                "historicalOperations": used,
+                "historicalCapacityRemaining": remaining,
                 "phoneDelivery": false
             }))
         }
@@ -1040,10 +1278,10 @@ fn publish_job(
     {
         return Ok(None);
     }
-    let relays = if command.relays.is_empty() {
-        session.binding().map_err(|error| error.to_string())?.relays
-    } else {
+    let relays = if allow_loopback && !command.relays.is_empty() {
         command.relays.clone()
+    } else {
+        session.binding().map_err(|error| error.to_string())?.relays
     };
     relay::validate_relays(&relays, allow_loopback)?;
     let operation_id = body
@@ -1053,7 +1291,7 @@ fn publish_job(
         .to_owned();
     let event = if command.op == "stage_push" {
         body.get("trigger").cloned().unwrap_or(Value::Null)
-    } else if command.op == "key_package" {
+    } else if command.op == "key_package" || command.op == "maintain" {
         body.get("event").cloned().unwrap_or(Value::Null)
     } else if let Some(message) = body.get("message") {
         let message: TransportMessage = serde_json::from_value(message.clone()).map_err(|error| error.to_string())?;
@@ -1077,26 +1315,130 @@ fn publish_job(
     }))
 }
 
+async fn publish_and_record(
+    state: &State,
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    project: &str,
+    operation_id: &str,
+    kind: &str,
+    relays: &[String],
+    event: &Value,
+    allow_loopback: bool,
+) -> Result<String> {
+    let event_id = event
+        .get("id")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    if event_id.is_empty() {
+        return Err(Error::RustError("event id is missing".into()));
+    }
+    let attempt_id = publication::new_attempt_id();
+    let destination = relays.first().cloned().unwrap_or_default();
+    let sql_begin = sql.clone();
+    let project_begin = project.to_owned();
+    let operation_begin = operation_id.to_owned();
+    let kind_begin = kind.to_owned();
+    let attempt_begin = attempt_id.clone();
+    let event_begin = event_id.clone();
+    let destination_begin = destination.clone();
+    let started = state
+        .block_concurrency_while(async move {
+            Ok(begin_attempt(
+                &sql_begin,
+                storage_key,
+                &project_begin,
+                &operation_begin,
+                &kind_begin,
+                &attempt_begin,
+                &event_begin,
+                &destination_begin,
+            )
+            .await)
+        })
+        .await?;
+    let started = started.map_err(|error| Error::RustError(sanitize(&error)))?;
+    if !started {
+        return Ok("relay_accepted".into());
+    }
+    let publication = match relay::publish_event(relays, event, allow_loopback, &attempt_id).await {
+        Ok(publication) => publication,
+        Err(error) => relay::RelayPublication {
+            event_id: event_id.clone(),
+            attempt_id: attempt_id.clone(),
+            outcome: "unobservable".into(),
+            relay: destination.clone(),
+            reason: if error.contains("timed out") {
+                "publication_timeout".into()
+            } else {
+                "relay_disconnected".into()
+            },
+            retryable: true,
+            started_ms: 0,
+            finished_ms: 0,
+        },
+    };
+    let sql_ack = sql.clone();
+    let project_ack = project.to_owned();
+    let operation_ack = operation_id.to_owned();
+    let kind_ack = kind.to_owned();
+    let phase = state
+        .block_concurrency_while(async move {
+            Ok(acknowledge(
+                &sql_ack,
+                storage_key,
+                &project_ack,
+                &operation_ack,
+                &kind_ack,
+                publication,
+            )
+            .await)
+        })
+        .await?;
+    phase.map_err(|error| Error::RustError(sanitize(&error)))
+}
+
+async fn begin_attempt(
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    project: &str,
+    operation_id: &str,
+    kind: &str,
+    attempt_id: &str,
+    event_id: &str,
+    destination: &str,
+) -> std::result::Result<bool, String> {
+    let (session, row) = open_account(sql, storage_key, project)?;
+    let role = if kind == "push" { "push" } else { "message" };
+    let started = session
+        .begin_network_attempt(operation_id, role, attempt_id, event_id, destination)
+        .map_err(|error| error.to_string())?;
+    if started {
+        persist_session(sql, storage_key, project, &session, row.revision as u64)?;
+    }
+    Ok(started)
+}
+
 async fn acknowledge(
     sql: &SqlStorage,
     storage_key: [u8; 32],
     project: &str,
     operation_id: &str,
     kind: &str,
-    outcome: &str,
-    event_id: &str,
-    destination: &str,
+    publication: relay::RelayPublication,
 ) -> std::result::Result<String, String> {
-    let Some(row) = load(sql)? else {
-        return Err("account is not initialized".into());
-    };
-    let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
-        .map_err(|error| error.to_string())?;
+    let (session, row) = open_account(sql, storage_key, project)?;
     let phase = if kind == "push" {
-        let phase = match outcome {
+        let phase = match publication.outcome.as_str() {
             "relay_accepted" => "relay_accepted",
             "rejected" => "rejected",
             _ => "unobservable",
+        };
+        let reason = if phase == "unobservable" && !publication.retryable {
+            "push_unobservable"
+        } else {
+            publication.reason.as_str()
         };
         if let Some(stored) = session
             .storage()
@@ -1107,35 +1449,37 @@ async fn acknowledge(
                 let prepared = push_event_ids(bytes);
                 if phase == "relay_accepted"
                     && !prepared.is_empty()
-                    && !prepared.iter().any(|item| item == event_id)
+                    && !prepared.iter().any(|item| item == &publication.event_id)
                 {
                     return Err("push acknowledgement does not match the prepared trigger".into());
                 }
             }
         }
         session
-            .note_push(operation_id, phase, Some(event_id.to_owned()))
-            .map_err(|error| error.to_string())?;
-        phase.to_owned()
+            .note_trigger(
+                operation_id,
+                phase,
+                &publication.event_id,
+                &publication.relay,
+                &publication.attempt_id,
+                reason,
+                "",
+            )
+            .map_err(|error| error.to_string())?
     } else {
-        let message_outcome = match outcome {
+        let message_outcome = match publication.outcome.as_str() {
             "relay_accepted" => "relay_accepted",
             "rejected" => "rejected",
             _ => "completion_unknown",
         };
-        let already_accepted = session
-            .storage()
-            .publication(operation_id)
-            .map_err(|error| error.to_string())?
-            .map(|stored| stored.message_phase == "relay_accepted")
-            .unwrap_or(false);
-        if !already_accepted {
-            session
-                .mark_message_publication(operation_id)
-                .map_err(|error| error.to_string())?;
-        }
         session
-            .note_message_outcome(operation_id, message_outcome, event_id, destination, event_id)
+            .note_message_outcome(
+                operation_id,
+                message_outcome,
+                &publication.event_id,
+                &publication.relay,
+                &publication.attempt_id,
+            )
             .await
             .map_err(|error| error.to_string())?;
         session
@@ -1177,13 +1521,33 @@ fn persist_session(
     session: &Session,
     revision: u64,
 ) -> std::result::Result<(), String> {
-    let next = advance(session, Some(revision))?;
+    commit_account(sql, storage_key, project, session, Some(revision))
+}
+
+fn commit_account(
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    project: &str,
+    session: &Session,
+    expected: Option<u64>,
+) -> std::result::Result<(), String> {
+    let indexed = read_operation_index(sql)?;
+    session
+        .storage()
+        .install_indexed_tombstones(indexed)
+        .map_err(|error| error.to_string())?;
+    let stones = session
+        .storage()
+        .export_tombstones()
+        .map_err(|error| error.to_string())?;
+    write_operation_index(sql, &stones)?;
+    let next = advance(session, expected)?;
     let floors = floor_map(session)?;
     let sealed = session.seal(&storage_key, project).map_err(|error| error.to_string())?;
     let writer = writer_id()?;
     store(
         sql,
-        Some(revision),
+        expected,
         next,
         &writer,
         &session.public_key_hex(),
@@ -1196,59 +1560,352 @@ fn persist_session(
     Ok(())
 }
 
+struct PushWork {
+    jobs: Vec<(Value, Vec<String>)>,
+    discover: Vec<String>,
+    discovery_relays: Vec<String>,
+    phase: Option<String>,
+}
+
+fn empty_push(phase: Option<String>) -> PushWork {
+    PushWork {
+        jobs: Vec::new(),
+        discover: Vec::new(),
+        discovery_relays: Vec::new(),
+        phase,
+    }
+}
+
 async fn prepare_push(
     sql: &SqlStorage,
     storage_key: [u8; 32],
     project: &str,
     operation_id: &str,
     allow_loopback: bool,
-) -> std::result::Result<(Vec<(Value, Vec<String>)>, Option<String>), String> {
-    let Some(row) = load(sql)? else {
-        return Err("account is not initialized".into());
-    };
-    let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
-        .map_err(|error| error.to_string())?;
+    rediscovery: bool,
+) -> std::result::Result<PushWork, String> {
+    let (session, row) = open_account(sql, storage_key, project)?;
     let stored = session
         .storage()
         .publication(operation_id)
         .map_err(|error| error.to_string())?
         .ok_or("publication missing")?;
     if stored.message_phase != "relay_accepted" {
-        return Ok((Vec::new(), Some(stored.push_phase)));
+        return Ok(empty_push(Some(stored.push_phase)));
     }
     if stored.push_phase == "relay_accepted" {
-        return Ok((Vec::new(), Some("relay_accepted".into())));
-    }
-    if let Some(bytes) = stored.push_trigger.as_deref() {
-        if let Some(jobs) = stored_push_jobs(bytes) {
-            return Ok((jobs, None));
-        }
+        return Ok(empty_push(Some("relay_accepted".into())));
     }
     let binding = session.binding().map_err(|error| error.to_string())?;
-    let Some(group_hex) = binding.group_id_hex else {
+    let discovery_relays = binding.relays.clone();
+    let now = js_sys::Date::now() as u64;
+    let directories = session
+        .storage()
+        .server_relays()
+        .map_err(|error| error.to_string())?;
+    let Some(group_hex) = binding.group_id_hex.clone() else {
         session
             .note_token_wait(operation_id)
             .map_err(|error| error.to_string())?;
         persist_session(sql, storage_key, project, &session, row.revision as u64)?;
-        return Ok((Vec::new(), Some("token_unavailable".into())));
+        return Ok(empty_push(Some("token_unavailable".into())));
     };
     let tokens = session
         .select_push_tokens(&decode_group(Some(group_hex))?)
         .map_err(|error| error.to_string())?;
+    if let Some(bytes) = stored.push_trigger.as_deref() {
+        if let Ok(envelope) = serde_json::from_slice::<Value>(bytes) {
+            if envelope.get(0).and_then(|item| item.get("event")).is_some() {
+                return retry_stored_push(
+                    sql,
+                    storage_key,
+                    project,
+                    operation_id,
+                    allow_loopback,
+                    rediscovery,
+                    session,
+                    row.revision as u64,
+                    &tokens,
+                    &directories,
+                    &discovery_relays,
+                    envelope,
+                    now,
+                )
+                .await;
+            }
+        }
+    }
     if tokens.is_empty() {
         session
             .note_token_wait(operation_id)
             .map_err(|error| error.to_string())?;
         persist_session(sql, storage_key, project, &session, row.revision as u64)?;
-        return Ok((Vec::new(), Some("token_unavailable".into())));
+        return Ok(empty_push(Some("token_unavailable".into())));
     }
-    let directories = session
-        .storage()
-        .server_relays()
-        .map_err(|error| error.to_string())?;
-    let mut order = Vec::new();
-    let mut grouped: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+    let mut jobs = Vec::new();
+    let mut envelope = Vec::new();
+    let mut discover = Vec::new();
+    let mut grouped: HashMap<String, Vec<(Vec<u8>, String)>> = HashMap::new();
     let mut hints: HashMap<String, Vec<String>> = HashMap::new();
+    let mut order = Vec::new();
+    for wake in &tokens {
+        if !grouped.contains_key(&wake.server_pubkey_hex) {
+            order.push(wake.server_pubkey_hex.clone());
+        }
+        if let Some(hint) = wake.relay_hint.clone() {
+            if relay::validate_relay(&hint, allow_loopback).is_ok() {
+                let entry = hints.entry(wake.server_pubkey_hex.clone()).or_default();
+                if !entry.contains(&hint) {
+                    entry.push(hint);
+                }
+            }
+        }
+        grouped
+            .entry(wake.server_pubkey_hex.clone())
+            .or_default()
+            .push((wake.encrypted_token.clone(), wake.token_fingerprint.clone()));
+    }
+    for server in order {
+        let mut relays = hints.remove(&server).unwrap_or_default();
+        if relays.is_empty() {
+            match cached_inbox(&directories, &server, now, allow_loopback) {
+                Some(found) if !found.is_empty() => relays = found,
+                Some(_) => continue,
+                None => {
+                    discover.push(server);
+                    continue;
+                }
+            }
+        }
+        let batch = grouped.remove(&server).unwrap_or_default();
+        let mut offset = 0;
+        while offset < batch.len() {
+            let end = (offset + 18).min(batch.len());
+            let slice = &batch[offset..end];
+            let ciphertexts = slice.iter().map(|(token, _)| token.clone()).collect::<Vec<_>>();
+            let fingerprints = slice.iter().map(|(_, fingerprint)| fingerprint.clone()).collect::<Vec<_>>();
+            let event = notification_gift_wrap(&server, &ciphertexts)
+                .await
+                .map_err(|error| error.to_string())?;
+            let event = serde_json::to_value(&event).map_err(|error| error.to_string())?;
+            envelope.push(json!({
+                "event": event,
+                "relays": relays,
+                "server": server,
+                "fingerprints": fingerprints,
+                "phase": "prepared"
+            }));
+            jobs.push((event, relays.clone()));
+            offset = end;
+        }
+    }
+    if !discover.is_empty() && !rediscovery {
+        if !envelope.is_empty() {
+            let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
+            session
+                .stage_push(operation_id, &bytes)
+                .map_err(|error| error.to_string())?;
+            persist_session(sql, storage_key, project, &session, row.revision as u64)?;
+        }
+        return Ok(PushWork {
+            jobs: Vec::new(),
+            discover,
+            discovery_relays,
+            phase: None,
+        });
+    }
+    if jobs.is_empty() {
+        session
+            .note_push(operation_id, "unobservable", None)
+            .map_err(|error| error.to_string())?;
+        persist_session(sql, storage_key, project, &session, row.revision as u64)?;
+        return Ok(empty_push(Some("unobservable".into())));
+    }
+    let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
+    session
+        .stage_push(operation_id, &bytes)
+        .map_err(|error| error.to_string())?;
+    persist_session(sql, storage_key, project, &session, row.revision as u64)?;
+    Ok(PushWork {
+        jobs,
+        discover: Vec::new(),
+        discovery_relays,
+        phase: None,
+    })
+}
+
+fn cached_inbox(
+    directories: &[ServerRelays],
+    server: &str,
+    now: u64,
+    allow_loopback: bool,
+) -> Option<Vec<String>> {
+    let found = directories.iter().find(|item| item.server_pubkey_hex == server)?;
+    if !inbox::cache_fresh(found.observed_at_ms, now) {
+        return None;
+    }
+    if found.negative {
+        return Some(Vec::new());
+    }
+    Some(
+        found
+            .relays
+            .iter()
+            .filter(|url| relay::validate_relay(url, allow_loopback).is_ok())
+            .cloned()
+            .collect(),
+    )
+}
+
+async fn retry_stored_push(
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    project: &str,
+    operation_id: &str,
+    allow_loopback: bool,
+    rediscovery: bool,
+    session: Session,
+    revision: u64,
+    tokens: &[marmot_worker_runtime::StoredWake],
+    directories: &[ServerRelays],
+    discovery_relays: &[String],
+    envelope: Value,
+    now: u64,
+) -> std::result::Result<PushWork, String> {
+    let authorized = tokens
+        .iter()
+        .map(|wake| wake.token_fingerprint.clone())
+        .collect::<HashSet<_>>();
+    let (updated, jobs, _uncovered) = revalidate_trigger_envelope(&envelope, &authorized);
+    let mut publish = Vec::new();
+    let mut discover = Vec::new();
+    let mut updated = updated;
+    if let Some(items) = updated.as_array_mut() {
+        for item in items.iter_mut() {
+            let phase = item.get("phase").and_then(|value| value.as_str()).unwrap_or("prepared");
+            if phase == "relay_accepted" || phase == "retired" {
+                continue;
+            }
+            let server = item
+                .get("server")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let event = item.get("event").cloned().unwrap_or(Value::Null);
+            if event.get("id").is_none() {
+                continue;
+            }
+            let mut relays = item
+                .get("relays")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_owned))
+                        .filter(|url| relay::validate_relay(url, allow_loopback).is_ok())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let failed = phase == "unobservable" || phase == "publication_attempted";
+            if failed && !rediscovery {
+                if !server.is_empty() && !discover.contains(&server) {
+                    discover.push(server);
+                }
+                continue;
+            }
+            if rediscovery {
+                if let Some(found) = cached_inbox(directories, &server, now, allow_loopback) {
+                    if !found.is_empty() {
+                        relays = found;
+                        if let Some(map) = item.as_object_mut() {
+                            map.insert("relays".into(), json!(relays));
+                        }
+                    }
+                }
+            }
+            if relays.is_empty() {
+                if !server.is_empty() && !discover.contains(&server) {
+                    discover.push(server);
+                }
+                continue;
+            }
+            let _ = jobs;
+            publish.push((event, relays));
+        }
+    }
+    let covered = fingerprint_set(&updated);
+    let missing = tokens
+        .iter()
+        .filter(|wake| !covered.contains(&wake.token_fingerprint))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let (extra_jobs, extra_items, extra_discover) =
+            build_trigger_batches(&missing, directories, allow_loopback, now, rediscovery).await?;
+        publish.extend(extra_jobs);
+        discover.extend(extra_discover);
+        if let Some(items) = updated.as_array_mut() {
+            items.extend(extra_items);
+        }
+    }
+    let bytes = serde_json::to_vec(&updated).map_err(|error| error.to_string())?;
+    session
+        .replace_push_envelope(operation_id, &bytes)
+        .map_err(|error| error.to_string())?;
+    persist_session(sql, storage_key, project, &session, revision)?;
+    if !discover.is_empty() && !rediscovery {
+        return Ok(PushWork {
+            jobs: Vec::new(),
+            discover,
+            discovery_relays: discovery_relays.to_vec(),
+            phase: None,
+        });
+    }
+    if publish.is_empty() && tokens.is_empty() {
+        return Ok(empty_push(Some("token_unavailable".into())));
+    }
+    Ok(PushWork {
+        jobs: publish,
+        discover: Vec::new(),
+        discovery_relays: discovery_relays.to_vec(),
+        phase: None,
+    })
+}
+
+fn fingerprint_set(envelope: &Value) -> HashSet<String> {
+    let mut covered = HashSet::new();
+    let Some(items) = envelope.as_array() else {
+        return covered;
+    };
+    for item in items {
+        let phase = item.get("phase").and_then(|value| value.as_str()).unwrap_or("");
+        if phase == "retired" {
+            continue;
+        }
+        if let Some(values) = item.get("fingerprints").and_then(|value| value.as_array()) {
+            for value in values {
+                if let Some(fingerprint) = value.as_str() {
+                    covered.insert(fingerprint.to_owned());
+                }
+            }
+        }
+    }
+    covered
+}
+
+async fn build_trigger_batches(
+    tokens: &[marmot_worker_runtime::StoredWake],
+    directories: &[ServerRelays],
+    allow_loopback: bool,
+    now: u64,
+    rediscovery: bool,
+) -> std::result::Result<(Vec<(Value, Vec<String>)>, Vec<Value>, Vec<String>), String> {
+    let mut jobs = Vec::new();
+    let mut envelope = Vec::new();
+    let mut discover = Vec::new();
+    let mut grouped: HashMap<String, Vec<(Vec<u8>, String)>> = HashMap::new();
+    let mut hints: HashMap<String, Vec<String>> = HashMap::new();
+    let mut order = Vec::new();
     for wake in tokens {
         if !grouped.contains_key(&wake.server_pubkey_hex) {
             order.push(wake.server_pubkey_hex.clone());
@@ -1262,75 +1919,185 @@ async fn prepare_push(
             }
         }
         grouped
-            .entry(wake.server_pubkey_hex)
+            .entry(wake.server_pubkey_hex.clone())
             .or_default()
-            .push(wake.encrypted_token);
+            .push((wake.encrypted_token.clone(), wake.token_fingerprint.clone()));
     }
-    let mut jobs = Vec::new();
-    let mut envelope = Vec::new();
     for server in order {
         let mut relays = hints.remove(&server).unwrap_or_default();
         if relays.is_empty() {
-            if let Some(found) = directories.iter().find(|item| item.server_pubkey_hex == server && !item.negative) {
-                relays = found
-                    .relays
-                    .iter()
-                    .filter(|url| relay::validate_relay(url, allow_loopback).is_ok())
-                    .cloned()
-                    .collect();
+            match cached_inbox(directories, &server, now, allow_loopback) {
+                Some(found) if !found.is_empty() => relays = found,
+                Some(_) => continue,
+                None if !rediscovery => {
+                    discover.push(server);
+                    continue;
+                }
+                None => continue,
             }
         }
-        if relays.is_empty() {
-            continue;
-        }
-        let tokens = grouped.remove(&server).unwrap_or_default();
+        let batch = grouped.remove(&server).unwrap_or_default();
         let mut offset = 0;
-        while offset < tokens.len() {
-            let end = (offset + 18).min(tokens.len());
-            let event = notification_gift_wrap(&server, &tokens[offset..end])
+        while offset < batch.len() {
+            let end = (offset + 18).min(batch.len());
+            let slice = &batch[offset..end];
+            let ciphertexts = slice.iter().map(|(token, _)| token.clone()).collect::<Vec<_>>();
+            let fingerprints = slice
+                .iter()
+                .map(|(_, fingerprint)| fingerprint.clone())
+                .collect::<Vec<_>>();
+            let event = notification_gift_wrap(&server, &ciphertexts)
                 .await
                 .map_err(|error| error.to_string())?;
             let event = serde_json::to_value(&event).map_err(|error| error.to_string())?;
-            envelope.push(json!({"event": event, "relays": relays}));
+            envelope.push(json!({
+                "event": event,
+                "relays": relays,
+                "server": server,
+                "fingerprints": fingerprints,
+                "phase": "prepared"
+            }));
             jobs.push((event, relays.clone()));
             offset = end;
         }
     }
-    if jobs.is_empty() {
-        session
-            .note_push(operation_id, "unobservable", None)
-            .map_err(|error| error.to_string())?;
-        persist_session(sql, storage_key, project, &session, row.revision as u64)?;
-        return Ok((Vec::new(), Some("unobservable".into())));
-    }
-    let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
-    session
-        .stage_push(operation_id, &bytes)
-        .map_err(|error| error.to_string())?;
-    persist_session(sql, storage_key, project, &session, row.revision as u64)?;
-    Ok((jobs, None))
+    Ok((jobs, envelope, discover))
 }
 
-fn stored_push_jobs(bytes: &[u8]) -> Option<Vec<(Value, Vec<String>)>> {
-    let value: Value = serde_json::from_slice(bytes).ok()?;
-    let items = value.as_array()?;
-    if items.is_empty() || items.iter().any(|item| item.get("event").is_none()) {
-        return None;
+fn open_account(
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    project: &str,
+) -> std::result::Result<(Session, Row), String> {
+    let row = load(sql)?.ok_or_else(|| "account is not initialized".to_owned())?;
+    let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
+        .map_err(|error| error.to_string())?;
+    hydrate(sql, &session)?;
+    Ok((session, row))
+}
+
+fn hydrate(sql: &SqlStorage, session: &Session) -> std::result::Result<(), String> {
+    let rows = read_operation_index(sql)?;
+    session
+        .storage()
+        .install_indexed_tombstones(rows)
+        .map_err(|error| error.to_string())
+}
+
+fn recovery_response(session: &Session, requested_operation: &str) -> std::result::Result<Value, String> {
+    let binding = session.binding().map_err(|error| error.to_string())?;
+    let view = session.onboarding_view().map_err(|error| error.to_string())?;
+    let welcome = session
+        .storage()
+        .welcome_publication()
+        .map_err(|error| error.to_string())?;
+    let relays = if binding.welcome_relays.is_empty() {
+        binding.relays.clone()
+    } else {
+        binding.welcome_relays.clone()
+    };
+    let operation_id = welcome
+        .as_ref()
+        .map(|row| row.alert_id.clone())
+        .unwrap_or_else(|| requested_operation.to_owned());
+    let ready = view
+        .get("conversationReady")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let mut body = json!({
+        "ok": true,
+        "operationId": operation_id,
+        "requestedOperationId": requested_operation,
+        "groupBound": true,
+        "groupIdHex": binding.group_id_hex,
+        "groupPersisted": binding.group_id_hex.is_some(),
+        "onboarding": view,
+        "publicationRelays": relays,
+        "disposition": if ready { "settled" } else { "reconcile" },
+        "settled": ready,
+        "phoneDelivery": false
+    });
+    if let Some(row) = welcome {
+        let republish = row.message_phase != "relay_accepted" && row.message_phase != "rejected";
+        if republish {
+            let welcomes = if row.welcomes.is_empty() {
+                vec![row.message.clone()]
+            } else {
+                row.welcomes.clone()
+            };
+            body["welcomes"] = serde_json::to_value(&welcomes).map_err(|error| error.to_string())?;
+        }
+        body["messagePhase"] = json!(row.message_phase);
+        body["messageState"] = json!(row.message_phase);
+    } else {
+        body["completion"] = json!("unknown");
+        body["error"] = json!("onboarding_completion_unknown");
     }
-    Some(
-        items
-            .iter()
-            .filter_map(|item| {
-                let relays = item
-                    .get("relays")?
-                    .as_array()?
-                    .iter()
-                    .filter_map(|relay| relay.as_str().map(str::to_owned))
-                    .collect();
-                Some((item.get("event")?.clone(), relays))
-            })
-            .collect(),
-    )
+    Ok(body)
+}
+
+async fn admit_inboxes(
+    sql: &SqlStorage,
+    storage_key: [u8; 32],
+    project: &str,
+    servers: &[String],
+    events: Vec<Value>,
+    allow_loopback: bool,
+) -> std::result::Result<(), String> {
+    let (session, row) = open_account(sql, storage_key, project)?;
+    let now = js_sys::Date::now() as u64;
+    let mut directories = session.storage().server_relays().map_err(|error| error.to_string())?;
+    for server in servers {
+        directories.retain(|item| item.server_pubkey_hex != *server);
+        match inbox::select_inbox(&events, server, allow_loopback) {
+            InboxChoice::Relays { relays, .. } => directories.push(ServerRelays {
+                server_pubkey_hex: server.clone(),
+                relays,
+                observed_at_ms: now,
+                negative: false,
+            }),
+            InboxChoice::Negative => directories.push(ServerRelays {
+                server_pubkey_hex: server.clone(),
+                relays: Vec::new(),
+                observed_at_ms: now,
+                negative: true,
+            }),
+        }
+    }
+    session
+        .storage()
+        .put_server_relays(directories)
+        .map_err(|error| error.to_string())?;
+    persist_session(sql, storage_key, project, &session, row.revision as u64)?;
+    Ok(())
+}
+
+fn read_operation_index(sql: &SqlStorage) -> std::result::Result<Vec<OperationTombstone>, String> {
+    let cursor = sql
+        .exec("SELECT record FROM marmot_operation", None)
+        .map_err(|error| error.to_string())?;
+    let mut raw = cursor.raw();
+    let mut rows = Vec::new();
+    while let Some(values) = raw.next() {
+        let values = values.map_err(|error| error.to_string())?;
+        let record = sql_string(values.first().ok_or("deduplication state is corrupt")?)?;
+        let stone = serde_json::from_str::<OperationTombstone>(&record)
+            .map_err(|_| "deduplication state is corrupt".to_owned())?;
+        rows.push(stone);
+    }
+    Ok(rows)
+}
+
+fn write_operation_index(sql: &SqlStorage, stones: &[OperationTombstone]) -> std::result::Result<(), String> {
+    for stone in stones {
+        let record = serde_json::to_string(stone).map_err(|error| error.to_string())?;
+        sql.exec(
+            "INSERT OR REPLACE INTO marmot_operation (alert_id, record) VALUES (?, ?)",
+            vec![stone.alert_id.clone().into(), record.into()],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 async fn read_limited(req: &mut Request) -> Result<Vec<u8>> {
@@ -1416,19 +2183,22 @@ fn outcome(
 }
 
 fn status(sql: &SqlStorage, storage_key: [u8; 32], project: &str) -> std::result::Result<Value, String> {
-    let Some(row) = load(sql)? else {
+    if load(sql)?.is_none() {
         return Ok(json!({
             "ready": false,
             "revision": null,
             "pubkey": null,
             "groups": 0,
-            "databaseBytes": sql.database_size()
+            "databaseBytes": sql.database_size(),
+            "historicalOperations": 0,
+            "historicalCapacityRemaining": 4096
         }));
-    };
-    let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
-        .map_err(|error| error.to_string())?;
+    }
+    let (session, row) = open_account(sql, storage_key, project)?;
     let groups = session.storage().list_groups().map_err(|error| error.to_string())?.len();
     let binding = session.binding().map_err(|error| error.to_string())?;
+    let onboarding = session.onboarding_view().map_err(|error| error.to_string())?;
+    let (used, remaining) = session.storage().tombstone_status().map_err(|error| error.to_string())?;
     Ok(json!({
         "ready": true,
         "revision": row.revision,
@@ -1436,6 +2206,9 @@ fn status(sql: &SqlStorage, storage_key: [u8; 32], project: &str) -> std::result
         "groups": groups,
         "projectId": binding.project_id,
         "recipient": binding.recipient_hex,
+        "onboarding": onboarding,
+        "historicalOperations": used,
+        "historicalCapacityRemaining": remaining,
         "databaseBytes": sql.database_size()
     }))
 }
