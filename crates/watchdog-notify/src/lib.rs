@@ -19,9 +19,10 @@ pub use nip17::{
     Nip17Error,
 };
 pub use nip17_flow::{
-    auth_frame, definitive_negative, discovery_relays, fold_discovery, interpret_cache,
-    parse_relay_frame, partial_failure, publication_relays, verify_frames, CacheDecision,
-    DiscoveryFold, InboxFrames, RelayControl, MAX_DISCOVERY_RELAYS,
+    auth_event_id, auth_frame, definitive_negative, discovery_relays, fold_discovery,
+    interpret_cache, parse_relay_frame, partial_failure, publication_relays, verify_frames,
+    AuthPolicy, AuthSession, CacheDecision, DiscoveryFold, InboxFrames, RelayControl, SessionStep,
+    MAX_AUTH_CHALLENGES, MAX_DISCOVERY_RELAYS,
 };
 
 pub const MARMOT_ENGINE_STATUS: &str = "native_mdk_not_linked";

@@ -12,9 +12,13 @@ mod sqlite;
 
 pub use contract::OperationalStore;
 pub use model::{
-    CommitOutcome, FailedAlert, HeartbeatStored, LoadedMemory, MarmotProjectRow, OutboxRow,
-    StoreError, UpstreamRow, VersionRow,
+    ClaimOwnership, CommitOutcome, FailedAlert, HeartbeatStored, HeartbeatWrite, LoadedMemory,
+    MarmotDiagnostics, MarmotProjectRow, OnboardReceipt, OutboxRow, RetryMode, StoreError,
+    UpstreamRow, VersionRow,
 };
-pub use schema::{schema_status, MIGRATIONS, SCHEMA_VERSION};
+pub use schema::{
+    schema_status, MIGRATIONS, REQUIRED_COLUMNS, REQUIRED_INDEXES, SCHEMA_VERSION,
+    SETTLEMENT_PREDICATE,
+};
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;

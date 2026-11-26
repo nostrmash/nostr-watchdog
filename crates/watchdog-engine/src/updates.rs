@@ -38,7 +38,8 @@ pub async fn run_update_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C
     http: &H,
     notifier: &N,
     now: i64,
-    _clock: &C,
+    clock: &C,
+    deadline_ms: i64,
 ) -> Result<(), watchdog_store::StoreError> {
     if !settings.enabled {
         return Ok(());
@@ -51,7 +52,7 @@ pub async fn run_update_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C
         return Ok(());
     }
     store
-        .mark_run("updates", Some(now), None, None, None)
+        .mark_run("updates", &owner, Some(now), None, None, None)
         .await?;
     let mut failed = 0;
     let mut incomplete = 0;
@@ -61,6 +62,16 @@ pub async fn run_update_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C
         let Some(vendor) = monitor.version_vendor else {
             continue;
         };
+        let renew_at = clock.unix_ms();
+        if deadline_ms.saturating_sub(renew_at) < settings.timeout_ms {
+            break;
+        }
+        if !store
+            .renew_lease("updates", &owner, renew_at + 600_000, renew_at)
+            .await?
+        {
+            break;
+        }
         let outcome = match check_vendor(store, settings, get, http, &monitor, vendor, now).await {
             Ok(outcome) => outcome,
             Err(_) => Outcome {
@@ -74,6 +85,9 @@ pub async fn run_update_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C
                 releases_rate_limited: false,
                 advisories_rate_limited: false,
                 checked_at: now,
+                alerts: Vec::new(),
+                version: None,
+                version_generation: 0,
             },
         };
         match outcome.coverage {
@@ -108,16 +122,18 @@ pub async fn run_update_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C
     } else {
         None
     };
+    let finished = clock.unix_ms();
     store
         .mark_run(
             "updates",
-            None,
+            &owner,
             Some(now),
+            Some(finished),
             error,
-            error.is_none().then_some(now),
+            error.is_none().then_some(finished),
         )
         .await?;
-    store.release_lease("updates", &owner, now).await?;
+    store.release_lease("updates", &owner, finished).await?;
     Ok(())
 }
 
@@ -132,6 +148,9 @@ struct Outcome {
     releases_rate_limited: bool,
     advisories_rate_limited: bool,
     checked_at: i64,
+    alerts: Vec<AlertDraft>,
+    version: Option<VersionRow>,
+    version_generation: i64,
 }
 
 async fn check_vendor<S: OperationalStore, H: HttpClient>(
@@ -310,30 +329,23 @@ async fn check_vendor<S: OperationalStore, H: HttpClient>(
     let latest_url = latest
         .map(|item| item.url.clone())
         .or_else(|| previous.as_ref().and_then(|row| row.latest_url.clone()));
-    for alert in &alerts {
-        store.insert_alert(alert, now).await?;
-    }
-    store
-        .write_version(
-            monitor.id,
-            &VersionRow {
-                installed: installed.clone(),
-                latest: latest_kept,
-                latest_url,
-                security_status: status.as_str().to_string(),
-                advisory_fingerprint: Some(if status == SecurityStatus::Unknown {
-                    previous
-                        .and_then(|row| row.advisory_fingerprint)
-                        .unwrap_or(fingerprint.clone())
-                } else {
-                    fingerprint.clone()
-                }),
-                notice_fingerprint: notice,
-                security_reminded_at: reminded,
-            },
-            now,
-        )
-        .await?;
+    let version_generation = previous.as_ref().map(|row| row.generation).unwrap_or(0);
+    let version = VersionRow {
+        installed: installed.clone(),
+        latest: latest_kept,
+        latest_url,
+        security_status: status.as_str().to_string(),
+        advisory_fingerprint: Some(if status == SecurityStatus::Unknown {
+            previous
+                .and_then(|row| row.advisory_fingerprint)
+                .unwrap_or(fingerprint.clone())
+        } else {
+            fingerprint.clone()
+        }),
+        notice_fingerprint: notice,
+        security_reminded_at: reminded,
+        generation: version_generation,
+    };
     let error_code = vendor_error(
         coverage,
         release_state,
@@ -352,6 +364,9 @@ async fn check_vendor<S: OperationalStore, H: HttpClient>(
         releases_rate_limited: releases.error_code == Some("rate_limited"),
         advisories_rate_limited: advisories.error_code == Some("rate_limited"),
         checked_at: now,
+        alerts,
+        version: Some(version),
+        version_generation,
     })
 }
 
@@ -396,24 +411,28 @@ async fn record_vendor<S: OperationalStore>(
             .unwrap_or(0),
     );
     let partial = outcome.coverage == "partial" || outcome.coverage == "policy_only";
+    let mut alerts = outcome.alerts.clone();
     if hard_failure && consecutive >= 3 {
         let previous_success = previous
             .as_ref()
             .and_then(|row| row.succeeded_at)
             .unwrap_or(0);
-        for alert in integrity_alerts(
+        alerts.extend(integrity_alerts(
             settings,
             get,
             monitor,
             previous_success,
             consecutive,
             outcome,
-        ) {
-            store.insert_alert(&alert, outcome.checked_at).await?;
-        }
+        ));
     }
-    store
-        .write_vendor(
+    let vendor_generation = previous.as_ref().map(|row| row.generation).unwrap_or(0);
+    let committed = store
+        .commit_vendor_cycle(
+            &outcome.monitor_id,
+            outcome.version.as_ref().map(|_| outcome.version_generation),
+            outcome.version.as_ref(),
+            vendor_generation,
             &VendorView {
                 monitor_id: outcome.monitor_id.clone(),
                 vendor: outcome.vendor.clone(),
@@ -433,10 +452,13 @@ async fn record_vendor<S: OperationalStore>(
                 consecutive_failures: consecutive,
                 releases_failures,
                 advisories_failures,
+                generation: vendor_generation,
             },
+            &alerts,
             outcome.checked_at,
         )
         .await?;
+    let _ = committed.committed;
     Ok(())
 }
 
@@ -1080,6 +1102,7 @@ mod tests {
             &Silent,
             1_000,
             &watchdog_core::clock::ManualClock::new(1_000),
+            1_000 + 600_000,
         )
         .await
         .unwrap();

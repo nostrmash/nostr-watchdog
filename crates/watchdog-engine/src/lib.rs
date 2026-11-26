@@ -7,8 +7,8 @@ mod nip17;
 mod probes;
 mod updates;
 
-pub use cycle::{dispatch_due, run_check_cycle, DeliveryOutcome, Notifier};
-pub use http_api::{handle, ApiError, ApiRequest, ApiResponse};
+pub use cycle::{dispatch_due, dispatch_transport, run_check_cycle, DeliveryOutcome, Notifier};
+pub use http_api::{handle, ApiError, ApiRequest, ApiResponse, MarmotControl, UnconnectedMarmot};
 pub use nip17::{deliver_nip17, InboxFrames, RelayIo};
 pub use probes::{HttpClient, ProbeRequest, ProbeResponse};
 pub use updates::run_update_cycle;

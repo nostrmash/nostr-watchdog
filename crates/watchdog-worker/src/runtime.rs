@@ -8,12 +8,15 @@ use serde_json::Value;
 use watchdog_core::clock::SystemClock;
 use watchdog_core::settings::{config_alias, load_settings, CONFIG_KEYS};
 use watchdog_engine::{
-    deliver_nip17, dispatch_due, handle, run_check_cycle, run_update_cycle, ApiRequest,
+    deliver_nip17, dispatch_transport, handle, run_check_cycle, run_update_cycle, ApiRequest,
     ApiResponse, DeliveryOutcome, HttpClient, InboxFrames, Notifier, ProbeRequest, ProbeResponse,
     RelayIo,
 };
-use watchdog_notify::{auth_frame, parse_relay_frame, RelayControl, MARMOT_ENGINE_STATUS};
-use watchdog_store::OutboxRow;
+use watchdog_notify::{
+    auth_event_id, auth_frame, parse_relay_frame, AuthPolicy, AuthSession, RelayControl,
+    SessionStep, MARMOT_ENGINE_STATUS,
+};
+use watchdog_store::{OperationalStore, OutboxRow};
 use worker::{
     console_log, AbortController, D1Database, Delay, Env, Fetch, Headers, Method, Request,
     RequestInit, RequestRedirect, Response, Result, ScheduledEvent, WebSocket,
@@ -44,31 +47,42 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
     if let Err(error) = d1_store::schema_ready(&db).await {
         return Response::error(schema_error(&error), 503);
     }
-    if req.method() == Method::Get && path == "/readyz" {
-        let ready = db
-            .prepare("SELECT 1 AS n")
-            .first::<Value>(None)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-        let status = if ready { 200 } else { 503 };
-        return Ok(Response::from_json(&serde_json::json!({
-            "ready": ready,
-            "database": if ready { "ok" } else { "unavailable" },
-            "marmot": "native_only"
-        }))?
-        .with_status(status));
-    }
     let vars = read_config(&env);
     let settings = load_settings(|key| vars.get(key).cloned().unwrap_or_default());
     let store = D1Store::new(&db);
     let notifier = WorkerNotifier {
         db: env.d1("DB")?,
         vars: vars.clone(),
+        timeout_ms: settings.timeout_ms.clamp(1_000, 15_000) as u64,
     };
     let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
-    let request = match api_request(&mut req).await {
+    if req.method() == Method::Post && path == "/v1/diagnostics/runtime-fence" {
+        if get("ENVIRONMENT") != "test" {
+            return Response::error("not_found", 404);
+        }
+        let authorization = req.headers().get("authorization").ok().flatten();
+        if !operator_authorized(&authorization, &get("OPERATOR_TOKEN")) {
+            return Response::error("unauthorized", 401);
+        }
+        return runtime_fence(&store, now_ms()).await;
+    }
+    if req.method() == Method::Get && path == "/readyz" {
+        let response = handle(
+            &store,
+            &settings,
+            &get,
+            &notifier,
+            ApiRequest::Ready {
+                marmot_supported: false,
+                startup_grace: false,
+            },
+            now_ms(),
+            &SystemClock,
+        )
+        .await;
+        return exact_json(response);
+    }
+    let request = match api_request(&mut req, &get("OPERATOR_TOKEN")).await {
         Some(request) => request,
         None => return Response::error("not_found", 404),
     };
@@ -96,20 +110,94 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
     let notifier = WorkerNotifier {
         db: env.d1("DB")?,
         vars: vars.clone(),
+        timeout_ms: settings.timeout_ms.clamp(1_000, 15_000) as u64,
     };
     let http = WorkerHttp;
     let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
-    let now = now_ms();
-    let cycle = if event.cron().starts_with("0 ") {
-        run_update_cycle(&store, &settings, &get, &http, &notifier, now, &SystemClock).await
-    } else {
-        run_check_cycle(&store, &settings, &get, &http, &notifier, now, &SystemClock).await
-    };
-    if let Err(error) = cycle {
+    let started = now_ms();
+    let hourly = event.cron().starts_with("0 ");
+    if hourly {
+        let deadline = started + 15_000;
+        if let Err(error) = run_update_cycle(
+            &store,
+            &settings,
+            &get,
+            &http,
+            &notifier,
+            started,
+            &SystemClock,
+            deadline,
+        )
+        .await
+        {
+            console_log!("vendor cycle failed: {error}");
+        }
+        if now_ms() < deadline {
+            let _ = store.prune(now_ms()).await;
+        }
+        return Ok(());
+    }
+    let health_deadline = started + 12_000;
+    if let Err(error) = run_check_cycle(
+        &store,
+        &settings,
+        &get,
+        &http,
+        &notifier,
+        started,
+        &SystemClock,
+        health_deadline,
+    )
+    .await
+    {
         console_log!("monitoring cycle failed: {error}");
     }
-    if let Err(error) = dispatch_due(&store, &settings, &get, &notifier, &SystemClock).await {
-        console_log!("dispatch failed: {error}");
+    let message_deadline = started + 17_000;
+    for (destination, critical, other) in [
+        ("telegram", 2_usize, 1_usize),
+        ("nostr", 2, 1),
+        ("marmot", 1, 1),
+    ] {
+        if message_deadline.saturating_sub(now_ms()) < 1_500 {
+            break;
+        }
+        if let Err(error) = dispatch_transport(
+            &store,
+            &settings,
+            &get,
+            &notifier,
+            &SystemClock,
+            destination,
+            critical,
+            other,
+            message_deadline,
+            "delivery",
+            "worker",
+        )
+        .await
+        {
+            console_log!("dispatch failed: {error}");
+        }
+    }
+    let push_deadline = started + 20_000;
+    if push_deadline.saturating_sub(now_ms()) >= 1_500 {
+        if let Err(error) = dispatch_transport(
+            &store,
+            &settings,
+            &get,
+            &notifier,
+            &SystemClock,
+            "marmot",
+            1,
+            0,
+            push_deadline,
+            "push",
+            "worker",
+        )
+        .await
+        {
+            console_log!("push reconciliation failed: {error}");
+        }
     }
     Ok(())
 }
@@ -133,6 +221,7 @@ impl HttpClient for WorkerHttp {
 struct WorkerNotifier {
     db: D1Database,
     vars: HashMap<String, String>,
+    timeout_ms: u64,
 }
 
 impl Notifier for WorkerNotifier {
@@ -184,7 +273,7 @@ impl Notifier for WorkerNotifier {
             &url,
             &headers,
             Some(body),
-            Duration::from_secs(15),
+            Duration::from_millis(self.timeout_ms),
             65_536,
         )
         .await;
@@ -336,7 +425,15 @@ async fn relay_exchange(
     let mut eose = false;
     let mut accepted = false;
     let mut total = 0usize;
-    let mut authed = false;
+    let policy = match &goal {
+        Exchange::Query { .. } => AuthPolicy::Discovery,
+        Exchange::Publish { .. } => AuthPolicy::Publication,
+    };
+    let original_id = match &goal {
+        Exchange::Query { sub } => sub.clone(),
+        Exchange::Publish { event_id } => event_id.clone(),
+    };
+    let mut session = AuthSession::new(policy);
     loop {
         let remaining = deadline.saturating_sub(now_ms());
         if remaining == 0 {
@@ -362,8 +459,12 @@ async fn relay_exchange(
                 return Err("relay_timeout".to_string());
             }
         };
-        let worker::WebsocketEvent::Message(message) = event else {
-            continue;
+        let message = match event {
+            worker::WebsocketEvent::Close(_) => {
+                let _ = socket.close(Some(1000), Some("closed"));
+                return Err("relay_closed".to_string());
+            }
+            worker::WebsocketEvent::Message(message) => message,
         };
         let Some(text) = message.text() else {
             continue;
@@ -377,61 +478,68 @@ async fn relay_exchange(
             let _ = socket.close(Some(1009), Some("size"));
             return Err("relay_response_too_large".to_string());
         }
-        match parse_relay_frame(&text) {
-            RelayControl::Auth { challenge } if !authed => {
+        let control = parse_relay_frame(&text);
+        if let RelayControl::Event {
+            subscription,
+            event_json,
+        } = &control
+        {
+            if let Exchange::Query { sub } = &goal {
+                if subscription == sub {
+                    if seen.len() >= 32 {
+                        let _ = socket.close(Some(1009), Some("events"));
+                        return Err("relay_event_limit".to_string());
+                    }
+                    seen.push(event_json.clone());
+                    continue;
+                }
+            }
+        }
+        if let RelayControl::Eose { subscription } = &control {
+            if let Exchange::Query { sub } = &goal {
+                if subscription == sub {
+                    eose = true;
+                    break;
+                }
+            }
+        }
+        match session.on_frame(&control, &original_id) {
+            SessionStep::Sign { challenge } => {
+                if !matches!(policy, AuthPolicy::Publication) {
+                    let _ = socket.close(Some(1008), Some("auth"));
+                    return Err("relay_auth_required".to_string());
+                }
                 let Some(nsec) = signer else {
                     let _ = socket.close(Some(1008), Some("auth"));
                     return Err("relay_auth_required".to_string());
                 };
-                let frame = auth_frame(nsec, &challenge, relay)
+                let auth = auth_frame(nsec, &challenge, relay)
                     .map_err(|_| "relay_auth_required".to_string())?;
+                if let Some(auth_id) = auth_event_id(&auth) {
+                    session.note_auth_sent(&auth_id);
+                }
                 socket
-                    .send_with_str(&frame)
+                    .send_with_str(&auth)
                     .map_err(|_| "relay_closed".to_string())?;
-                authed = true;
             }
-            RelayControl::Auth { .. } => {
+            SessionStep::ResendOriginal => {
+                socket
+                    .send_with_str(frame)
+                    .map_err(|_| "relay_closed".to_string())?;
+            }
+            SessionStep::Accepted => {
+                accepted = true;
+                break;
+            }
+            SessionStep::Rejected => {
+                accepted = false;
+                break;
+            }
+            SessionStep::Failed(error) => {
                 let _ = socket.close(Some(1008), Some("auth"));
-                return Err("relay_auth_required".to_string());
+                return Err(error.to_string());
             }
-            RelayControl::Event {
-                subscription,
-                event_json,
-            } => {
-                if let Exchange::Query { sub } = &goal {
-                    if subscription == *sub {
-                        if seen.len() >= 32 {
-                            let _ = socket.close(Some(1009), Some("events"));
-                            return Err("relay_event_limit".to_string());
-                        }
-                        seen.push(event_json);
-                    }
-                }
-            }
-            RelayControl::Eose { subscription } => {
-                if let Exchange::Query { sub } = &goal {
-                    if subscription == *sub {
-                        eose = true;
-                        break;
-                    }
-                }
-            }
-            RelayControl::Ok {
-                event_id,
-                accepted: ok,
-            } => {
-                if let Exchange::Publish { event_id: wanted } = &goal {
-                    if event_id == *wanted {
-                        accepted = ok;
-                        break;
-                    }
-                }
-            }
-            RelayControl::Closed { .. } => {
-                let _ = socket.close(Some(1000), Some("closed"));
-                return Err("relay_closed".to_string());
-            }
-            _ => {}
+            SessionStep::Continue => {}
         }
     }
     let _ = socket.close(Some(1000), Some("done"));
@@ -572,6 +680,31 @@ fn exact_json(response: ApiResponse) -> Result<Response> {
         .with_status(response.status))
 }
 
+async fn read_limited(
+    req: &mut Request,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, &'static str> {
+    if let Some(value) = req.headers().get("content-length").ok().flatten() {
+        if value.parse::<usize>().unwrap_or(usize::MAX) > limit {
+            return Err("payload_too_large");
+        }
+    }
+    let mut stream = req.stream().map_err(|_| "payload_invalid")?;
+    let mut body = Vec::new();
+    let started = now_ms();
+    while let Some(chunk) = stream.next().await {
+        if now_ms().saturating_sub(started) > 5_000 {
+            return Err("payload_timeout");
+        }
+        let chunk = chunk.map_err(|_| "payload_invalid")?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err("payload_too_large");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn schema_error(error: &watchdog_store::StoreError) -> &'static str {
     if error.to_string() == "schema_unsupported" {
         "schema_unsupported"
@@ -580,7 +713,17 @@ fn schema_error(error: &watchdog_store::StoreError) -> &'static str {
     }
 }
 
-async fn api_request(req: &mut Request) -> Option<ApiRequest> {
+fn operator_authorized(header: &Option<String>, operator: &str) -> bool {
+    let header = header.as_deref().unwrap_or("");
+    let token = header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+        .unwrap_or("")
+        .trim();
+    !operator.is_empty() && watchdog_core::crypto::secrets_equal(operator, token)
+}
+
+async fn api_request(req: &mut Request, operator: &str) -> Option<ApiRequest> {
     let path = req.path();
     let authorization = req.headers().get("authorization").ok().flatten();
     let header = |name: &str| req.headers().get(name).ok().flatten().unwrap_or_default();
@@ -620,13 +763,39 @@ async fn api_request(req: &mut Request) -> Option<ApiRequest> {
                 project,
             })
         }
+        (Method::Get, ["v1", "outbox", id]) if *id != "failed" => Some(ApiRequest::Alert {
+            authorization,
+            id: (*id).to_string(),
+        }),
+        (Method::Post, ["v1", "outbox", id, "ack"]) => Some(ApiRequest::AcknowledgeAlert {
+            authorization,
+            id: (*id).to_string(),
+        }),
+        (Method::Post, ["v1", "diagnostics", "marmot", "onboard"]) => {
+            if !operator_authorized(&authorization, operator) {
+                return Some(ApiRequest::Onboard {
+                    authorization,
+                    body: Vec::new(),
+                });
+            }
+            match read_limited(req, 2_048).await {
+                Ok(body) => Some(ApiRequest::Onboard {
+                    authorization,
+                    body,
+                }),
+                Err(error) => Some(ApiRequest::Rejected { status: 413, error }),
+            }
+        }
         (Method::Post, ["v1", "heartbeats", monitor_id]) => {
             let monitor_id = (*monitor_id).to_string();
             let content_type = header("content-type");
             let timestamp = header("x-watchdog-timestamp");
             let nonce = header("x-watchdog-nonce");
             let signature = header("x-watchdog-signature");
-            let body = req.bytes().await.unwrap_or_default();
+            let body = match read_limited(req, 16_384).await {
+                Ok(body) => body,
+                Err(error) => return Some(ApiRequest::Rejected { status: 413, error }),
+            };
             Some(ApiRequest::Heartbeat {
                 monitor_id,
                 content_type,
@@ -637,7 +806,17 @@ async fn api_request(req: &mut Request) -> Option<ApiRequest> {
             })
         }
         (Method::Post, ["v1", "diagnostics", "test-alert"]) => {
-            let body = req.bytes().await.unwrap_or_default();
+            if !operator_authorized(&authorization, operator) {
+                return Some(ApiRequest::TestAlert {
+                    authorization,
+                    body: Vec::new(),
+                    transport: None,
+                });
+            }
+            let body = match read_limited(req, 2_048).await {
+                Ok(body) => body,
+                Err(error) => return Some(ApiRequest::Rejected { status: 413, error }),
+            };
             Some(ApiRequest::TestAlert {
                 authorization,
                 body,
@@ -649,7 +828,18 @@ async fn api_request(req: &mut Request) -> Option<ApiRequest> {
             id: (*id).to_string(),
         }),
         (Method::Post, ["v1", "incidents", id, action]) => {
-            let body = req.bytes().await.unwrap_or_default();
+            if !operator_authorized(&authorization, operator) {
+                return Some(ApiRequest::Incident {
+                    authorization,
+                    id: (*id).to_string(),
+                    action: (*action).to_string(),
+                    body: Vec::new(),
+                });
+            }
+            let body = match read_limited(req, 2_048).await {
+                Ok(body) => body,
+                Err(error) => return Some(ApiRequest::Rejected { status: 413, error }),
+            };
             Some(ApiRequest::Incident {
                 authorization,
                 id: (*id).to_string(),
@@ -677,6 +867,61 @@ fn read_config(env: &Env) -> HashMap<String, String> {
         vars.entry(canonical.to_string()).or_insert(value);
     }
     vars
+}
+
+async fn runtime_fence(store: &D1Store<'_>, now: i64) -> Result<Response> {
+    let completion = d1_store::probe_completion_fence(store, now)
+        .await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    let loaded = store
+        .load_memory("sfs-web")
+        .await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    let check = watchdog_core::domain::check_result(
+        watchdog_core::domain::MonitorStatus::Healthy,
+        None,
+        "fence",
+        None,
+        None,
+    );
+    let first = store
+        .commit_check(
+            "sfs-web",
+            "smartflowsocial",
+            loaded.generation,
+            &loaded.memory,
+            &check,
+            now,
+            &[],
+            &[],
+        )
+        .await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    let second = store
+        .commit_check(
+            "sfs-web",
+            "smartflowsocial",
+            loaded.generation,
+            &loaded.memory,
+            &check,
+            now,
+            &[],
+            &[],
+        )
+        .await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    let mut body = completion;
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "generationFirst".to_string(),
+            serde_json::json!(first.committed),
+        );
+        object.insert(
+            "generationSecond".to_string(),
+            serde_json::json!(second.committed),
+        );
+    }
+    Response::from_json(&body)
 }
 
 fn now_ms() -> i64 {

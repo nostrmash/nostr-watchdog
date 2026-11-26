@@ -12,7 +12,10 @@ use tokio_tungstenite::{client_async_tls_with_config, tungstenite::Message};
 use url::Url;
 use watchdog_core::url_policy::workers_websocket_url;
 use watchdog_engine::{InboxFrames, RelayIo};
-use watchdog_notify::{auth_frame, parse_relay_frame, RelayControl};
+use watchdog_notify::{
+    auth_event_id, auth_frame, parse_relay_frame, AuthPolicy, AuthSession, RelayControl,
+    SessionStep,
+};
 
 const MAX_FRAME_BYTES: usize = 65_536;
 const MAX_SESSION_BYTES: usize = 262_144;
@@ -58,13 +61,18 @@ pub async fn query_inbox(
     let mut events = Vec::new();
     let mut eose = false;
     let mut total = 0usize;
-    let mut authed = false;
+    // Discovery never signs, even when the caller has a key.
+    let _ = signer;
+    let mut session = AuthSession::new(AuthPolicy::Discovery);
     let read = async {
         while let Some(message) = socket.next().await {
             if Instant::now() >= deadline {
                 return Err("relay_timeout".to_string());
             }
             let message = message.map_err(|_| "relay_malformed".to_string())?;
+            if matches!(message, Message::Close(_)) {
+                return Err("relay_closed".to_string());
+            }
             let Message::Text(text) = message else {
                 continue;
             };
@@ -72,34 +80,26 @@ pub async fn query_inbox(
             if total > MAX_SESSION_BYTES {
                 return Err("relay_response_too_large".to_string());
             }
-            match parse_relay_frame(&text) {
-                RelayControl::Auth { challenge } if !authed => {
-                    let Some(nsec) = signer else {
-                        return Err("relay_auth_required".to_string());
-                    };
-                    let frame = auth_frame(nsec, &challenge, relay)
-                        .map_err(|_| "relay_auth_required".to_string())?;
-                    send_text(&mut socket, &frame, deadline).await?;
-                    authed = true;
-                }
-                RelayControl::Auth { .. } => return Err("relay_auth_required".to_string()),
+            let control = parse_relay_frame(&text);
+            match &control {
                 RelayControl::Event {
                     subscription,
                     event_json,
-                } if subscription == sub => {
+                } if subscription == &sub => {
                     if events.len() >= MAX_EVENTS {
                         return Err("relay_event_limit".to_string());
                     }
-                    events.push(event_json);
+                    events.push(event_json.clone());
                 }
-                RelayControl::Eose { subscription } if subscription == sub => {
+                RelayControl::Eose { subscription } if subscription == &sub => {
                     eose = true;
                     break;
                 }
-                RelayControl::Closed { subscription } if subscription == sub => {
-                    return Err("relay_closed".to_string());
-                }
-                _ => {}
+                _ => match session.on_frame(&control, &sub) {
+                    SessionStep::Failed(error) => return Err(error.to_string()),
+                    SessionStep::Sign { .. } => return Err("relay_auth_required".to_string()),
+                    _ => {}
+                },
             }
         }
         Ok(())
@@ -133,13 +133,16 @@ pub async fn publish(
     send_text(&mut socket, &frame, deadline).await?;
     let mut accepted = false;
     let mut total = 0usize;
-    let mut authed = false;
+    let mut session = AuthSession::new(AuthPolicy::Publication);
     let read = async {
         while let Some(message) = socket.next().await {
             if Instant::now() >= deadline {
                 return Err("relay_timeout".to_string());
             }
             let message = message.map_err(|_| "relay_malformed".to_string())?;
+            if matches!(message, Message::Close(_)) {
+                return Err("relay_closed".to_string());
+            }
             let Message::Text(text) = message else {
                 continue;
             };
@@ -147,26 +150,32 @@ pub async fn publish(
             if total > MAX_SESSION_BYTES {
                 return Err("relay_response_too_large".to_string());
             }
-            match parse_relay_frame(&text) {
-                RelayControl::Auth { challenge } if !authed => {
+            let control = parse_relay_frame(&text);
+            match session.on_frame(&control, &id) {
+                SessionStep::Sign { challenge } => {
                     let Some(nsec) = signer else {
                         return Err("relay_auth_required".to_string());
                     };
-                    let frame = auth_frame(nsec, &challenge, relay)
+                    let auth = auth_frame(nsec, &challenge, relay)
                         .map_err(|_| "relay_auth_required".to_string())?;
-                    send_text(&mut socket, &frame, deadline).await?;
-                    authed = true;
+                    if let Some(auth_id) = auth_event_id(&auth) {
+                        session.note_auth_sent(&auth_id);
+                    }
+                    send_text(&mut socket, &auth, deadline).await?;
                 }
-                RelayControl::Auth { .. } => return Err("relay_auth_required".to_string()),
-                RelayControl::Ok {
-                    event_id,
-                    accepted: ok,
-                } if event_id == id => {
-                    accepted = ok;
+                SessionStep::ResendOriginal => {
+                    send_text(&mut socket, &frame, deadline).await?;
+                }
+                SessionStep::Accepted => {
+                    accepted = true;
                     break;
                 }
-                RelayControl::Closed { .. } => return Err("relay_closed".to_string()),
-                _ => {}
+                SessionStep::Rejected => {
+                    accepted = false;
+                    break;
+                }
+                SessionStep::Failed(error) => return Err(error.to_string()),
+                SessionStep::Continue => {}
             }
         }
         Ok(())
@@ -203,7 +212,12 @@ async fn connect(
         .ok_or_else(|| "relay_url_invalid".to_string())?
         .to_string();
     let port = parsed.port_or_known_default().unwrap_or(443);
-    let address = timeout_until(deadline, crate::net::resolve_pinned(&host, port, false)).await??;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let address = timeout_until(
+        deadline,
+        crate::net::resolve_pinned(&host, port, false, remaining),
+    )
+    .await??;
     let stream = timeout_until(deadline, TcpStream::connect(address))
         .await?
         .map_err(|_| "relay_connect_failed".to_string())?;

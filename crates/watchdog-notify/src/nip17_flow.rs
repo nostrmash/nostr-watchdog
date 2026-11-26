@@ -32,9 +32,11 @@ pub enum RelayControl {
     Ok {
         event_id: String,
         accepted: bool,
+        message: String,
     },
     Closed {
         subscription: String,
+        message: String,
     },
     Notice,
     Auth {
@@ -158,10 +160,20 @@ pub fn parse_relay_frame(text: &str) -> RelayControl {
                 .unwrap_or("")
                 .to_string(),
             accepted: items.get(2).and_then(Value::as_bool).unwrap_or(false),
+            message: items
+                .get(3)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         },
         "CLOSED" => RelayControl::Closed {
             subscription: items
                 .get(1)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            message: items
+                .get(2)
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
@@ -197,6 +209,135 @@ pub fn auth_frame(nsec: &str, challenge: &str, relay_url: &str) -> Result<String
         .finalize(&keys)
         .map_err(|_| Nip17Error::Event)?;
     Ok(ClientMessage::auth(event).as_json())
+}
+
+pub const MAX_AUTH_CHALLENGES: u8 = 2;
+
+/// Discovery relays never receive a signed identity. Publication relays may
+/// be signed only after they require authentication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthPolicy {
+    Discovery,
+    Publication,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionStep {
+    Continue,
+    Sign { challenge: String },
+    ResendOriginal,
+    Accepted,
+    Rejected,
+    Failed(&'static str),
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthSession {
+    policy: AuthPolicy,
+    challenges: u8,
+    resends: u8,
+    pending_auth_id: Option<String>,
+    authenticated: bool,
+}
+
+impl AuthSession {
+    pub fn new(policy: AuthPolicy) -> Self {
+        Self {
+            policy,
+            challenges: 0,
+            resends: 0,
+            pending_auth_id: None,
+            authenticated: false,
+        }
+    }
+
+    pub fn note_auth_sent(&mut self, event_id: &str) {
+        self.pending_auth_id = Some(event_id.to_string());
+    }
+
+    pub fn on_frame(&mut self, control: &RelayControl, original_id: &str) -> SessionStep {
+        match control {
+            RelayControl::Auth { challenge } => self.on_challenge(challenge),
+            RelayControl::Ok {
+                event_id,
+                accepted,
+                message,
+            } => self.on_ok(event_id, *accepted, message, original_id),
+            RelayControl::Closed { message, .. } => {
+                if auth_required(message) && !self.may_have_authenticated() {
+                    SessionStep::Failed("relay_auth_required")
+                } else {
+                    SessionStep::Failed("relay_closed")
+                }
+            }
+            _ => SessionStep::Continue,
+        }
+    }
+
+    fn on_challenge(&mut self, challenge: &str) -> SessionStep {
+        self.challenges = self.challenges.saturating_add(1);
+        if self.challenges > MAX_AUTH_CHALLENGES {
+            return SessionStep::Failed("relay_auth_repeated");
+        }
+        if self.policy == AuthPolicy::Discovery || self.authenticated {
+            return SessionStep::Continue;
+        }
+        SessionStep::Sign {
+            challenge: challenge.to_string(),
+        }
+    }
+
+    fn on_ok(
+        &mut self,
+        event_id: &str,
+        accepted: bool,
+        message: &str,
+        original_id: &str,
+    ) -> SessionStep {
+        if self.pending_auth_id.as_deref() == Some(event_id) {
+            self.pending_auth_id = None;
+            if !accepted {
+                return SessionStep::Failed("relay_auth_rejected");
+            }
+            self.authenticated = true;
+            if self.resends == 0 {
+                self.resends = 1;
+                return SessionStep::ResendOriginal;
+            }
+            return SessionStep::Continue;
+        }
+        if event_id == original_id {
+            if accepted {
+                return SessionStep::Accepted;
+            }
+            if auth_required(message) && !self.authenticated {
+                return SessionStep::Failed("relay_auth_required");
+            }
+            return SessionStep::Rejected;
+        }
+        if auth_required(message) && !self.may_have_authenticated() {
+            return SessionStep::Failed("relay_auth_required");
+        }
+        SessionStep::Continue
+    }
+
+    fn may_have_authenticated(&self) -> bool {
+        self.policy == AuthPolicy::Publication && self.authenticated
+    }
+}
+
+pub fn auth_event_id(frame: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(frame).ok()?;
+    parsed
+        .get(1)
+        .and_then(|event| event.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn auth_required(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("auth-required") || lower.contains("auth required")
 }
 
 #[cfg(test)]
@@ -269,5 +410,77 @@ mod tests {
         assert!(frame.starts_with("[\"AUTH\""));
         assert!(frame.contains("22242") || frame.contains("\"kind\":22242"));
         let _ = sign_inbox(&nsec, &["wss://inbox.example"], 10);
+    }
+
+    #[test]
+    fn discovery_ignores_an_optional_challenge_and_fails_closed_when_required() {
+        let mut session = AuthSession::new(AuthPolicy::Discovery);
+        let challenge = parse_relay_frame(r#"["AUTH","c1"]"#);
+        assert_eq!(session.on_frame(&challenge, "sub"), SessionStep::Continue);
+        let required = parse_relay_frame(r#"["CLOSED","sub","auth-required: sign in"]"#);
+        assert_eq!(
+            session.on_frame(&required, "sub"),
+            SessionStep::Failed("relay_auth_required")
+        );
+    }
+
+    #[test]
+    fn publication_signs_once_resends_the_original_event_and_rejects_a_bad_ack() {
+        let mut session = AuthSession::new(AuthPolicy::Publication);
+        let step = session.on_frame(&parse_relay_frame(r#"["AUTH","c1"]"#), "event");
+        assert!(matches!(step, SessionStep::Sign { .. }));
+        session.note_auth_sent("auth-event");
+        assert_eq!(
+            session.on_frame(
+                &parse_relay_frame(r#"["OK","auth-event",true,""]"#),
+                "event"
+            ),
+            SessionStep::ResendOriginal
+        );
+        assert_eq!(
+            session.on_frame(&parse_relay_frame(r#"["OK","event",true,""]"#), "event"),
+            SessionStep::Accepted
+        );
+        let mut rejected = AuthSession::new(AuthPolicy::Publication);
+        rejected.note_auth_sent("auth-event");
+        assert_eq!(
+            rejected.on_frame(
+                &parse_relay_frame(r#"["OK","auth-event",false,"rejected"]"#),
+                "event"
+            ),
+            SessionStep::Failed("relay_auth_rejected")
+        );
+    }
+
+    #[test]
+    fn a_second_challenge_is_bounded_and_a_late_ok_still_matches() {
+        let mut session = AuthSession::new(AuthPolicy::Publication);
+        assert!(matches!(
+            session.on_frame(
+                &RelayControl::Auth {
+                    challenge: "a".into()
+                },
+                "event"
+            ),
+            SessionStep::Sign { .. }
+        ));
+        assert!(matches!(
+            session.on_frame(
+                &RelayControl::Auth {
+                    challenge: "b".into()
+                },
+                "event"
+            ),
+            SessionStep::Sign { .. }
+        ));
+        assert_eq!(
+            session.on_frame(
+                &RelayControl::Auth {
+                    challenge: "c".into()
+                },
+                "event"
+            ),
+            SessionStep::Failed("relay_auth_repeated")
+        );
     }
 }

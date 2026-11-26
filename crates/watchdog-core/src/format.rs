@@ -23,6 +23,25 @@ pub fn format_unix_ms(ms: i64) -> String {
         .unwrap_or_else(|| "invalid-time".to_string())
 }
 
+/// Telegram fallback text stays short. It does not include the full reason or a runbook.
+pub fn format_telegram_notice(
+    project_name: &str,
+    display_name: &str,
+    severity: Severity,
+    event: NoticeEvent,
+    incident_id: &str,
+) -> String {
+    let label = match event {
+        NoticeEvent::Close => "recovery",
+        NoticeEvent::Remind => "reminder",
+        NoticeEvent::Open => "alert",
+    };
+    format!(
+        "[{project_name}] {} {label}\n{display_name}\nIncident: {incident_id}",
+        severity.as_str().to_ascii_uppercase()
+    )
+}
+
 pub fn format_incident_message(input: IncidentMessage<'_>) -> String {
     let label = match input.event {
         NoticeEvent::Close => "recovery",

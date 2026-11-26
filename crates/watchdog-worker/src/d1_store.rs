@@ -123,7 +123,7 @@ impl OperationalStore for D1Store<'_> {
         memory.last_unknown_reason = row["last_unknown_reason"].as_str().map(str::to_string);
         let incidents = self
             .all(
-                "SELECT id, kind, severity, opened_at, reminder_count, last_reminder_at, silenced_until, acked_at FROM incidents WHERE monitor_id = ?1 AND status = 'open'",
+                "SELECT id, kind, severity, opened_at, reminder_count, last_reminder_at, silenced_until, acked_at, decision_generation FROM incidents WHERE monitor_id = ?1 AND status = 'open'",
                 &[text(monitor_id)],
             )
             .await?;
@@ -139,6 +139,7 @@ impl OperationalStore for D1Store<'_> {
                 last_reminder_at: as_opt_i64(&incident["last_reminder_at"]),
                 silenced_until: as_opt_i64(&incident["silenced_until"]),
                 acked_at: as_opt_i64(&incident["acked_at"]),
+                decision_generation: as_i64(&incident["decision_generation"]),
             };
             if open.kind == IncidentKind::Inconclusive {
                 memory.integrity_incident = Some(open);
@@ -254,12 +255,18 @@ impl OperationalStore for D1Store<'_> {
                 )?,
                 NoticeEvent::Remind => self.prepare(
                     "UPDATE incidents SET reminder_count = reminder_count + 1, last_reminder_at = ?1, updated_at = ?1
-                     WHERE id = ?2 AND status = 'open' AND EXISTS (
-                        SELECT 1 FROM monitor_state WHERE monitor_id = ?3 AND generation = ?4 AND commit_token = ?5
+                     WHERE id = ?2 AND status = 'open'
+                       AND decision_generation = ?3 AND reminder_count = ?4
+                       AND acked_at IS NULL
+                       AND (silenced_until IS NULL OR silenced_until <= ?1)
+                       AND EXISTS (
+                        SELECT 1 FROM monitor_state WHERE monitor_id = ?5 AND generation = ?6 AND commit_token = ?7
                      )",
                     &[
                         number(now),
                         text(&item.incident_id),
+                        number(item.decision_generation),
+                        number(item.reminder_count),
                         text(monitor_id),
                         number(next_generation),
                         text(&commit_token),
@@ -269,12 +276,34 @@ impl OperationalStore for D1Store<'_> {
             statements.push(statement);
         }
         for alert in alerts {
+            let remind = notices.iter().find(|notice| {
+                notice.event == NoticeEvent::Remind
+                    && alert.incident_id.as_deref() == Some(notice.incident_id.as_str())
+                    && alert.alert_class == watchdog_core::domain::AlertClass::Reminder
+            });
+            let (is_reminder, decision, count_after, incident_id) = match remind {
+                Some(notice) => (
+                    1_i64,
+                    notice.decision_generation,
+                    notice.reminder_count + 1,
+                    notice.incident_id.clone(),
+                ),
+                None => (0, 0, 0, String::new()),
+            };
             statements.push(self.prepare(
                 "INSERT OR IGNORE INTO alert_outbox (
                     id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
-                    state, payload_text, attempt_count, next_attempt_at, created_at, updated_at
-                 ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10
-                 FROM monitor_state WHERE monitor_id = ?4 AND generation = ?11 AND commit_token = ?12",
+                    state, payload_text, attempt_count, next_attempt_at, created_at, updated_at, logical_id
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10, ?11
+                 FROM monitor_state WHERE monitor_id = ?4 AND generation = ?12 AND commit_token = ?13
+                   AND (
+                     ?14 = 0 OR EXISTS (
+                       SELECT 1 FROM incidents WHERE id = ?15 AND status = 'open'
+                         AND decision_generation = ?16 AND reminder_count = ?17
+                         AND last_reminder_at = ?10 AND acked_at IS NULL
+                     )
+                   )",
                 &[
                     text(&alert.id),
                     text(alert.alert_class.as_str()),
@@ -286,8 +315,13 @@ impl OperationalStore for D1Store<'_> {
                     text(alert.severity.as_str()),
                     text(&alert.text),
                     number(now),
+                    text(watchdog_core::settings::logical_notification_key(&alert.dedupe_key)),
                     number(next_generation),
                     text(&commit_token),
+                    number(is_reminder),
+                    text(&incident_id),
+                    number(decision),
+                    number(count_after),
                 ],
             )?);
         }
@@ -333,28 +367,59 @@ impl OperationalStore for D1Store<'_> {
         Ok(())
     }
 
+    async fn renew_lease(
+        &self,
+        name: &str,
+        owner: &str,
+        until: i64,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .run(
+                "UPDATE scheduler_leases
+                 SET lease_until = CASE WHEN ?1 > lease_until THEN ?1 ELSE lease_until END
+                 WHERE job_name = ?2 AND owner = ?3 AND lease_until >= ?4",
+                &[number(until), text(name), text(owner), number(now)],
+            )
+            .await?
+            > 0)
+    }
+
     async fn mark_run(
         &self,
         name: &str,
+        owner: &str,
         started_at: Option<i64>,
         finished_at: Option<i64>,
         error: Option<&str>,
         success_at: Option<i64>,
     ) -> Result<(), StoreError> {
         self.run(
-            "INSERT INTO scheduler_runs (job_name, last_started_at, last_finished_at, last_error, last_success_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO scheduler_runs (
+                job_name, last_started_at, last_finished_at, last_error, last_success_at, run_owner
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(job_name) DO UPDATE SET
-               last_started_at = COALESCE(excluded.last_started_at, scheduler_runs.last_started_at),
-               last_finished_at = COALESCE(excluded.last_finished_at, scheduler_runs.last_finished_at),
+               last_started_at = excluded.last_started_at,
+               last_finished_at = excluded.last_finished_at,
                last_error = excluded.last_error,
-               last_success_at = COALESCE(excluded.last_success_at, scheduler_runs.last_success_at)",
+               last_success_at = CASE
+                 WHEN excluded.last_error IS NULL THEN excluded.last_success_at
+                 ELSE scheduler_runs.last_success_at END,
+               run_owner = excluded.run_owner
+             WHERE scheduler_runs.last_started_at IS NULL
+                OR excluded.last_started_at > scheduler_runs.last_started_at
+                OR (
+                  excluded.last_started_at = scheduler_runs.last_started_at
+                  AND excluded.run_owner = scheduler_runs.run_owner
+                  AND COALESCE(excluded.last_finished_at, 0) >= COALESCE(scheduler_runs.last_finished_at, 0)
+                )",
             &[
                 text(name),
                 optional_number(started_at),
                 optional_number(finished_at),
                 optional_text(error),
                 optional_number(success_at),
+                text(owner),
             ],
         )
         .await?;
@@ -409,7 +474,7 @@ impl OperationalStore for D1Store<'_> {
         progress: Option<&str>,
         idle: bool,
         loop_at: Option<i64>,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<watchdog_store::HeartbeatWrite, StoreError> {
         let statements = vec![
             self.prepare(
                 "DELETE FROM heartbeat_nonces WHERE expires_at < ?1",
@@ -428,7 +493,8 @@ impl OperationalStore for D1Store<'_> {
                      WHEN heartbeats.progress_token IS excluded.progress_token THEN heartbeats.progress_changed_at
                      ELSE excluded.received_at
                    END,
-                   idle = excluded.idle, loop_at = excluded.loop_at",
+                   idle = excluded.idle, loop_at = excluded.loop_at
+                 WHERE excluded.reported_at > heartbeats.reported_at",
                 &[
                     text(monitor_id),
                     text(project_id),
@@ -442,11 +508,22 @@ impl OperationalStore for D1Store<'_> {
             )?,
         ];
         match self.db.batch(statements).await {
-            Ok(_) => Ok(true),
+            Ok(results) => {
+                let changed = results
+                    .get(2)
+                    .and_then(|result| result.meta().ok().flatten())
+                    .and_then(|meta| meta.changes)
+                    .unwrap_or(0);
+                Ok(if changed == 0 {
+                    watchdog_store::HeartbeatWrite::Stale
+                } else {
+                    watchdog_store::HeartbeatWrite::Stored
+                })
+            }
             Err(error) => {
                 let text = error.to_string();
                 if text.to_ascii_lowercase().contains("unique") {
-                    Ok(false)
+                    Ok(watchdog_store::HeartbeatWrite::Replay)
                 } else {
                     Err(StoreError::Database(text))
                 }
@@ -534,18 +611,42 @@ impl OperationalStore for D1Store<'_> {
         claim_until: i64,
         destination: Option<&str>,
         limit: i64,
+        kind: &str,
+        oldest: i64,
+        runtime_id: &str,
     ) -> Result<Vec<OutboxRow>, StoreError> {
         let ids = self
             .all(
                 "SELECT id FROM alert_outbox
                  WHERE state IN ('queued', 'retrying') AND next_attempt_at <= ?1
+                   AND settled_at IS NULL
                    AND (claim_until IS NULL OR claim_until < ?1)
                    AND (?2 IS NULL OR destination = ?2)
+                   AND (
+                     ((?3 = 'delivery' OR ?3 = 'delivery-critical' OR ?3 = 'delivery-other')
+                        AND NOT (
+                          destination = 'marmot'
+                          AND COALESCE(message_state, '') IN ('relay_accepted', 'accepted', 'accepted_pending')
+                          AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')
+                        )
+                        AND (?3 != 'delivery-critical' OR severity = 'critical')
+                        AND (?3 != 'delivery-other' OR severity != 'critical'))
+                     OR (?3 = 'push'
+                        AND destination = 'marmot'
+                        AND COALESCE(message_state, '') IN ('relay_accepted', 'accepted', 'accepted_pending')
+                        AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')
+                        AND (auth_push_publications IS NULL OR auth_push_publications < 2)
+                        AND (auth_push_reconciles IS NULL OR auth_push_reconciles < 2)
+                        AND (auth_token_waits IS NULL OR auth_token_waits < 2)
+                        AND COALESCE(operation_started_at, created_at) >= ?4)
+                   )
                  ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, created_at
-                 LIMIT ?3",
+                 LIMIT ?5",
                 &[
                     number(now),
                     optional_text(destination),
+                    text(kind),
+                    number(oldest),
                     number(limit),
                 ],
             )
@@ -556,9 +657,16 @@ impl OperationalStore for D1Store<'_> {
             let token = uuid::Uuid::new_v4().to_string();
             let changed = self
                 .run(
-                    "UPDATE alert_outbox SET claim_until = ?1, claim_token = ?2, state = 'retrying', updated_at = ?3
-                     WHERE id = ?4 AND state IN ('queued', 'retrying') AND (claim_until IS NULL OR claim_until < ?3)",
-                    &[number(claim_until), text(&token), number(now), text(&id)],
+                    "UPDATE alert_outbox SET claim_until = ?1, claim_token = ?2, claim_owner = ?3, state = 'retrying', updated_at = ?4
+                     WHERE id = ?5 AND state IN ('queued', 'retrying') AND settled_at IS NULL
+                       AND (claim_until IS NULL OR claim_until < ?4)",
+                    &[
+                        number(claim_until),
+                        text(&token),
+                        text(runtime_id),
+                        number(now),
+                        text(&id),
+                    ],
                 )
                 .await?;
             if changed > 0 {
@@ -584,7 +692,8 @@ impl OperationalStore for D1Store<'_> {
             .run(
                 "UPDATE alert_outbox SET claim_until = ?1
                  WHERE id = ?2 AND claim_token = ?3 AND state = 'retrying'
-                   AND claim_until IS NOT NULL AND claim_until >= ?4",
+                   AND claim_until IS NOT NULL AND claim_until >= ?4
+                   AND ?1 > ?4 AND ?1 <= ?4 + 300000",
                 &[number(claim_until), text(id), text(token), number(now)],
             )
             .await?
@@ -608,7 +717,8 @@ impl OperationalStore for D1Store<'_> {
         let changed = self
             .run(
                 "UPDATE alert_outbox SET envelope_json = ?1, updated_at = ?2
-                 WHERE id = ?3 AND claim_token = ?4 AND envelope_json IS NULL",
+                 WHERE id = ?3 AND claim_token = ?4 AND envelope_json IS NULL
+                   AND claim_until IS NOT NULL AND claim_until >= ?2",
                 &[text(envelope), number(now), text(id), text(token)],
             )
             .await?;
@@ -651,7 +761,7 @@ impl OperationalStore for D1Store<'_> {
         Ok(self
             .run(
                 "UPDATE alert_outbox SET state = ?1, attempt_count = ?2, next_attempt_at = ?3, last_error = ?4,
-                    accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL,
+                    accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL, claim_owner = NULL,
                     message_phase = COALESCE(?7, message_phase), push_phase = COALESCE(?8, push_phase),
                     message_event_id = COALESCE(?9, message_event_id),
                     push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11
@@ -676,22 +786,51 @@ impl OperationalStore for D1Store<'_> {
             > 0)
     }
 
-    async fn retry_dead_letter(&self, id: &str, now: i64) -> Result<bool, StoreError> {
-        Ok(self
-            .run(
-                "UPDATE alert_outbox SET state = 'queued', attempt_count = 0, next_attempt_at = ?1,
-                    claim_until = NULL, claim_token = NULL, last_error = NULL, updated_at = ?1
-                 WHERE id = ?2 AND state = 'failed'",
-                &[number(now), text(id)],
+    async fn retry_dead_letter(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<watchdog_store::RetryMode, StoreError> {
+        let existing = self
+            .first(
+                "SELECT destination, envelope_json, message_state FROM alert_outbox WHERE id = ?1 AND state = 'failed'",
+                &[text(id)],
             )
-            .await?
-            > 0)
+            .await?;
+        let Some(row) = existing else {
+            return Ok(watchdog_store::RetryMode::Missing);
+        };
+        let destination = as_text(&row["destination"]);
+        let envelope = row["envelope_json"].as_str().is_some();
+        let mode = match destination.as_str() {
+            "marmot" => watchdog_store::RetryMode::Reconcile,
+            "telegram" => watchdog_store::RetryMode::SameOperation,
+            "nostr" if envelope => watchdog_store::RetryMode::SameOperation,
+            "nostr" => watchdog_store::RetryMode::NewSubmission,
+            _ if envelope => watchdog_store::RetryMode::SameOperation,
+            _ => watchdog_store::RetryMode::NewSubmission,
+        };
+        self.run(
+            "UPDATE alert_outbox
+             SET state = 'queued', next_attempt_at = ?1, claim_until = NULL, claim_token = NULL,
+                 claim_owner = NULL, settled_at = NULL, updated_at = ?1,
+                 attempt_count = CASE
+                   WHEN destination = 'nostr' AND envelope_json IS NULL THEN 0
+                   ELSE attempt_count END,
+                 submission_generation = CASE
+                   WHEN destination = 'nostr' AND envelope_json IS NULL THEN submission_generation + 1
+                   ELSE submission_generation END
+             WHERE id = ?2 AND state = 'failed'",
+            &[number(now), text(id)],
+        )
+        .await?;
+        Ok(mode)
     }
 
     async fn ack_incident(&self, id: &str, now: i64) -> Result<bool, StoreError> {
         Ok(self
             .run(
-                "UPDATE incidents SET acked_at = ?1, updated_at = ?1 WHERE id = ?2 AND status = 'open'",
+                "UPDATE incidents SET acked_at = ?1, updated_at = ?1, decision_generation = decision_generation + 1 WHERE id = ?2 AND status = 'open' AND acked_at IS NULL",
                 &[number(now), text(id)],
             )
             .await?
@@ -701,7 +840,7 @@ impl OperationalStore for D1Store<'_> {
     async fn silence_incident(&self, id: &str, until: i64, now: i64) -> Result<bool, StoreError> {
         Ok(self
             .run(
-                "UPDATE incidents SET silenced_until = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'open'",
+                "UPDATE incidents SET silenced_until = ?1, updated_at = ?2, decision_generation = decision_generation + 1 WHERE id = ?3 AND status = 'open' AND (silenced_until IS NULL OR silenced_until < ?1)",
                 &[number(until), number(now), text(id)],
             )
             .await?
@@ -960,6 +1099,7 @@ impl OperationalStore for D1Store<'_> {
                 advisory_fingerprint: row["advisory_fingerprint"].as_str().map(str::to_string),
                 notice_fingerprint: row["notice_fingerprint"].as_str().map(str::to_string),
                 security_reminded_at: as_opt_i64(&row["security_reminded_at"]),
+                generation: as_i64(&row["generation"]),
             }))
     }
 
@@ -1048,6 +1188,7 @@ impl OperationalStore for D1Store<'_> {
                 consecutive_failures: as_i64(&row["consecutive_failures"]),
                 releases_failures: as_i64(&row["releases_failures"]),
                 advisories_failures: as_i64(&row["advisories_failures"]),
+                generation: as_i64(&row["generation"]),
             }))
     }
 
@@ -1091,6 +1232,636 @@ impl OperationalStore for D1Store<'_> {
         )
         .await?;
         Ok(())
+    }
+
+    async fn claim_ownership(
+        &self,
+        id: &str,
+        token: &str,
+        now: i64,
+    ) -> Result<watchdog_store::ClaimOwnership, StoreError> {
+        let Some(row) = self
+            .first(
+                "SELECT claim_token, claim_until FROM alert_outbox WHERE id = ?1",
+                &[text(id)],
+            )
+            .await?
+        else {
+            return Ok(watchdog_store::ClaimOwnership::Missing);
+        };
+        match (row["claim_token"].as_str(), as_opt_i64(&row["claim_until"])) {
+            (Some(stored), Some(until)) if stored == token && until >= now => {
+                Ok(watchdog_store::ClaimOwnership::Active { until })
+            }
+            (Some(stored), _) if stored == token => Ok(watchdog_store::ClaimOwnership::Expired),
+            _ => Ok(watchdog_store::ClaimOwnership::Lost),
+        }
+    }
+
+    async fn finish_with_fallback(
+        &self,
+        id: &str,
+        token: &str,
+        state: DeliveryState,
+        attempt_count: i64,
+        next_attempt_at: i64,
+        error: Option<&str>,
+        accepted_relays: Option<&str>,
+        failed_relays: Option<&str>,
+        message_phase: Option<&str>,
+        push_phase: Option<&str>,
+        message_event_id: Option<&str>,
+        push_envelope: Option<&str>,
+        logical_id: Option<&str>,
+        fallback: Option<&AlertDraft>,
+        counters: &watchdog_core::delivery::AuthoritativeCounters,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let completion = uuid::Uuid::new_v4().to_string();
+        let require_fallback = i64::from(fallback.is_some());
+        let fallback_logical = fallback
+            .as_ref()
+            .map(|alert| {
+                watchdog_core::settings::logical_notification_key(&alert.dedupe_key).to_string()
+            })
+            .unwrap_or_default();
+        let update = self.prepare(
+            "UPDATE alert_outbox
+             SET state = ?1, attempt_count = ?2, next_attempt_at = ?3, last_error = ?4,
+                 accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL,
+                 message_phase = COALESCE(?7, message_phase), push_phase = COALESCE(?8, push_phase),
+                 message_event_id = COALESCE(?9, message_event_id),
+                 push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11,
+                 logical_id = COALESCE(logical_id, ?12),
+                 message_state = CASE
+                   WHEN ?7 IS NULL THEN message_state
+                   WHEN ?7 IN ('relay_accepted', 'message_accepted', 'accepted', 'published') THEN 'relay_accepted'
+                   WHEN ?7 = 'accepted_pending' THEN 'accepted_pending'
+                   WHEN ?7 = 'completion_unknown' THEN 'completion_unknown'
+                   WHEN ?7 IN ('message_prepared', 'prepared') THEN 'prepared'
+                   WHEN ?7 = 'not_submitted' THEN 'not_submitted'
+                   WHEN ?7 IN ('rejected', 'failed') THEN 'rejected'
+                   ELSE message_state END,
+                 push_state = CASE
+                   WHEN ?8 IS NULL THEN push_state
+                   WHEN ?8 IN ('relay_accepted', 'push_trigger_accepted') THEN 'relay_accepted'
+                   WHEN ?8 = 'unknown' THEN 'unknown'
+                   WHEN ?8 = 'not_required' THEN 'not_required'
+                   WHEN ?8 = 'not_attempted' THEN 'not_attempted'
+                   WHEN ?8 IN ('token_unavailable', 'push_token_unavailable') THEN 'token_unavailable'
+                   WHEN ?8 IN ('prepared', 'push_trigger_prepared') THEN 'prepared'
+                   WHEN ?8 = 'pending' THEN 'pending'
+                   WHEN ?8 = 'publication_attempted' THEN 'publication_attempted'
+                   WHEN ?8 = 'rejected' THEN 'rejected'
+                   WHEN ?8 IN ('expired', 'push_expired') THEN 'expired'
+                   WHEN ?8 IN ('unobservable', 'push_unobservable') THEN 'unobservable'
+                   WHEN ?8 = 'terminal_failure' THEN 'terminal_failure'
+                   ELSE push_state END,
+                 claim_owner = NULL,
+                 completion_token = ?15,
+                 operation_started_at = COALESCE(operation_started_at, created_at),
+                 started_at_ms = COALESCE(started_at_ms, created_at),
+                 message_phase_started_at = CASE
+                   WHEN ?7 IS NOT NULL AND COALESCE(message_phase, '') != ?7 THEN ?11
+                   ELSE message_phase_started_at END,
+                 push_phase_started_at = CASE
+                   WHEN ?8 IS NOT NULL AND COALESCE(push_phase, '') != ?8 THEN ?11
+                   ELSE push_phase_started_at END,
+                 auth_message_submissions = CASE
+                   WHEN ?16 IS NULL THEN auth_message_submissions
+                   WHEN auth_message_submissions IS NULL OR ?16 > auth_message_submissions THEN ?16
+                   ELSE auth_message_submissions END,
+                 auth_message_publications = CASE
+                   WHEN ?17 IS NULL THEN auth_message_publications
+                   WHEN auth_message_publications IS NULL OR ?17 > auth_message_publications THEN ?17
+                   ELSE auth_message_publications END,
+                 auth_message_reconciles = CASE
+                   WHEN ?18 IS NULL THEN auth_message_reconciles
+                   WHEN auth_message_reconciles IS NULL OR ?18 > auth_message_reconciles THEN ?18
+                   ELSE auth_message_reconciles END,
+                 auth_ambiguous_reconciles = CASE
+                   WHEN ?19 IS NULL THEN auth_ambiguous_reconciles
+                   WHEN auth_ambiguous_reconciles IS NULL OR ?19 > auth_ambiguous_reconciles THEN ?19
+                   ELSE auth_ambiguous_reconciles END,
+                 auth_token_waits = CASE
+                   WHEN ?20 IS NULL THEN auth_token_waits
+                   WHEN auth_token_waits IS NULL OR ?20 > auth_token_waits THEN ?20
+                   ELSE auth_token_waits END,
+                 auth_push_publications = CASE
+                   WHEN ?21 IS NULL THEN auth_push_publications
+                   WHEN auth_push_publications IS NULL OR ?21 > auth_push_publications THEN ?21
+                   ELSE auth_push_publications END,
+                 auth_push_reconciles = CASE
+                   WHEN ?22 IS NULL THEN auth_push_reconciles
+                   WHEN auth_push_reconciles IS NULL OR ?22 > auth_push_reconciles THEN ?22
+                   ELSE auth_push_reconciles END,
+                 settled_at = CASE WHEN ?1 IN ('relay_accepted', 'failed') THEN ?11 ELSE NULL END,
+                 preserve_message = CASE
+                   WHEN ?7 IN ('relay_accepted', 'accepted_pending') THEN 1
+                   ELSE preserve_message END,
+                 operation_id = COALESCE(operation_id, CASE WHEN destination = 'marmot' THEN id ELSE NULL END),
+                 message_updated_at = CASE WHEN ?7 IS NOT NULL THEN ?11 ELSE message_updated_at END,
+                 push_updated_at = CASE WHEN ?8 IS NOT NULL THEN ?11 ELSE push_updated_at END,
+                 terminal_reason = COALESCE(?4, terminal_reason)
+             WHERE id = ?13 AND claim_token = ?14 AND claim_until IS NOT NULL AND claim_until >= ?11
+               AND (?23 = 0 OR EXISTS (
+                 SELECT 1 FROM alert_outbox AS fallback_row
+                 WHERE fallback_row.destination = 'telegram' AND fallback_row.logical_id = ?24
+               ))",
+            &[
+                text(state.as_str()),
+                number(attempt_count),
+                number(next_attempt_at),
+                optional_text(error),
+                optional_text(accepted_relays),
+                optional_text(failed_relays),
+                optional_text(message_phase),
+                optional_text(push_phase),
+                optional_text(message_event_id),
+                optional_text(push_envelope),
+                number(now),
+                optional_text(logical_id),
+                text(id),
+                text(token),
+                text(&completion),
+                optional_number(counters.message_submissions),
+                optional_number(counters.message_publications),
+                optional_number(counters.message_reconciles),
+                optional_number(counters.ambiguous_reconciles),
+                optional_number(counters.token_waits),
+                optional_number(counters.push_publications),
+                optional_number(counters.push_reconciles),
+                number(require_fallback),
+                text(&fallback_logical),
+            ],
+        )?;
+        let mut statements = Vec::new();
+        if let Some(alert) = fallback {
+            let logical =
+                watchdog_core::settings::logical_notification_key(&alert.dedupe_key).to_string();
+            statements.push(self.prepare(
+                "INSERT INTO alert_outbox (
+                    id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
+                    state, payload_text, attempt_count, next_attempt_at, created_at, updated_at, logical_id
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10, ?11
+                 FROM alert_outbox AS live
+                 WHERE live.id = ?12 AND live.claim_token = ?13
+                   AND live.claim_until IS NOT NULL AND live.claim_until >= ?10
+                   AND NOT EXISTS (
+                     SELECT 1 FROM alert_outbox AS existing
+                     WHERE existing.destination = 'telegram' AND existing.logical_id = ?11
+                       AND existing.id != ?1
+                   )",
+                &[
+                    text(&alert.id),
+                    text(alert.alert_class.as_str()),
+                    optional_text(alert.incident_id.as_deref()),
+                    text(&alert.monitor_id),
+                    text(&alert.project_id),
+                    text(&alert.dedupe_key),
+                    text(alert.destination.as_str()),
+                    text(alert.severity.as_str()),
+                    text(&alert.text),
+                    number(now),
+                    text(&logical),
+                    text(id),
+                    text(token),
+                ],
+            )?);
+        }
+        statements.push(update);
+        if let Err(error) = self.db.batch(statements).await {
+            let message = error.to_string();
+            if message.contains("NULL")
+                || message.contains("constraint")
+                || message.contains("Constraint")
+                || message.contains("UNIQUE")
+            {
+                return Ok(false);
+            }
+            return Err(StoreError::Database(message));
+        }
+        let won = self
+            .first(
+                "SELECT 1 AS n FROM alert_outbox WHERE id = ?1 AND completion_token = ?2",
+                &[text(id), text(&completion)],
+            )
+            .await?
+            .is_some();
+        Ok(won)
+    }
+
+    async fn commit_vendor_cycle(
+        &self,
+        monitor_id: &str,
+        version_generation: Option<i64>,
+        version: Option<&VersionRow>,
+        vendor_generation: i64,
+        vendor: &VendorView,
+        alerts: &[AlertDraft],
+        now: i64,
+    ) -> Result<CommitOutcome, StoreError> {
+        let token = uuid::Uuid::new_v4().to_string();
+        let mut statements = Vec::new();
+        let version_next = version_generation.map(|generation| generation + 1);
+        if let (Some(generation), Some(version)) = (version_generation, version) {
+            statements.push(self.prepare(
+                "INSERT INTO observed_versions (
+                        monitor_id, installed_version, latest_version, latest_url, security_status,
+                        advisory_fingerprint, notice_fingerprint, updated_at, security_reminded_at,
+                        generation, commit_token
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(monitor_id) DO UPDATE SET
+                        installed_version = excluded.installed_version,
+                        latest_version = excluded.latest_version,
+                        latest_url = excluded.latest_url,
+                        security_status = excluded.security_status,
+                        advisory_fingerprint = excluded.advisory_fingerprint,
+                        notice_fingerprint = excluded.notice_fingerprint,
+                        updated_at = excluded.updated_at,
+                        security_reminded_at = excluded.security_reminded_at,
+                        generation = excluded.generation,
+                        commit_token = excluded.commit_token
+                     WHERE observed_versions.generation = ?12",
+                &[
+                    text(monitor_id),
+                    optional_text(version.installed.as_deref()),
+                    optional_text(version.latest.as_deref()),
+                    optional_text(version.latest_url.as_deref()),
+                    text(&version.security_status),
+                    optional_text(version.advisory_fingerprint.as_deref()),
+                    optional_text(version.notice_fingerprint.as_deref()),
+                    number(now),
+                    optional_number(version.security_reminded_at),
+                    number(generation + 1),
+                    text(&token),
+                    number(generation),
+                ],
+            )?);
+        }
+        let vendor_index = statements.len();
+        statements.push(self.prepare(
+                "INSERT INTO vendor_checks (
+                    monitor_id, vendor, attempted_at, succeeded_at, partial_succeeded_at, releases_checked_at,
+                    advisories_checked_at, releases_stale, advisories_stale, releases_state, advisories_state,
+                    coverage, error_code, consecutive_failures, releases_failures, advisories_failures, updated_at,
+                    generation, commit_token
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                 ON CONFLICT(monitor_id) DO UPDATE SET
+                    vendor = excluded.vendor,
+                    attempted_at = COALESCE(excluded.attempted_at, vendor_checks.attempted_at),
+                    succeeded_at = COALESCE(excluded.succeeded_at, vendor_checks.succeeded_at),
+                    partial_succeeded_at = COALESCE(excluded.partial_succeeded_at, vendor_checks.partial_succeeded_at),
+                    releases_checked_at = COALESCE(excluded.releases_checked_at, vendor_checks.releases_checked_at),
+                    advisories_checked_at = COALESCE(excluded.advisories_checked_at, vendor_checks.advisories_checked_at),
+                    releases_stale = excluded.releases_stale,
+                    advisories_stale = excluded.advisories_stale,
+                    releases_state = excluded.releases_state,
+                    advisories_state = excluded.advisories_state,
+                    coverage = excluded.coverage,
+                    error_code = excluded.error_code,
+                    consecutive_failures = excluded.consecutive_failures,
+                    releases_failures = excluded.releases_failures,
+                    advisories_failures = excluded.advisories_failures,
+                    updated_at = excluded.updated_at,
+                    generation = excluded.generation,
+                    commit_token = excluded.commit_token
+                 WHERE vendor_checks.generation = ?20
+                   AND (?21 = 0 OR EXISTS (
+                     SELECT 1 FROM observed_versions
+                     WHERE monitor_id = ?1 AND generation = ?22 AND commit_token = ?19
+                   ))",
+                &[
+                    text(&vendor.monitor_id),
+                    text(&vendor.vendor),
+                    optional_number(vendor.attempted_at),
+                    optional_number(vendor.succeeded_at),
+                    optional_number(vendor.partial_succeeded_at),
+                    optional_number(vendor.releases_checked_at),
+                    optional_number(vendor.advisories_checked_at),
+                    number(i64::from(vendor.releases_stale)),
+                    number(i64::from(vendor.advisories_stale)),
+                    text(&vendor.releases_state),
+                    text(&vendor.advisories_state),
+                    text(&vendor.coverage),
+                    optional_text(vendor.error_code.as_deref()),
+                    number(vendor.consecutive_failures),
+                    number(vendor.releases_failures),
+                    number(vendor.advisories_failures),
+                    number(now),
+                    number(vendor_generation + 1),
+                    text(&token),
+                    number(vendor_generation),
+                    number(i64::from(version_next.is_some())),
+                    number(version_next.unwrap_or(0)),
+                ],
+            )?);
+        if version_next.is_some() {
+            statements.push(self.prepare(
+                "INSERT INTO alert_outbox (
+                    id, alert_class, monitor_id, project_id, dedupe_key, destination, severity,
+                    state, payload_text, attempt_count, next_attempt_at, created_at, updated_at
+                 )
+                 SELECT NULL, 'fence', ?1, 'fence', 'fence-' || ?2, 'telegram', 'info',
+                        'queued', '', 0, 0, 0, 0
+                 WHERE EXISTS (
+                   SELECT 1 FROM observed_versions
+                   WHERE monitor_id = ?1 AND commit_token = ?2 AND generation = ?3
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM vendor_checks
+                   WHERE monitor_id = ?1 AND commit_token = ?2 AND generation = ?4
+                 )",
+                &[
+                    text(monitor_id),
+                    text(&token),
+                    number(version_next.unwrap_or(0)),
+                    number(vendor_generation + 1),
+                ],
+            )?);
+        }
+        for alert in alerts {
+            statements.push(self.prepare(
+                "INSERT OR IGNORE INTO alert_outbox (
+                    id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
+                    state, payload_text, attempt_count, next_attempt_at, created_at, updated_at, logical_id
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10, ?11
+                 FROM vendor_checks WHERE monitor_id = ?4 AND generation = ?12 AND commit_token = ?13",
+                &[
+                    text(&alert.id),
+                    text(alert.alert_class.as_str()),
+                    optional_text(alert.incident_id.as_deref()),
+                    text(&alert.monitor_id),
+                    text(&alert.project_id),
+                    text(&alert.dedupe_key),
+                    text(alert.destination.as_str()),
+                    text(alert.severity.as_str()),
+                    text(&alert.text),
+                    number(now),
+                    text(watchdog_core::settings::logical_notification_key(&alert.dedupe_key)),
+                    number(vendor_generation + 1),
+                    text(&token),
+                ],
+            )?);
+        }
+        let results = match self.db.batch(statements).await {
+            Ok(results) => results,
+            Err(error) => {
+                let message = error.to_string();
+                if message.to_ascii_lowercase().contains("not null")
+                    || message.to_ascii_lowercase().contains("constraint")
+                {
+                    return Ok(CommitOutcome { committed: false });
+                }
+                return Err(StoreError::Database(message));
+            }
+        };
+        let changed = results
+            .get(vendor_index)
+            .and_then(|result| result.meta().ok().flatten())
+            .and_then(|meta| meta.changes)
+            .unwrap_or(0);
+        Ok(CommitOutcome {
+            committed: changed > 0,
+        })
+    }
+
+    async fn read_alert(&self, id: &str) -> Result<Option<OutboxRow>, StoreError> {
+        self.read_outbox(id).await
+    }
+
+    async fn acknowledge_alert(&self, id: &str, now: i64) -> Result<bool, StoreError> {
+        Ok(self
+            .run(
+                "UPDATE alert_outbox SET operator_ack_at = ?1, updated_at = ?1 WHERE id = ?2 AND operator_ack_at IS NULL",
+                &[number(now), text(id)],
+            )
+            .await?
+            > 0)
+    }
+
+    async fn release_open_claims(&self, runtime_id: &str, now: i64) -> Result<usize, StoreError> {
+        if runtime_id.is_empty() {
+            return Ok(0);
+        }
+        self.run(
+            "UPDATE alert_outbox SET claim_until = NULL, claim_token = NULL, claim_owner = NULL, state = 'retrying', updated_at = ?1
+             WHERE state = 'retrying' AND claim_owner = ?2",
+            &[number(now), text(runtime_id)],
+        )
+        .await
+    }
+
+    async fn settle_expired(&self, now: i64) -> Result<usize, StoreError> {
+        let ids = self.settlement_ids(now).await?;
+        let mut settled = 0;
+        for id in ids {
+            if self.settle_one(&id, now, None).await? {
+                settled += 1;
+            }
+        }
+        Ok(settled)
+    }
+
+    async fn settlement_ids(&self, now: i64) -> Result<Vec<String>, StoreError> {
+        let sql = format!(
+            "SELECT id FROM alert_outbox WHERE {} ORDER BY created_at LIMIT 16",
+            watchdog_store::SETTLEMENT_PREDICATE
+        );
+        let rows = self.all(&sql, &[number(now)]).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| as_text(&row["id"]))
+            .filter(|id| !id.is_empty())
+            .collect())
+    }
+
+    async fn settle_one(
+        &self,
+        id: &str,
+        now: i64,
+        fallback: Option<&AlertDraft>,
+    ) -> Result<bool, StoreError> {
+        let completion = uuid::Uuid::new_v4().to_string();
+        let predicate = watchdog_store::SETTLEMENT_PREDICATE;
+        let mut statements = Vec::new();
+        let fallback_logical = fallback
+            .as_ref()
+            .map(|alert| {
+                watchdog_core::settings::logical_notification_key(&alert.dedupe_key).to_string()
+            })
+            .unwrap_or_default();
+        if let Some(alert) = fallback {
+            let live_predicate = predicate.replace("?1", "?13");
+            statements.push(self.prepare(
+                &format!(
+                    "INSERT INTO alert_outbox (
+                        id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
+                        state, payload_text, attempt_count, next_attempt_at, created_at, updated_at, logical_id
+                     )
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10, ?11
+                     FROM alert_outbox AS live
+                     WHERE live.id = ?12 AND {live_predicate}
+                       AND NOT EXISTS (
+                         SELECT 1 FROM alert_outbox AS existing
+                         WHERE existing.destination = 'telegram' AND existing.logical_id = ?11
+                           AND existing.id != ?1
+                       )"
+                ),
+                &[
+                    text(&alert.id),
+                    text(alert.alert_class.as_str()),
+                    optional_text(alert.incident_id.as_deref()),
+                    text(&alert.monitor_id),
+                    text(&alert.project_id),
+                    text(&alert.dedupe_key),
+                    text(alert.destination.as_str()),
+                    text(alert.severity.as_str()),
+                    text(&alert.text),
+                    number(now),
+                    text(&fallback_logical),
+                    text(id),
+                    number(now),
+                ],
+            )?);
+        }
+        let fallback_gate = if fallback.is_some() {
+            " AND EXISTS (
+                SELECT 1 FROM alert_outbox AS fallback_row
+                WHERE fallback_row.destination = 'telegram' AND fallback_row.logical_id = ?4
+              )"
+        } else {
+            ""
+        };
+        let update_sql = format!(
+            "UPDATE alert_outbox
+             SET state = CASE
+                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted') THEN 'relay_accepted'
+                   ELSE 'failed' END,
+                 settled_at = ?1,
+                 terminal_reason = COALESCE(terminal_reason, 'reconciliation_window'),
+                 push_state = CASE
+                   WHEN COALESCE(push_state, '') IN ('publication_attempted', 'prepared', 'pending', 'unknown', 'not_attempted')
+                     THEN 'unobservable'
+                   ELSE push_state END,
+                 claim_token = NULL,
+                 claim_until = NULL,
+                 claim_owner = NULL,
+                 completion_token = ?3,
+                 operation_started_at = COALESCE(operation_started_at, created_at),
+                 updated_at = ?1
+             WHERE id = ?2 AND {predicate}{fallback_gate}"
+        );
+        let mut binds = vec![number(now), text(id), text(&completion)];
+        if fallback.is_some() {
+            binds.push(text(&fallback_logical));
+        }
+        statements.push(self.prepare(&update_sql, &binds)?);
+        if let Err(error) = self.db.batch(statements).await {
+            let message = error.to_string();
+            if message.contains("NULL")
+                || message.contains("constraint")
+                || message.contains("Constraint")
+                || message.contains("UNIQUE")
+            {
+                return Ok(false);
+            }
+            return Err(StoreError::Database(message));
+        }
+        let won = self
+            .first(
+                "SELECT 1 AS n FROM alert_outbox WHERE id = ?1 AND completion_token = ?2",
+                &[text(id), text(&completion)],
+            )
+            .await?
+            .is_some();
+        Ok(won)
+    }
+
+    async fn expedite_destination(&self, destination: &str, now: i64) -> Result<usize, StoreError> {
+        self.run(
+            "UPDATE alert_outbox SET next_attempt_at = ?1, updated_at = ?1
+             WHERE destination = ?2 AND state IN ('queued', 'retrying')
+               AND (claim_until IS NULL OR claim_until < ?1) AND next_attempt_at > ?1",
+            &[number(now), text(destination)],
+        )
+        .await
+    }
+
+    async fn record_onboarding(
+        &self,
+        project_id: &str,
+        operation_id: &str,
+        replace: bool,
+        now: i64,
+    ) -> Result<Option<watchdog_store::OnboardReceipt>, StoreError> {
+        self.run(
+            "INSERT INTO marmot_projects (
+                project_id, engine_status, updated_at, onboard_idempotency_key, onboard_requested_at
+             ) VALUES (?1, 'onboard_requested', ?2, ?3, ?2)
+             ON CONFLICT(project_id) DO UPDATE SET
+               onboard_idempotency_key = excluded.onboard_idempotency_key,
+               onboard_requested_at = excluded.onboard_requested_at,
+               engine_status = 'onboard_requested',
+               updated_at = excluded.updated_at
+             WHERE marmot_projects.onboard_idempotency_key IS NULL
+                OR marmot_projects.onboard_idempotency_key = excluded.onboard_idempotency_key
+                OR ?4 = 1",
+            &[
+                text(project_id),
+                number(now),
+                text(operation_id),
+                number(i64::from(replace)),
+            ],
+        )
+        .await?;
+        self.run(
+            "INSERT OR IGNORE INTO marmot_onboard_history (
+                project_id, operation_id, replace_requested, requested_at, engine_status
+             ) VALUES (?1, ?2, ?3, ?4, 'onboard_requested')",
+            &[
+                text(project_id),
+                text(operation_id),
+                number(i64::from(replace)),
+                number(now),
+            ],
+        )
+        .await?;
+        Ok(self
+            .first(
+                "SELECT engine_status, onboard_idempotency_key FROM marmot_projects WHERE project_id = ?1",
+                &[text(project_id)],
+            )
+            .await?
+            .map(|row| watchdog_store::OnboardReceipt {
+                engine_status: as_text(&row["engine_status"]),
+                idempotency_key: row["onboard_idempotency_key"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            }))
+    }
+
+    async fn count_delivery_pressure(&self, now: i64) -> Result<(i64, i64), StoreError> {
+        let pending = self
+            .first(
+                "SELECT COUNT(*) AS n FROM alert_outbox WHERE state = 'retrying' AND next_attempt_at <= ?1",
+                &[number(now)],
+            )
+            .await?
+            .map(|row| as_i64(&row["n"]))
+            .unwrap_or(0);
+        let recent = self
+            .first(
+                "SELECT COUNT(*) AS n FROM alert_outbox WHERE state = 'retrying' AND updated_at >= ?1",
+                &[number(now - 86_400_000)],
+            )
+            .await?
+            .map(|row| as_i64(&row["n"]))
+            .unwrap_or(0);
+        Ok((pending, recent))
     }
 }
 
@@ -1150,7 +1921,32 @@ pub async fn schema_ready(db: &D1Database) -> Result<(), StoreError> {
         .first("SELECT commit_token FROM monitor_state LIMIT 1", &[])
         .await
         .is_ok();
-    match watchdog_store::schema_status(&applied, commit_token_column) {
+    let mut missing = Vec::new();
+    for (table, column) in watchdog_store::REQUIRED_COLUMNS {
+        if store
+            .first(&format!("SELECT {column} AS c FROM {table} LIMIT 1"), &[])
+            .await
+            .is_err()
+        {
+            missing.push(format!("{table}.{column}"));
+        }
+    }
+    for index in watchdog_store::REQUIRED_INDEXES {
+        let present = store
+            .first(
+                "SELECT 1 AS n FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                &[text(index)],
+            )
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !present {
+            missing.push(format!("index:{index}"));
+        }
+    }
+    let _ = commit_token_column;
+    match watchdog_store::schema_status(&applied, &missing) {
         Ok(()) => Ok(()),
         Err(error) => Err(StoreError::Database(error.to_string())),
     }
@@ -1162,6 +1958,232 @@ impl D1Store<'_> {
             .first("SELECT * FROM alert_outbox WHERE id = ?1", &[text(id)])
             .await?
             .map(outbox_row))
+    }
+}
+
+pub async fn probe_completion_fence(store: &D1Store<'_>, now: i64) -> Result<Value, StoreError> {
+    store
+        .run("DELETE FROM alert_outbox WHERE id LIKE 'alt_fence%'", &[])
+        .await?;
+    let source = fence_alert("alt_fence_src", "fence:src:marmot", "marmot");
+    let winner_fallback = fence_alert("alt_fence_win", "fence:win:telegram", "telegram");
+    let loser_fallback = fence_alert("alt_fence_lose", "fence:lose:telegram", "telegram");
+    OperationalStore::insert_alert(store, &source, now).await?;
+    store
+        .run(
+            "UPDATE alert_outbox
+             SET state = 'retrying', claim_token = 'fence-winner', claim_owner = 'worker',
+                 claim_until = ?1
+             WHERE id = 'alt_fence_src'",
+            &[number(now + 60_000)],
+        )
+        .await?;
+    let unknown = watchdog_core::delivery::AuthoritativeCounters::unknown();
+    let winner = OperationalStore::finish_with_fallback(
+        store,
+        "alt_fence_src",
+        "fence-winner",
+        DeliveryState::Failed,
+        1,
+        now,
+        Some("rejected"),
+        None,
+        None,
+        Some("rejected"),
+        Some("unobservable"),
+        None,
+        None,
+        Some("fence:src"),
+        Some(&winner_fallback),
+        &unknown,
+        now,
+    )
+    .await?;
+    let loser = OperationalStore::finish_with_fallback(
+        store,
+        "alt_fence_src",
+        "fence-loser",
+        DeliveryState::Failed,
+        1,
+        now,
+        Some("rejected"),
+        None,
+        None,
+        Some("rejected"),
+        Some("unobservable"),
+        None,
+        None,
+        Some("fence:src"),
+        Some(&loser_fallback),
+        &unknown,
+        now,
+    )
+    .await?;
+    let telegram = store
+        .first(
+            "SELECT COUNT(*) AS n FROM alert_outbox WHERE id LIKE 'alt_fence%' AND destination = 'telegram'",
+            &[],
+        )
+        .await?
+        .map(|row| as_i64(&row["n"]))
+        .unwrap_or(0);
+
+    let blocked = fence_alert("alt_fence_block", "fence:block:marmot", "marmot");
+    let taken = fence_alert("alt_fence_taken", "fence:block:fallback:telegram", "nostr");
+    let blocked_fallback = fence_alert(
+        "alt_fence_blocked_tg",
+        "fence:block:fallback:telegram",
+        "telegram",
+    );
+    OperationalStore::insert_alert(store, &blocked, now).await?;
+    OperationalStore::insert_alert(store, &taken, now).await?;
+    store
+        .run(
+            "UPDATE alert_outbox
+             SET state = 'retrying', claim_token = 'fence-block', claim_owner = 'worker',
+                 claim_until = ?1
+             WHERE id = 'alt_fence_block'",
+            &[number(now + 60_000)],
+        )
+        .await?;
+    let rolled_back = !OperationalStore::finish_with_fallback(
+        store,
+        "alt_fence_block",
+        "fence-block",
+        DeliveryState::Failed,
+        1,
+        now,
+        Some("rejected"),
+        None,
+        None,
+        Some("rejected"),
+        None,
+        None,
+        None,
+        Some("fence:block"),
+        Some(&blocked_fallback),
+        &unknown,
+        now,
+    )
+    .await?;
+    let preserved = store
+        .first(
+            "SELECT claim_token, state FROM alert_outbox WHERE id = 'alt_fence_block'",
+            &[],
+        )
+        .await?;
+    let rollback_preserved = preserved.as_ref().is_some_and(|row| {
+        row["claim_token"].as_str() == Some("fence-block")
+            && row["state"].as_str() == Some("retrying")
+    });
+
+    let aged = fence_alert("alt_fence_age", "fence:age:marmot", "marmot");
+    let aged_fallback = fence_alert(
+        "alt_fence_age_tg",
+        "fence:age:fallback:telegram",
+        "telegram",
+    );
+    let aged_again = fence_alert(
+        "alt_fence_age_tg2",
+        "fence:age:fallback:telegram",
+        "telegram",
+    );
+    OperationalStore::insert_alert(store, &aged, now).await?;
+    store
+        .run(
+            "UPDATE alert_outbox
+             SET created_at = ?1, state = 'retrying', claim_token = NULL, claim_until = NULL,
+                 claim_owner = NULL, message_state = 'completion_unknown'
+             WHERE id = 'alt_fence_age'",
+            &[number(now - 86_400_001)],
+        )
+        .await?;
+    let settled =
+        OperationalStore::settle_one(store, "alt_fence_age", now, Some(&aged_fallback)).await?;
+    let settled_again =
+        OperationalStore::settle_one(store, "alt_fence_age", now, Some(&aged_again)).await?;
+    let settlement_telegram = store
+        .first(
+            "SELECT COUNT(*) AS n FROM alert_outbox
+             WHERE destination = 'telegram' AND logical_id = 'fence:age:fallback'",
+            &[],
+        )
+        .await?
+        .map(|row| as_i64(&row["n"]))
+        .unwrap_or(0);
+    let settled_row = store
+        .first(
+            "SELECT state, settled_at, claim_token FROM alert_outbox WHERE id = 'alt_fence_age'",
+            &[],
+        )
+        .await?;
+    let settlement_preserved = settled_row.as_ref().is_some_and(|row| {
+        row["state"].as_str() == Some("failed")
+            && row["settled_at"].as_f64().is_some()
+            && row["claim_token"].is_null()
+    });
+
+    let stuck = fence_alert("alt_fence_stuck", "fence:stuck:marmot", "marmot");
+    let occupied = fence_alert(
+        "alt_fence_occupied",
+        "fence:stuck:fallback:telegram",
+        "nostr",
+    );
+    let stuck_fallback = fence_alert(
+        "alt_fence_stuck_tg",
+        "fence:stuck:fallback:telegram",
+        "telegram",
+    );
+    OperationalStore::insert_alert(store, &stuck, now).await?;
+    OperationalStore::insert_alert(store, &occupied, now).await?;
+    store
+        .run(
+            "UPDATE alert_outbox
+             SET created_at = ?1, state = 'retrying', claim_token = NULL, claim_until = NULL,
+                 claim_owner = NULL
+             WHERE id = 'alt_fence_stuck'",
+            &[number(now - 86_400_001)],
+        )
+        .await?;
+    let settlement_blocked =
+        !OperationalStore::settle_one(store, "alt_fence_stuck", now, Some(&stuck_fallback)).await?;
+    let stuck_row = store
+        .first(
+            "SELECT state, settled_at FROM alert_outbox WHERE id = 'alt_fence_stuck'",
+            &[],
+        )
+        .await?;
+    let settlement_blocked_preserved = stuck_row.as_ref().is_some_and(|row| {
+        row["state"].as_str() == Some("retrying") && row["settled_at"].is_null()
+    });
+
+    Ok(serde_json::json!({
+        "winner": winner,
+        "loser": loser,
+        "telegramRows": telegram,
+        "rolledBack": rolled_back,
+        "rollbackPreserved": rollback_preserved,
+        "settled": settled,
+        "settledAgain": settled_again,
+        "settlementTelegram": settlement_telegram,
+        "settlementPreserved": settlement_preserved,
+        "settlementBlocked": settlement_blocked,
+        "settlementBlockedPreserved": settlement_blocked_preserved,
+    }))
+}
+
+fn fence_alert(id: &str, dedupe: &str, destination: &str) -> AlertDraft {
+    AlertDraft {
+        id: id.to_string(),
+        alert_class: watchdog_core::domain::AlertClass::Outage,
+        incident_id: None,
+        monitor_id: "sfs-web".to_string(),
+        project_id: "smartflowsocial".to_string(),
+        dedupe_key: dedupe.to_string(),
+        destination: watchdog_core::domain::Destination::parse(destination)
+            .unwrap_or(watchdog_core::domain::Destination::Marmot),
+        severity: watchdog_core::domain::Severity::Critical,
+        text: "fence".to_string(),
     }
 }
 
@@ -1191,5 +2213,35 @@ fn outbox_row(row: Value) -> OutboxRow {
         push_phase: row["push_phase"].as_str().map(str::to_string),
         push_envelope_json: row["push_envelope_json"].as_str().map(str::to_string),
         message_event_id: row["message_event_id"].as_str().map(str::to_string),
+        message_state: row["message_state"].as_str().map(str::to_string),
+        push_state: row["push_state"].as_str().map(str::to_string),
+        message_attempts: as_i64(&row["message_attempts"]),
+        push_attempts: as_i64(&row["push_attempts"]),
+        message_updated_at: as_opt_i64(&row["message_updated_at"]),
+        push_updated_at: as_opt_i64(&row["push_updated_at"]),
+        terminal_reason: row["terminal_reason"].as_str().map(str::to_string),
+        operator_ack_at: as_opt_i64(&row["operator_ack_at"]),
+        logical_id: row["logical_id"].as_str().map(str::to_string),
+        submission_generation: as_i64(&row["submission_generation"]),
+        message_reconcile_attempts: as_i64(&row["message_reconcile_attempts"]),
+        unknown_attempts: as_i64(&row["unknown_attempts"]),
+        token_wait_attempts: as_i64(&row["token_wait_attempts"]),
+        push_publication_attempts: as_i64(&row["push_publication_attempts"]),
+        unobservable_attempts: as_i64(&row["unobservable_attempts"]),
+        started_at_ms: as_opt_i64(&row["started_at_ms"]),
+        preserve_message: as_i64(&row["preserve_message"]) == 1,
+        settled_at: as_opt_i64(&row["settled_at"]),
+        operation_id: row["operation_id"].as_str().map(str::to_string),
+        claim_owner: row["claim_owner"].as_str().map(str::to_string),
+        operation_started_at: as_opt_i64(&row["operation_started_at"]),
+        message_phase_started_at: as_opt_i64(&row["message_phase_started_at"]),
+        push_phase_started_at: as_opt_i64(&row["push_phase_started_at"]),
+        auth_message_submissions: as_opt_i64(&row["auth_message_submissions"]),
+        auth_message_publications: as_opt_i64(&row["auth_message_publications"]),
+        auth_message_reconciles: as_opt_i64(&row["auth_message_reconciles"]),
+        auth_ambiguous_reconciles: as_opt_i64(&row["auth_ambiguous_reconciles"]),
+        auth_token_waits: as_opt_i64(&row["auth_token_waits"]),
+        auth_push_publications: as_opt_i64(&row["auth_push_publications"]),
+        auth_push_reconciles: as_opt_i64(&row["auth_push_reconciles"]),
     }
 }

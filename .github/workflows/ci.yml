@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - feat/rust-rewrite
+      - feat/rust-production-hardening
   pull_request:
   workflow_dispatch:
 
@@ -32,7 +33,9 @@ jobs:
         run: cargo clippy --workspace --exclude watchdog-worker --all-targets -- -W clippy::all
 
       - name: Test
-        run: cargo test --workspace --exclude watchdog-worker
+        run: |
+          cargo test --workspace --exclude watchdog-worker
+          cargo test -p watchdog-store --features sqlite --lib
 
       - name: Release binary
         run: cargo build --release -p watchdog-native
@@ -60,6 +63,7 @@ jobs:
         with:
           toolchain: "1.100.0"
           targets: wasm32-unknown-unknown
+          components: llvm-tools
 
       - name: Check the staging Worker
         run: cargo check -p watchdog-worker --target wasm32-unknown-unknown
@@ -77,14 +81,72 @@ jobs:
       - name: Build the image
         run: docker build -t nostr-watchdog:ci .
 
-      - name: Boot and read health
+      - name: Boot, health, persistent state, and helper startup
         run: |
           docker run -d --name watchdog -p 8787:8787 nostr-watchdog:ci
           for _ in 1 2 3 4 5 6 7 8 9 10; do
             if curl -fsS http://127.0.0.1:8787/healthz; then
-              exit 0
+              break
             fi
             sleep 2
           done
-          docker logs watchdog
-          exit 1
+          curl -fsS http://127.0.0.1:8787/healthz | grep -F '"status":"ok"'
+          docker exec watchdog test -x /usr/local/bin/nostr-watchdog
+          docker exec watchdog test -x /usr/local/bin/watchdog-marmot
+          docker exec watchdog test -d /data/marmot
+          docker exec -d watchdog sh -c '/usr/local/bin/watchdog-marmot --root /data/marmot --socket /data/marmot/helper.sock >/data/marmot/helper.log 2>&1'
+          sleep 2
+          if ! docker exec watchdog test -S /data/marmot/helper.sock; then
+            docker exec watchdog cat /data/marmot/helper.log || true
+            exit 1
+          fi
+          docker exec watchdog sh -c 'echo persisted >/data/marmot/persistence-marker'
+          docker exec watchdog test -s /data/watchdog.sqlite
+          docker restart watchdog
+          ready=0
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:8787/healthz | grep -F '"status":"ok"'; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = "1"
+          docker exec watchdog test -s /data/watchdog.sqlite
+          docker exec watchdog test -s /data/marmot/persistence-marker
+          # A surviving directory is not Marmot conversation recovery. That check
+          # waits until the native helper is wired to this operational store.
+
+  workerd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          targets: wasm32-unknown-unknown
+          components: llvm-tools
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install worker-build
+        run: cargo install worker-build --locked
+
+      - name: Workerd scheduled suite
+        run: sh tests/runtime/worker-scheduled.sh
+
+  # These stay off this branch until the named tree is integrated here.
+  # Adding them now would fail for a missing workspace, not for a product defect:
+  # - Agent A's native Marmot helper tests and executable interoperability
+  # - the MDK engine probe as its own job (wasm-worker already checks probes/mdk-engine)
+  # - Agent B's Cloudflare Marmot workspace, the OpenMLS Durable Object probe,
+  #   and a workerd MDK conversation test
+  # The SQLCipher WASM compile probe is a known incompatibility and is not required.
+  # Public relay tests stay opt-in.

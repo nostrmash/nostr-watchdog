@@ -109,7 +109,7 @@ pub async fn deliver_nip17<S: OperationalStore, R: RelayIo, C: Clock>(
                     return retry("claim_lost");
                 }
                 match relay_io
-                    .query_inbox(relay, &recipient, Some(nsec.as_str()), timeout_ms)
+                    .query_inbox(relay, &recipient, None, timeout_ms)
                     .await
                 {
                     Ok(frames) => {
@@ -224,6 +224,10 @@ pub async fn deliver_nip17<S: OperationalStore, R: RelayIo, C: Clock>(
             .unwrap_or(false)
         {
             return retry("claim_lost");
+        }
+        match store.claim_ownership(&row.id, claim, clock.unix_ms()).await {
+            Ok(watchdog_store::ClaimOwnership::Active { .. }) => {}
+            _ => return retry("claim_lost"),
         }
         match relay_io
             .publish(relay, &event_json, Some(nsec.as_str()), timeout_ms)
@@ -376,7 +380,15 @@ mod tests {
             .insert_alert(&draft("disk is full"), 1_700_000_000_000)
             .unwrap();
         let claimed = store
-            .claim_outbox(1_700_000_000_000, 1_700_000_120_000, Some("nostr"), 1)
+            .claim_outbox(
+                1_700_000_000_000,
+                1_700_000_120_000,
+                Some("nostr"),
+                1,
+                "delivery",
+                0,
+                "test",
+            )
             .unwrap();
         let claim = claimed[0].claim_token.clone().unwrap();
         let clock = ManualClock::new(1_700_000_000_000);
@@ -394,8 +406,15 @@ mod tests {
         assert_eq!(published[0].0, "wss://inbox.example");
         assert!(!published[0].1.contains("disk is full"));
         let stored = store.read_envelope("alt_nip17").unwrap().unwrap();
-        let again =
-            store.claim_outbox(clock.unix_ms(), clock.unix_ms() + 120_000, Some("nostr"), 1);
+        let again = store.claim_outbox(
+            clock.unix_ms(),
+            clock.unix_ms() + 120_000,
+            Some("nostr"),
+            1,
+            "delivery",
+            0,
+            "test",
+        );
         // The first delivery accepted the alert, so it is not claimed again.
         // A retry of the same stored envelope is what the outbox keeps.
         assert!(again.unwrap().is_empty());
@@ -427,7 +446,15 @@ mod tests {
             .insert_alert(&draft("disk is full"), 1_700_000_000_000)
             .unwrap();
         let claimed = store
-            .claim_outbox(1_700_000_000_000, 1_700_000_120_000, Some("nostr"), 1)
+            .claim_outbox(
+                1_700_000_000_000,
+                1_700_000_120_000,
+                Some("nostr"),
+                1,
+                "delivery",
+                0,
+                "test",
+            )
             .unwrap();
         let claim = claimed[0].claim_token.clone().unwrap();
         let clock = ManualClock::new(1_700_000_000_000);

@@ -31,11 +31,11 @@ Transports are independent. One failure does not cancel the others.
 
 NIP-04 is not implemented.
 
-Marmot phases on the outbox are `message_prepared`, `message_accepted`, `push_token_unavailable`, `push_trigger_prepared`, and `push_trigger_accepted`. This build does not write the accepted phases, because it does not publish MLS messages or push triggers.
+Canonical message and push states are defined in [agent-c-integration.md](agent-c-integration.md). This branch does not publish MLS messages. When an adapter supplies a known phase, the outbox stores that canonical name. An unknown name is not stored as `rejected`.
 
 ## State
 
-SQLite (native) and D1 use migrations `0001` through `0007`. `0006` is left as it was. `0007` adds the push-record identity `(group, member, leaf, platform, server)` and does not treat a fingerprint as a primary key. The application database is plaintext, mode `0600` on Unix. It stores operational rows and Marmot metadata. MLS private keys stay in the helper's SQLCipher database. Push-token plaintext is not stored here.
+SQLite (native) and D1 use migrations `0001` through `0011`. `0006` is left as it was. `0007` adds the push-record identity `(group, member, leaf, platform, server)` and does not treat a fingerprint as a primary key. `0008` through `0011` are additive and are described in [hardening.md](hardening.md). The application database is plaintext, mode `0600` on Unix. It stores operational rows and Marmot metadata. MLS private keys stay in the helper's SQLCipher database. Push-token plaintext is not stored here.
 
 Claim tokens fence outbox updates. A stale claimant cannot finish or replace an envelope. Gift-wrap JSON is written only while `envelope_json` is null. Delivery is at least once. It is not exactly once. A lost response after a relay accepted an event can be retried and the relay may see a duplicate of the same event id.
 
@@ -45,6 +45,6 @@ The native process wakes about once a minute, runs due monitors with the configu
 
 ## Cloudflare
 
-The Worker scheduled handler calls the same check and update functions, then dispatches notifications after the monitoring lease is released. Fetch serves the operator routes. `storage-sqlite` does not build for `wasm32-unknown-unknown`, so the watchdog Worker still has no MDK session. `probes/mls-durable` has created an OpenMLS group inside a SQLite Durable Object and restored it after workerd restarted. See [mdk-compatibility.md](mdk-compatibility.md). The watchdog bundle has been loaded under local workerd. Health and readiness succeeded against a local D1 database. Scheduled monitoring has not been executed there.
+The Worker scheduled handler calls the same check and update functions, then dispatches notifications after the monitoring lease is released. Fetch serves the operator routes. `storage-sqlite` does not build for `wasm32-unknown-unknown`, so the watchdog Worker still has no MDK session. `probes/mls-durable` has created an OpenMLS group inside a SQLite Durable Object and restored it after workerd restarted. See [mdk-compatibility.md](mdk-compatibility.md). The watchdog bundle has been loaded under local workerd. Health, readiness, scheduled monitoring, delivery fallback, and the D1 completion fence are covered by `tests/runtime/worker-scheduled.sh`.
 
 The staging Worker name is `nostr-watchdog-rust-staging`. It must not be given the production D1 id.

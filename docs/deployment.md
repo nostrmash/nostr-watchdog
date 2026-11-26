@@ -22,9 +22,9 @@ ENABLE_MARMOT = "false"
 
 The environment overrides the file. Leave monitor `ENABLE_*` flags false until the endpoint is set.
 
-`GET /healthz` returns 200 when the process is up. `GET /readyz` returns 200 when SQLite answers.
+`GET /healthz` returns 200 when the process is up. `GET /readyz` returns 200 when the database, schema, configuration, scheduler freshness, and required transports pass. A disabled optional transport does not fail readiness. Unknown Marmot state is reported and does not fail readiness. Enabled Marmot on the Worker is unavailable.
 
-Stop the process with SIGINT. The current minute's probes finish or are dropped when the runtime shuts down. State that was committed stays in SQLite. On the next start the outbox claim leases expire and those rows can be claimed again. Stored gift wraps are reused.
+Stop the process with SIGINT or SIGTERM. New scheduler ticks stop immediately. Active work drains for 25 seconds, open claims are released without deleting stored envelopes, and the Marmot helper is then signalled. Stored gift wraps are reused.
 
 ### systemd
 
@@ -40,6 +40,8 @@ Group=watchdog
 EnvironmentFile=/etc/nostr-watchdog.env
 ExecStart=/usr/local/bin/nostr-watchdog
 Restart=on-failure
+TimeoutStopSec=30
+KillSignal=SIGTERM
 NoNewPrivileges=true
 PrivateTmp=true
 
@@ -60,7 +62,7 @@ docker build -t nostr-watchdog .
 docker run --rm -p 8787:8787 -v watchdog-data:/data -e OPERATOR_TOKEN=replace-me nostr-watchdog
 ```
 
-The image runs as uid 10001 and keeps the database on `/data`. It does not include Node.js. It does not contact Cloudflare.
+The image runs as uid 10001 and keeps the database on `/data`. It contains `nostr-watchdog` and `watchdog-marmot`. Odin, Node.js, and the Rust toolchain stay in the build stage. Set `MARMOT_HELPER=/usr/local/bin/watchdog-marmot` and `MARMOT_ROOT=/var/lib/watchdog/marmot` before enabling Marmot. The image does not contact Cloudflare.
 
 ## Cloudflare staging
 

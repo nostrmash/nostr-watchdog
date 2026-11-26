@@ -13,7 +13,7 @@ sqlite = ["dep:rusqlite"]
 
 [dependencies]
 async-trait = { workspace = true }
-rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }

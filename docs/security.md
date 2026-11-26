@@ -8,7 +8,7 @@ Nostr Watchdog sends operational alerts. Treat the sender keys, operator token, 
 - Redirects are limited to two hops and the original host. An authenticated probe does not follow a redirect.
 - Relay URLs must be `wss` on port 443 and must not be a private address. `ws://` is rejected. Inbox relays that fail that check are dropped before use.
 - GitHub requests are limited to `https` hosts `api.github.com` or `*.github.com`. Other bases are treated as unavailable. Redirects are not followed.
-- Heartbeats use HMAC-SHA256. The current key and, on failure, the previous key are checked. Nonces are stored and a repeat is `401`.
+- Heartbeats use HMAC-SHA256. The current key and, on failure, the previous key are checked. Nonces are stored and a repeat is `401`. A valid older observation is `409` and does not replace newer progress. Equal timestamps keep the first committed row.
 - Operator and status tokens are compared by hashing both sides and comparing the digests. The status body can be signed with `STATUS_SIGNING_SECRET`.
 - Logs go through the existing redaction idea for token-like fields. Private keys, MLS secrets, and push tokens are not written by this code because it does not hold the latter two. Do not add debug prints of `nsec`, `TELEGRAM_BOT_TOKEN`, `GITHUB_TOKEN`, or authorization headers.
 - The SQLite file is created mode `0600` on Unix. That is filesystem permissions, not encryption. Anyone who can read the file can read alert text and the stored NIP-17 gift wrap.
@@ -19,8 +19,9 @@ Nostr Watchdog sends operational alerts. Treat the sender keys, operator token, 
 - D1 and SQLite are not application-level encrypted. A copy of the database is a copy of the alert history.
 - Memory zeroization of secrets is limited. `nsec` values are ordinary `String`s. WASM and a moving garbage-collected host would not honor zeroize anyway. The native process drops them when the request ends, which is not a guarantee against swapping or core dumps.
 - Relay `OK` is not evidence the operator's phone showed the alert.
-- DNS rebinding is only partly addressed: the URL is checked before the request, and the HTTP client does not follow redirects. The native client resolves through the system resolver and does not pin the address it checked. A name that changes between the check and the connect can still be a problem. Prefer IP-literal denial, which is in place, and stable public names.
-- The Worker stub has no operator authentication because it has no data. Do not add data to it without the same auth checks as the native API.
+- Native HTTP, Telegram, and relay sockets resolve once, reject private answers unless the monitor explicitly allows them, and connect to that address while TLS still checks the original name. DNS, TCP, TLS, and the body share one deadline. The Worker `fetch` API cannot pin DNS. Its URL policy rejects literal private hosts before the request, which is weaker than the native pin.
+- Discovery relays never receive a signed NIP-42 identity. Publication relays are signed only after they require authentication, and the original event is resent once with the same id.
+- Operator routes require the operator token. The status reader token can read status and cannot acknowledge, silence, or onboard.
 - Marmot push tokens, if they are stored later, are wake capabilities. `0006` has a column for the encrypted token. This build does not write it. Diagnostics must never return it.
 
 ## Dependencies

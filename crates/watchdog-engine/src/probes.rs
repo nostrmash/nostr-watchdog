@@ -157,7 +157,7 @@ async fn fetch_checked<H: HttpClient>(
     http: &H,
     hop: u8,
 ) -> CheckResult {
-    let started = std::time::Instant::now();
+    let started = watchdog_core::clock::system_unix_ms();
     let mut headers = HashMap::from([
         ("accept".to_string(), "application/json".to_string()),
         ("cache-control".to_string(), "no-cache".to_string()),
@@ -177,9 +177,15 @@ async fn fetch_checked<H: HttpClient>(
         .await
     {
         Ok(response) => response,
-        Err(error) => return network_failure(&error, "", started.elapsed().as_millis() as i64),
+        Err(error) => {
+            return network_failure(
+                &error,
+                "",
+                watchdog_core::clock::system_unix_ms().saturating_sub(started),
+            )
+        }
     };
-    let latency = started.elapsed().as_millis() as i64;
+    let latency = watchdog_core::clock::system_unix_ms().saturating_sub(started);
     if (300..400).contains(&response.status) {
         if !bearer.is_empty() {
             return misconfigured(
@@ -317,7 +323,7 @@ async fn run_alby<H: HttpClient>(
         headers.insert("authorization".to_string(), format!("Bearer {token}"));
     }
     let info_url = target.join("/api/info").unwrap_or(target.clone());
-    let started = std::time::Instant::now();
+    let started = watchdog_core::clock::system_unix_ms();
     let info = match vendor_get(
         http,
         info_url.as_str(),
@@ -329,9 +335,14 @@ async fn run_alby<H: HttpClient>(
     .await
     {
         Ok(response) => response,
-        Err(error) => return vendor_error(&error, started.elapsed().as_millis() as i64),
+        Err(error) => {
+            return vendor_error(
+                &error,
+                watchdog_core::clock::system_unix_ms().saturating_sub(started),
+            )
+        }
     };
-    let latency = started.elapsed().as_millis() as i64;
+    let latency = watchdog_core::clock::system_unix_ms().saturating_sub(started);
     if matches!(info.status, 401 | 403) {
         return misconfigured("The Alby Hub rejected the read-only token.", Some(latency));
     }
@@ -389,7 +400,7 @@ async fn run_alby<H: HttpClient>(
         private_network,
     )
     .await;
-    let done = started.elapsed().as_millis() as i64;
+    let done = watchdog_core::clock::system_unix_ms().saturating_sub(started);
     let (Ok(health), Ok(node)) = (health, node) else {
         return vendor_error("network", done);
     };
@@ -458,7 +469,7 @@ async fn run_btcpay<H: HttpClient>(
     ) else {
         return misconfigured("The BTCPay URL failed the outbound policy.", None);
     };
-    let started = std::time::Instant::now();
+    let started = watchdog_core::clock::system_unix_ms();
     let health_url = target.join("/api/v1/health").unwrap_or(target.clone());
     let health = match vendor_get(
         http,
@@ -471,9 +482,14 @@ async fn run_btcpay<H: HttpClient>(
     .await
     {
         Ok(response) => response,
-        Err(error) => return vendor_error(&error, started.elapsed().as_millis() as i64),
+        Err(error) => {
+            return vendor_error(
+                &error,
+                watchdog_core::clock::system_unix_ms().saturating_sub(started),
+            )
+        }
     };
-    let health_latency = started.elapsed().as_millis() as i64;
+    let health_latency = watchdog_core::clock::system_unix_ms().saturating_sub(started);
     if matches!(health.status, 401 | 403) {
         return misconfigured(
             "The BTCPay health endpoint rejected the request.",
@@ -534,9 +550,14 @@ async fn run_btcpay<H: HttpClient>(
     .await
     {
         Ok(response) => response,
-        Err(error) => return vendor_error(&error, started.elapsed().as_millis() as i64),
+        Err(error) => {
+            return vendor_error(
+                &error,
+                watchdog_core::clock::system_unix_ms().saturating_sub(started),
+            )
+        }
     };
-    let latency = started.elapsed().as_millis() as i64;
+    let latency = watchdog_core::clock::system_unix_ms().saturating_sub(started);
     if matches!(info.status, 401 | 403) {
         return watchdog_core::check_result(
             MonitorStatus::Misconfigured,

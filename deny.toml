@@ -1,6 +1,9 @@
 [advisories]
 version = 2
 yanked = "warn"
+# chrono has no fixed release. The Worker SDK and timestamp formatting still
+# link it. It is not used to parse untrusted input.
+ignore = ["RUSTSEC-2026-0543"]
 
 [licenses]
 version = 2

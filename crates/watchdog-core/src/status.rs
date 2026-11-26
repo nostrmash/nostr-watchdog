@@ -79,6 +79,8 @@ pub struct VendorView {
     pub consecutive_failures: i64,
     pub releases_failures: i64,
     pub advisories_failures: i64,
+    /// Conditional-commit fence. Zero means the row has not been written.
+    pub generation: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -227,7 +229,8 @@ pub fn derive_operational_status(
         "disabled"
     } else if enabled.is_empty() {
         "not_configured"
-    } else if (!destinations.nostr_ready && settings.alerts_enabled) || counts["misconfigured"] > 0
+    } else if (settings.nip17_enabled && settings.alerts_enabled && !destinations.nostr_ready)
+        || counts["misconfigured"] > 0
     {
         "misconfigured"
     } else if check_unhealthy || update_unhealthy {
