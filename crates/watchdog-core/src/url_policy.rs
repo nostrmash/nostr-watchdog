@@ -126,6 +126,28 @@ pub fn workers_websocket_url(wss_url: &str) -> Result<String, UrlPolicyError> {
     Ok(url.to_string())
 }
 
+/// Every resolved address must be acceptable. A mixed public and private
+/// answer is rejected for public destinations. `allow_private` is only for a
+/// monitor that was explicitly placed in the private-network profile.
+pub fn resolved_addresses_allowed(addresses: &[std::net::IpAddr], allow_private: bool) -> bool {
+    !addresses.is_empty()
+        && addresses.iter().all(|address| {
+            let rendered = address.to_string();
+            if is_blocked_address(&rendered) {
+                allow_private && !is_unspecified_or_multicast(address)
+            } else {
+                true
+            }
+        })
+}
+
+fn is_unspecified_or_multicast(address: &std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(ip) => ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast(),
+        std::net::IpAddr::V6(ip) => ip.is_unspecified() || ip.is_multicast(),
+    }
+}
+
 pub fn is_blocked_address(hostname: &str) -> bool {
     !matches!(
         parse_address(hostname),
@@ -377,6 +399,19 @@ mod tests {
     fn private_profile_allows_an_explicit_private_destination() {
         let url = assert_probe_url("http://10.1.2.3/health", allow!("10.1.2.3", true)).unwrap();
         assert_eq!(url.host_str(), Some("10.1.2.3"));
+    }
+
+    #[test]
+    fn mixed_resolution_is_rejected_unless_the_monitor_allows_private_addresses() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let public = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let private = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
+        assert!(resolved_addresses_allowed(&[public], false));
+        assert!(!resolved_addresses_allowed(&[private], false));
+        assert!(resolved_addresses_allowed(&[private], true));
+        assert!(!resolved_addresses_allowed(&[public, private], false));
+        assert!(resolved_addresses_allowed(&[public, private], true));
+        assert!(!resolved_addresses_allowed(&[], true));
     }
 
     #[test]

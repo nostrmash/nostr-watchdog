@@ -10,7 +10,7 @@ use watchdog_core::heartbeat::parse_heartbeat;
 use watchdog_core::settings::Settings;
 use watchdog_core::status::{derive_operational_status, DestinationFlags};
 use watchdog_notify::marmot_blocker;
-use watchdog_store::SqliteStore;
+use watchdog_store::OperationalStore;
 
 use crate::cycle::{dispatch_due, Notifier};
 
@@ -62,8 +62,8 @@ pub struct ApiResponse {
 
 pub struct ApiError;
 
-pub async fn handle(
-    store: &SqliteStore,
+pub async fn handle<S: OperationalStore>(
+    store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     notifier: &dyn Notifier,
@@ -80,7 +80,7 @@ pub async fn handle(
             }),
         ),
         ApiRequest::Status { authorization } => {
-            status(store, settings, get, authorization.as_deref(), now)
+            status(store, settings, get, authorization.as_deref(), now).await
         }
         ApiRequest::Heartbeat {
             monitor_id,
@@ -89,18 +89,21 @@ pub async fn handle(
             nonce,
             signature,
             body,
-        } => heartbeat(
-            store,
-            settings,
-            get,
-            &monitor_id,
-            &content_type,
-            &timestamp,
-            &nonce,
-            &signature,
-            &body,
-            now,
-        ),
+        } => {
+            heartbeat(
+                store,
+                settings,
+                get,
+                &monitor_id,
+                &content_type,
+                &timestamp,
+                &nonce,
+                &signature,
+                &body,
+                now,
+            )
+            .await
+        }
         ApiRequest::TestAlert {
             authorization,
             body,
@@ -121,31 +124,36 @@ pub async fn handle(
         ApiRequest::MarmotDiagnostic {
             authorization,
             project,
-        } => marmot_diagnostic(store, get, authorization.as_deref(), &project, now),
-        ApiRequest::FailedOutbox { authorization } => failed(store, get, authorization.as_deref()),
+        } => marmot_diagnostic(store, get, authorization.as_deref(), &project, now).await,
+        ApiRequest::FailedOutbox { authorization } => {
+            failed(store, get, authorization.as_deref()).await
+        }
         ApiRequest::RetryOutbox { authorization, id } => {
-            retry(store, get, authorization.as_deref(), &id, now)
+            retry(store, get, authorization.as_deref(), &id, now).await
         }
         ApiRequest::Incident {
             authorization,
             id,
             action,
             body,
-        } => incident(
-            store,
-            get,
-            authorization.as_deref(),
-            &id,
-            &action,
-            &body,
-            now,
-        ),
+        } => {
+            incident(
+                store,
+                get,
+                authorization.as_deref(),
+                &id,
+                &action,
+                &body,
+                now,
+            )
+            .await
+        }
         ApiRequest::NotFound => json_response(404, json!({"error": "not_found"})),
     }
 }
 
-fn status(
-    store: &SqliteStore,
+async fn status<S: OperationalStore>(
+    store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     authorization: Option<&str>,
@@ -154,7 +162,7 @@ fn status(
     if let Some(response) = authorize(get, authorization, true) {
         return response;
     }
-    let Ok(snapshot) = store.snapshot() else {
+    let Ok(snapshot) = store.snapshot().await else {
         return json_response(503, json!({"error": "status_unavailable"}));
     };
     let enabled = watchdog_core::catalog::enabled_monitors(get);
@@ -182,8 +190,8 @@ fn status(
     response
 }
 
-fn heartbeat(
-    store: &SqliteStore,
+async fn heartbeat<S: OperationalStore>(
+    store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     monitor_id: &str,
@@ -251,25 +259,28 @@ fn heartbeat(
     else {
         return json_response(400, json!({"error": "bad_request"}));
     };
-    match store.store_heartbeat(
-        monitor.id,
-        monitor.project_id,
-        now,
-        reported * 1000,
-        nonce,
-        reported * 1000 + settings.skew_seconds * 1000,
-        payload.progress.as_deref(),
-        payload.idle.unwrap_or(false),
-        payload.loop_at.map(|value| value as i64),
-    ) {
+    match store
+        .store_heartbeat(
+            monitor.id,
+            monitor.project_id,
+            now,
+            reported * 1000,
+            nonce,
+            reported * 1000 + settings.skew_seconds * 1000,
+            payload.progress.as_deref(),
+            payload.idle.unwrap_or(false),
+            payload.loop_at.map(|value| value as i64),
+        )
+        .await
+    {
         Ok(true) => json_response(200, json!({"status": "ok"})),
         Ok(false) => json_response(401, json!({"error": "replay"})),
         Err(_) => json_response(500, json!({"error": "internal_error"})),
     }
 }
 
-async fn test_alert(
-    store: &SqliteStore,
+async fn test_alert<S: OperationalStore>(
+    store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     notifier: &dyn Notifier,
@@ -293,20 +304,16 @@ async fn test_alert(
     if !known_project(project_id) {
         return json_response(400, json!({"error": "bad_request"}));
     }
-    let destination = match transport.unwrap_or("nostr") {
+    let requested = value.get("transport").and_then(Value::as_str).or(transport);
+    let Some(requested) = requested else {
+        return json_response(400, json!({"error": "transport_required"}));
+    };
+    let destination = match requested {
         "marmot" => Destination::Marmot,
         "telegram" => Destination::Telegram,
-        "nostr" => Destination::Nostr,
-        _ => return json_response(400, json!({"error": "bad_request"})),
+        "nip17" | "nostr" => Destination::Nostr,
+        _ => return json_response(400, json!({"error": "transport_invalid"})),
     };
-    let destination_name = destination.as_str();
-    if store
-        .count_recent(&format!("test:{project_id}:"), now - 3_600_000)
-        .unwrap_or(i64::MAX)
-        >= 3
-    {
-        return json_response(429, json!({"error": "rate_limited"}));
-    }
     let Some(project) = project_by_id(project_id) else {
         return json_response(400, json!({"error": "bad_request"}));
     };
@@ -321,15 +328,35 @@ async fn test_alert(
         severity: Severity::Info,
         text: format_test_message(project.display_name, now),
     };
-    if store.insert_alert(&alert, now).is_err() {
-        return json_response(500, json!({"error": "internal_error"}));
+    let allowed = store
+        .insert_alert_if_allowed(
+            &alert,
+            now,
+            &format!("test:{project_id}:"),
+            now - 3_600_000,
+            3,
+        )
+        .await;
+    match allowed {
+        Ok(false) => return json_response(429, json!({"error": "rate_limited"})),
+        Err(_) => return json_response(500, json!({"error": "internal_error"})),
+        Ok(true) => {}
     }
     let _ = dispatch_due(store, settings, get, notifier, now).await;
-    json_response(200, json!({"queued": true, "delivery": destination_name}))
+    json_response(
+        202,
+        json!({
+            "alertId": alert.id,
+            "transport": requested,
+            "queueStatus": "queued",
+            "deliveryState": "queued",
+            "note": "Queued is not delivery. Relay acceptance is not phone delivery."
+        }),
+    )
 }
 
-fn marmot_diagnostic(
-    store: &SqliteStore,
+async fn marmot_diagnostic<S: OperationalStore>(
+    store: &S,
     get: &impl Fn(&str) -> String,
     authorization: Option<&str>,
     project: &str,
@@ -341,7 +368,7 @@ fn marmot_diagnostic(
     if !known_project(project) {
         return json_response(400, json!({"error": "bad_request"}));
     }
-    let row = store.marmot_project(project).ok().flatten();
+    let row = store.marmot_project(project).await.ok().flatten();
     json_response(
         200,
         json!({
@@ -361,15 +388,15 @@ fn marmot_diagnostic(
     )
 }
 
-fn failed(
-    store: &SqliteStore,
+async fn failed<S: OperationalStore>(
+    store: &S,
     get: &impl Fn(&str) -> String,
     authorization: Option<&str>,
 ) -> ApiResponse {
     if let Some(response) = authorize(get, authorization, false) {
         return response;
     }
-    let alerts = store.list_failed().unwrap_or_default();
+    let alerts = store.list_failed().await.unwrap_or_default();
     json_response(
         200,
         json!({
@@ -383,8 +410,8 @@ fn failed(
     )
 }
 
-fn retry(
-    store: &SqliteStore,
+async fn retry<S: OperationalStore>(
+    store: &S,
     get: &impl Fn(&str) -> String,
     authorization: Option<&str>,
     id: &str,
@@ -393,15 +420,15 @@ fn retry(
     if let Some(response) = authorize(get, authorization, false) {
         return response;
     }
-    match store.retry_dead_letter(id, now) {
+    match store.retry_dead_letter(id, now).await {
         Ok(true) => json_response(200, json!({"id": id, "status": "queued"})),
         Ok(false) => json_response(404, json!({"error": "not_found"})),
         Err(_) => json_response(500, json!({"error": "internal_error"})),
     }
 }
 
-fn incident(
-    store: &SqliteStore,
+async fn incident<S: OperationalStore>(
+    store: &S,
     get: &impl Fn(&str) -> String,
     authorization: Option<&str>,
     id: &str,
@@ -412,14 +439,14 @@ fn incident(
     if let Some(response) = authorize(get, authorization, false) {
         return response;
     }
-    let Ok(Some((monitor_id, status))) = store.open_incident_status(id) else {
+    let Ok(Some((monitor_id, status))) = store.open_incident_status(id).await else {
         return json_response(404, json!({"error": "not_found"}));
     };
     if status != "open" {
         return json_response(404, json!({"error": "not_found"}));
     }
     if action == "ack" {
-        let _ = store.ack_incident(id, now);
+        let _ = store.ack_incident(id, now).await;
         return json_response(
             200,
             json!({"id": id, "monitorId": monitor_id, "status": "acked"}),
@@ -437,7 +464,9 @@ fn incident(
             minutes = parsed;
         }
     }
-    let _ = store.silence_incident(id, now + minutes * 60_000, now);
+    let _ = store
+        .silence_incident(id, now + minutes * 60_000, now)
+        .await;
     json_response(
         200,
         json!({"id": id, "monitorId": monitor_id, "status": "silenced"}),

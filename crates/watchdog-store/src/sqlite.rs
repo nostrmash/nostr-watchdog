@@ -2,7 +2,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
-use thiserror::Error;
 use watchdog_core::domain::{
     AlertClass, AlertDraft, CheckResult, DeliveryState, Destination, IncidentKind, MonitorMemory,
     MonitorStatus, Notice, NoticeEvent, OpenIncident, Severity,
@@ -36,6 +35,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0006_marmot",
         include_str!("../../../migrations/0006_marmot.sql"),
     ),
+    (
+        "0007_marmot_push_identity",
+        include_str!("../../../migrations/0007_marmot_push_identity.sql"),
+    ),
 ];
 
 const ACCEPTED_RETENTION_MS: i64 = 14 * 86_400_000;
@@ -43,14 +46,16 @@ const DEAD_LETTER_RETENTION_MS: i64 = 30 * 86_400_000;
 const CLOSED_INCIDENT_RETENTION_MS: i64 = 90 * 86_400_000;
 const UPSTREAM_RETENTION_MS: i64 = 7 * 86_400_000;
 
-#[derive(Debug, Error)]
-pub enum StoreError {
-    #[error("database error")]
-    Sqlite(#[from] rusqlite::Error),
-    #[error("database lock poisoned")]
-    Poison,
-    #[error("stored value is invalid")]
-    Invalid,
+use crate::model::{
+    CommitOutcome, FailedAlert, HeartbeatStored, LoadedMemory, MarmotProjectRow, OutboxRow,
+    StoreError, UpstreamRow, VersionRow,
+};
+use crate::OperationalStore;
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(value: rusqlite::Error) -> Self {
+        StoreError::Database(value.to_string())
+    }
 }
 
 #[derive(Clone)]
@@ -58,98 +63,31 @@ pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
 }
 
-#[derive(Clone, Debug)]
-pub struct LoadedMemory {
-    pub memory: MonitorMemory,
-    pub generation: i64,
-}
-
-#[derive(Clone, Debug)]
-pub struct CommitOutcome {
-    pub committed: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct FailedAlert {
-    pub id: String,
-    pub monitor_id: String,
-    pub destination: String,
-    pub last_error: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct OutboxRow {
-    pub id: String,
-    pub alert_class: String,
-    pub incident_id: Option<String>,
-    pub monitor_id: String,
-    pub project_id: String,
-    pub dedupe_key: String,
-    pub destination: String,
-    pub severity: String,
-    pub state: String,
-    pub payload_text: String,
-    pub envelope_json: Option<String>,
-    pub attempt_count: i64,
-    pub next_attempt_at: i64,
-    pub claim_until: Option<i64>,
-    pub claim_token: Option<String>,
-    pub accepted_relays: Option<String>,
-    pub failed_relays: Option<String>,
-    pub last_error: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub message_phase: Option<String>,
-    pub push_phase: Option<String>,
-    pub push_envelope_json: Option<String>,
-    pub message_event_id: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct HeartbeatStored {
-    pub received_at: i64,
-    pub progress_token: Option<String>,
-    pub progress_changed_at: i64,
-    pub idle: bool,
-    pub loop_at: Option<i64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct VersionRow {
-    pub installed: Option<String>,
-    pub latest: Option<String>,
-    pub latest_url: Option<String>,
-    pub security_status: String,
-    pub advisory_fingerprint: Option<String>,
-    pub notice_fingerprint: Option<String>,
-    pub security_reminded_at: Option<i64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct UpstreamRow {
-    pub etag: Option<String>,
-    pub payload_json: Option<String>,
-    pub fetched_at: i64,
-    pub rate_limited_until: Option<i64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct MarmotProjectRow {
-    pub project_id: String,
-    pub pubkey: Option<String>,
-    pub conversation_id: Option<String>,
-    pub group_id_hex: Option<String>,
-    pub peer_pubkey: Option<String>,
-    pub last_sync_at: Option<i64>,
-    pub last_sync_error: Option<String>,
-    pub key_package_published_at: Option<i64>,
-    pub engine_status: String,
-}
-
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| StoreError::Database(error.to_string()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                        .map_err(|error| StoreError::Database(error.to_string()))?;
+                }
+            }
+        }
+        if !path.exists() {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(path)
+                .map_err(|error| StoreError::Database(error.to_string()))?;
         }
         let conn = Connection::open(path)?;
         let store = Self {
@@ -159,7 +97,8 @@ impl SqliteStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| StoreError::Database(error.to_string()))?;
         }
         Ok(store)
     }
@@ -173,12 +112,13 @@ impl SqliteStore {
     }
 
     fn migrate(&self) -> Result<(), StoreError> {
-        let conn = self.lock()?;
+        let mut conn = self.lock()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);",
         )?;
         for (id, sql) in MIGRATIONS {
-            let exists: bool = conn
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let exists: bool = tx
                 .query_row(
                     "SELECT 1 FROM schema_migrations WHERE id = ?1",
                     params![id],
@@ -186,14 +126,14 @@ impl SqliteStore {
                 )
                 .optional()?
                 .unwrap_or(false);
-            if exists {
-                continue;
+            if !exists {
+                tx.execute_batch(sql)?;
+                tx.execute(
+                    "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
+                    params![id, 0],
+                )?;
             }
-            conn.execute_batch(sql)?;
-            conn.execute(
-                "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
-                params![id, 0],
-            )?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -571,6 +511,48 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn insert_alert_if_allowed(
+        &self,
+        alert: &AlertDraft,
+        now: i64,
+        prefix: &str,
+        since: i64,
+        limit: i64,
+    ) -> Result<bool, StoreError> {
+        let pattern = format!("{prefix}%");
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM alert_outbox WHERE dedupe_key LIKE ?1 AND created_at >= ?2",
+            params![pattern, since],
+            |row| row.get(0),
+        )?;
+        if count >= limit {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO alert_outbox (
+                id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
+                state, payload_text, attempt_count, next_attempt_at, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10)",
+            params![
+                alert.id,
+                alert.alert_class.as_str(),
+                alert.incident_id,
+                alert.monitor_id,
+                alert.project_id,
+                alert.dedupe_key,
+                alert.destination.as_str(),
+                alert.severity.as_str(),
+                alert.text,
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn count_recent(&self, prefix: &str, since: i64) -> Result<i64, StoreError> {
         let pattern = format!("{prefix}%");
         let count = self.lock()?.query_row(
@@ -581,16 +563,24 @@ impl SqliteStore {
         Ok(count)
     }
 
-    pub fn claim_outbox(&self, now: i64, claim_until: i64) -> Result<Vec<OutboxRow>, StoreError> {
+    pub fn claim_outbox(
+        &self,
+        now: i64,
+        claim_until: i64,
+        destination: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<OutboxRow>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id FROM alert_outbox
              WHERE state IN ('queued', 'retrying') AND next_attempt_at <= ?1
                AND (claim_until IS NULL OR claim_until < ?1)
-             ORDER BY created_at LIMIT 20",
+               AND (?2 IS NULL OR destination = ?2)
+             ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, created_at
+             LIMIT ?3",
         )?;
         let ids: Vec<String> = stmt
-            .query_map(params![now], |row| row.get(0))?
+            .query_map(params![now, destination, limit], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         let mut claimed = Vec::new();
@@ -1277,6 +1267,260 @@ fn _enum_markers(class: AlertClass, destination: Destination) -> (&'static str, 
     (class.as_str(), destination.as_str())
 }
 
+impl OperationalStore for SqliteStore {
+    async fn load_memory(&self, monitor_id: &str) -> Result<LoadedMemory, StoreError> {
+        SqliteStore::load_memory(self, monitor_id)
+    }
+    async fn commit_check(
+        &self,
+        monitor_id: &str,
+        project_id: &str,
+        previous_generation: i64,
+        memory: &watchdog_core::domain::MonitorMemory,
+        check: &watchdog_core::domain::CheckResult,
+        now: i64,
+        notices: &[watchdog_core::domain::Notice],
+        alerts: &[watchdog_core::domain::AlertDraft],
+    ) -> Result<CommitOutcome, StoreError> {
+        SqliteStore::commit_check(
+            self,
+            monitor_id,
+            project_id,
+            previous_generation,
+            memory,
+            check,
+            now,
+            notices,
+            alerts,
+        )
+    }
+    async fn acquire_lease(
+        &self,
+        name: &str,
+        owner: &str,
+        until: i64,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        SqliteStore::acquire_lease(self, name, owner, until, now)
+    }
+    async fn release_lease(&self, name: &str, owner: &str, now: i64) -> Result<(), StoreError> {
+        SqliteStore::release_lease(self, name, owner, now)
+    }
+    async fn mark_run(
+        &self,
+        name: &str,
+        started_at: Option<i64>,
+        finished_at: Option<i64>,
+        error: Option<&str>,
+        success_at: Option<i64>,
+    ) -> Result<(), StoreError> {
+        SqliteStore::mark_run(self, name, started_at, finished_at, error, success_at)
+    }
+    async fn last_checks(&self) -> Result<Vec<(String, Option<i64>)>, StoreError> {
+        SqliteStore::last_checks(self)
+    }
+    async fn read_heartbeat(
+        &self,
+        monitor_id: &str,
+    ) -> Result<Option<HeartbeatStored>, StoreError> {
+        SqliteStore::read_heartbeat(self, monitor_id)
+    }
+    async fn store_heartbeat(
+        &self,
+        monitor_id: &str,
+        project_id: &str,
+        now: i64,
+        reported_at: i64,
+        nonce: &str,
+        nonce_expires_at: i64,
+        progress: Option<&str>,
+        idle: bool,
+        loop_at: Option<i64>,
+    ) -> Result<bool, StoreError> {
+        SqliteStore::store_heartbeat(
+            self,
+            monitor_id,
+            project_id,
+            now,
+            reported_at,
+            nonce,
+            nonce_expires_at,
+            progress,
+            idle,
+            loop_at,
+        )
+    }
+    async fn insert_alert(
+        &self,
+        alert: &watchdog_core::domain::AlertDraft,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        SqliteStore::insert_alert(self, alert, now)
+    }
+    async fn insert_alert_if_allowed(
+        &self,
+        alert: &watchdog_core::domain::AlertDraft,
+        now: i64,
+        prefix: &str,
+        since: i64,
+        limit: i64,
+    ) -> Result<bool, StoreError> {
+        SqliteStore::insert_alert_if_allowed(self, alert, now, prefix, since, limit)
+    }
+    async fn count_recent(&self, prefix: &str, since: i64) -> Result<i64, StoreError> {
+        SqliteStore::count_recent(self, prefix, since)
+    }
+    async fn claim_outbox(
+        &self,
+        now: i64,
+        claim_until: i64,
+        destination: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<OutboxRow>, StoreError> {
+        SqliteStore::claim_outbox(self, now, claim_until, destination, limit)
+    }
+    async fn extend_claim(
+        &self,
+        id: &str,
+        token: &str,
+        claim_until: i64,
+    ) -> Result<bool, StoreError> {
+        SqliteStore::extend_claim(self, id, token, claim_until)
+    }
+    async fn save_envelope(
+        &self,
+        id: &str,
+        token: &str,
+        envelope: &str,
+        now: i64,
+    ) -> Result<&'static str, StoreError> {
+        SqliteStore::save_envelope(self, id, token, envelope, now)
+    }
+    async fn read_envelope(&self, id: &str) -> Result<Option<String>, StoreError> {
+        SqliteStore::read_envelope(self, id)
+    }
+    async fn finish_delivery(
+        &self,
+        id: &str,
+        token: &str,
+        state: watchdog_core::domain::DeliveryState,
+        attempt_count: i64,
+        next_attempt_at: i64,
+        error: Option<&str>,
+        accepted_relays: Option<&str>,
+        failed_relays: Option<&str>,
+        message_phase: Option<&str>,
+        push_phase: Option<&str>,
+        message_event_id: Option<&str>,
+        push_envelope: Option<&str>,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        SqliteStore::finish_delivery(
+            self,
+            id,
+            token,
+            state,
+            attempt_count,
+            next_attempt_at,
+            error,
+            accepted_relays,
+            failed_relays,
+            message_phase,
+            push_phase,
+            message_event_id,
+            push_envelope,
+            now,
+        )
+    }
+    async fn retry_dead_letter(&self, id: &str, now: i64) -> Result<bool, StoreError> {
+        SqliteStore::retry_dead_letter(self, id, now)
+    }
+    async fn ack_incident(&self, id: &str, now: i64) -> Result<bool, StoreError> {
+        SqliteStore::ack_incident(self, id, now)
+    }
+    async fn silence_incident(&self, id: &str, until: i64, now: i64) -> Result<bool, StoreError> {
+        SqliteStore::silence_incident(self, id, until, now)
+    }
+    async fn open_incident_status(&self, id: &str) -> Result<Option<(String, String)>, StoreError> {
+        SqliteStore::open_incident_status(self, id)
+    }
+    async fn list_failed(&self) -> Result<Vec<FailedAlert>, StoreError> {
+        SqliteStore::list_failed(self)
+    }
+    async fn save_relay_cache(
+        &self,
+        pubkey: &str,
+        relays_json: &str,
+        negative: bool,
+        fetched_at: i64,
+        expires_at: i64,
+    ) -> Result<(), StoreError> {
+        SqliteStore::save_relay_cache(self, pubkey, relays_json, negative, fetched_at, expires_at)
+    }
+    async fn relay_cache(
+        &self,
+        pubkey: &str,
+        now: i64,
+    ) -> Result<Option<(String, bool)>, StoreError> {
+        SqliteStore::relay_cache(self, pubkey, now)
+    }
+    async fn remembered_inbox(&self, pubkey: &str) -> Result<Vec<String>, StoreError> {
+        SqliteStore::remembered_inbox(self, pubkey)
+    }
+    async fn prune(&self, now: i64) -> Result<(), StoreError> {
+        SqliteStore::prune(self, now)
+    }
+    async fn snapshot(&self) -> Result<watchdog_core::status::StatusSnapshot, StoreError> {
+        SqliteStore::snapshot(self)
+    }
+    async fn upsert_marmot_project(
+        &self,
+        row: &MarmotProjectRow,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        SqliteStore::upsert_marmot_project(self, row, now)
+    }
+    async fn marmot_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<MarmotProjectRow>, StoreError> {
+        SqliteStore::marmot_project(self, project_id)
+    }
+    async fn installed_version(&self, monitor_id: &str) -> Result<Option<String>, StoreError> {
+        SqliteStore::installed_version(self, monitor_id)
+    }
+    async fn read_version(&self, monitor_id: &str) -> Result<Option<VersionRow>, StoreError> {
+        SqliteStore::read_version(self, monitor_id)
+    }
+    async fn write_version(
+        &self,
+        monitor_id: &str,
+        row: &VersionRow,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        SqliteStore::write_version(self, monitor_id, row, now)
+    }
+    async fn read_upstream(&self, key: &str) -> Result<Option<UpstreamRow>, StoreError> {
+        SqliteStore::read_upstream(self, key)
+    }
+    async fn write_upstream(&self, key: &str, row: &UpstreamRow) -> Result<(), StoreError> {
+        SqliteStore::write_upstream(self, key, row)
+    }
+    async fn read_vendor(
+        &self,
+        monitor_id: &str,
+    ) -> Result<Option<watchdog_core::status::VendorView>, StoreError> {
+        SqliteStore::read_vendor(self, monitor_id)
+    }
+    async fn write_vendor(
+        &self,
+        row: &watchdog_core::status::VendorView,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        SqliteStore::write_vendor(self, row, now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,7 +1619,7 @@ mod tests {
                 10,
             )
             .unwrap();
-        let claimed = store.claim_outbox(10, 100).unwrap();
+        let claimed = store.claim_outbox(10, 100, None, 4).unwrap();
         assert_eq!(claimed.len(), 1);
         let token = claimed[0].claim_token.clone().unwrap();
         assert!(!store.extend_claim("alt_1", "other", 200).unwrap());

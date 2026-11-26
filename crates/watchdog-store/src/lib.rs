@@ -1,13 +1,18 @@
 //! Application state for both deployment targets.
-#![allow(clippy::too_many_arguments, clippy::result_unit_err)]
 //!
-//! The schema is the existing D1 migration chain plus an additive Marmot
-//! metadata migration. MLS private keys are not stored here. The official MDK
-//! storage backend is separate and, today, native-only.
+//! The schema is the existing D1 migration chain plus additive Marmot
+//! metadata. MLS private keys are not stored here. Official MDK storage is a
+//! separate database.
 
+mod contract;
+mod model;
+#[cfg(feature = "sqlite")]
 mod sqlite;
 
-pub use sqlite::{
+pub use contract::OperationalStore;
+pub use model::{
     CommitOutcome, FailedAlert, HeartbeatStored, LoadedMemory, MarmotProjectRow, OutboxRow,
-    SqliteStore, StoreError, UpstreamRow, VersionRow,
+    StoreError, UpstreamRow, VersionRow,
 };
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteStore;

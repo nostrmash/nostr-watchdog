@@ -19,7 +19,7 @@ use watchdog_core::security_feed::{
 use watchdog_core::semver::{latest_stable, update_available, ReleaseRef};
 use watchdog_core::settings::{route_for, Settings, TelegramMode};
 use watchdog_core::status::VendorView;
-use watchdog_store::{SqliteStore, UpstreamRow, VersionRow};
+use watchdog_store::{OperationalStore, UpstreamRow, VersionRow};
 
 use crate::cycle::{dispatch_due, Notifier};
 use crate::probes::{HttpClient, ProbeRequest, ProbeResponse};
@@ -30,8 +30,8 @@ struct Feed<T> {
     error_code: Option<&'static str>,
 }
 
-pub async fn run_update_cycle(
-    store: &SqliteStore,
+pub async fn run_update_cycle<S: OperationalStore>(
+    store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     http: &dyn HttpClient,
@@ -42,10 +42,15 @@ pub async fn run_update_cycle(
         return Ok(());
     }
     let owner = Uuid::new_v4().to_string();
-    if !store.acquire_lease("updates", &owner, now + 600_000, now)? {
+    if !store
+        .acquire_lease("updates", &owner, now + 600_000, now)
+        .await?
+    {
         return Ok(());
     }
-    store.mark_run("updates", Some(now), None, None, None)?;
+    store
+        .mark_run("updates", Some(now), None, None, None)
+        .await?;
     let mut failed = 0;
     let mut incomplete = 0;
     let mut rate_limited = 0;
@@ -87,7 +92,7 @@ pub async fn run_update_cycle(
                 }
             }
         }
-        record_vendor(store, get, &monitor, &outcome)?;
+        record_vendor(store, get, &monitor, &outcome).await?;
     }
     let _ = dispatch_due(store, settings, get, notifier, now).await;
     let error = if failed > 0 {
@@ -101,14 +106,16 @@ pub async fn run_update_cycle(
     } else {
         None
     };
-    store.mark_run(
-        "updates",
-        None,
-        Some(now),
-        error,
-        error.is_none().then_some(now),
-    )?;
-    store.release_lease("updates", &owner, now)?;
+    store
+        .mark_run(
+            "updates",
+            None,
+            Some(now),
+            error,
+            error.is_none().then_some(now),
+        )
+        .await?;
+    store.release_lease("updates", &owner, now).await?;
     Ok(())
 }
 
@@ -125,8 +132,8 @@ struct Outcome {
     checked_at: i64,
 }
 
-async fn check_vendor(
-    store: &SqliteStore,
+async fn check_vendor<S: OperationalStore>(
+    store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     http: &dyn HttpClient,
@@ -135,7 +142,7 @@ async fn check_vendor(
     now: i64,
 ) -> Result<Outcome, watchdog_store::StoreError> {
     let (owner, repo) = vendor.github();
-    let installed = store.installed_version(monitor.id)?;
+    let installed = store.installed_version(monitor.id).await?;
     let releases = load_feed(
         store,
         http,
@@ -162,7 +169,7 @@ async fn check_vendor(
         parse_advisories,
     )
     .await?;
-    let previous = store.read_version(monitor.id)?;
+    let previous = store.read_version(monitor.id).await?;
     let release_state = source_state(&releases);
     let advisory_state = source_state(&advisories);
     let release_fresh = release_state == "fresh";
@@ -299,27 +306,29 @@ async fn check_vendor(
     let latest_url = latest
         .map(|item| item.url.clone())
         .or_else(|| previous.as_ref().and_then(|row| row.latest_url.clone()));
-    store.write_version(
-        monitor.id,
-        &VersionRow {
-            installed: installed.clone(),
-            latest: latest_kept,
-            latest_url,
-            security_status: status.as_str().to_string(),
-            advisory_fingerprint: Some(if status == SecurityStatus::Unknown {
-                previous
-                    .and_then(|row| row.advisory_fingerprint)
-                    .unwrap_or(fingerprint.clone())
-            } else {
-                fingerprint.clone()
-            }),
-            notice_fingerprint: notice,
-            security_reminded_at: reminded,
-        },
-        now,
-    )?;
+    store
+        .write_version(
+            monitor.id,
+            &VersionRow {
+                installed: installed.clone(),
+                latest: latest_kept,
+                latest_url,
+                security_status: status.as_str().to_string(),
+                advisory_fingerprint: Some(if status == SecurityStatus::Unknown {
+                    previous
+                        .and_then(|row| row.advisory_fingerprint)
+                        .unwrap_or(fingerprint.clone())
+                } else {
+                    fingerprint.clone()
+                }),
+                notice_fingerprint: notice,
+                security_reminded_at: reminded,
+            },
+            now,
+        )
+        .await?;
     for alert in &alerts {
-        store.insert_alert(alert, now)?;
+        store.insert_alert(alert, now).await?;
     }
     let error_code = vendor_error(
         coverage,
@@ -342,13 +351,13 @@ async fn check_vendor(
     })
 }
 
-fn record_vendor(
-    store: &SqliteStore,
+async fn record_vendor<S: OperationalStore>(
+    store: &S,
     get: &impl Fn(&str) -> String,
     monitor: &MonitorDefinition,
     outcome: &Outcome,
 ) -> Result<(), watchdog_store::StoreError> {
-    let previous = store.read_vendor(&outcome.monitor_id)?;
+    let previous = store.read_vendor(&outcome.monitor_id).await?;
     let rate_limited = outcome.error_code == Some("rate_limited");
     let hard_failure = outcome.coverage == "unavailable" && !rate_limited;
     let consecutive = if outcome.succeeded {
@@ -382,28 +391,31 @@ fn record_vendor(
             .unwrap_or(0),
     );
     let partial = outcome.coverage == "partial" || outcome.coverage == "policy_only";
-    store.write_vendor(
-        &VendorView {
-            monitor_id: outcome.monitor_id.clone(),
-            vendor: outcome.vendor.clone(),
-            attempted_at: Some(outcome.checked_at),
-            succeeded_at: outcome.succeeded.then_some(outcome.checked_at),
-            partial_succeeded_at: partial.then_some(outcome.checked_at),
-            releases_checked_at: (outcome.releases_state == "fresh").then_some(outcome.checked_at),
-            advisories_checked_at: (outcome.advisories_state == "fresh")
-                .then_some(outcome.checked_at),
-            releases_stale: outcome.releases_state != "fresh",
-            advisories_stale: outcome.advisories_state != "fresh",
-            releases_state: outcome.releases_state.to_string(),
-            advisories_state: outcome.advisories_state.to_string(),
-            coverage: outcome.coverage.to_string(),
-            error_code: outcome.error_code.map(str::to_string),
-            consecutive_failures: consecutive,
-            releases_failures,
-            advisories_failures,
-        },
-        outcome.checked_at,
-    )?;
+    store
+        .write_vendor(
+            &VendorView {
+                monitor_id: outcome.monitor_id.clone(),
+                vendor: outcome.vendor.clone(),
+                attempted_at: Some(outcome.checked_at),
+                succeeded_at: outcome.succeeded.then_some(outcome.checked_at),
+                partial_succeeded_at: partial.then_some(outcome.checked_at),
+                releases_checked_at: (outcome.releases_state == "fresh")
+                    .then_some(outcome.checked_at),
+                advisories_checked_at: (outcome.advisories_state == "fresh")
+                    .then_some(outcome.checked_at),
+                releases_stale: outcome.releases_state != "fresh",
+                advisories_stale: outcome.advisories_state != "fresh",
+                releases_state: outcome.releases_state.to_string(),
+                advisories_state: outcome.advisories_state.to_string(),
+                coverage: outcome.coverage.to_string(),
+                error_code: outcome.error_code.map(str::to_string),
+                consecutive_failures: consecutive,
+                releases_failures,
+                advisories_failures,
+            },
+            outcome.checked_at,
+        )
+        .await?;
     if hard_failure && consecutive == 3 {
         let Some(project) = project_by_id(monitor.project_id) else {
             return Ok(());
@@ -427,7 +439,7 @@ fn record_vendor(
                 ),
             },
             outcome.checked_at,
-        )?;
+        ).await?;
         let _ = get;
     }
     Ok(())
@@ -519,8 +531,8 @@ fn vendor_error<T, U>(
     None
 }
 
-async fn load_feed<T>(
-    store: &SqliteStore,
+async fn load_feed<T, S: OperationalStore>(
+    store: &S,
     http: &dyn HttpClient,
     settings: &Settings,
     key: &str,
@@ -534,7 +546,7 @@ async fn load_feed<T>(
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
-    let cache = store.read_upstream(key)?;
+    let cache = store.read_upstream(key).await?;
     if cache
         .as_ref()
         .and_then(|row| row.rate_limited_until)
@@ -570,15 +582,17 @@ where
             error_code: None,
         }),
         Github::RateLimited(retry_at) => {
-            store.write_upstream(
-                key,
-                &UpstreamRow {
-                    etag: cache.as_ref().and_then(|row| row.etag.clone()),
-                    payload_json: cache.as_ref().and_then(|row| row.payload_json.clone()),
-                    fetched_at: cache.as_ref().map(|row| row.fetched_at).unwrap_or(now),
-                    rate_limited_until: retry_at,
-                },
-            )?;
+            store
+                .write_upstream(
+                    key,
+                    &UpstreamRow {
+                        etag: cache.as_ref().and_then(|row| row.etag.clone()),
+                        payload_json: cache.as_ref().and_then(|row| row.payload_json.clone()),
+                        fetched_at: cache.as_ref().map(|row| row.fetched_at).unwrap_or(now),
+                        rate_limited_until: retry_at,
+                    },
+                )
+                .await?;
             Ok(Feed {
                 value: cache.and_then(|row| decode(row.payload_json.as_deref())),
                 fresh: false,
@@ -598,15 +612,17 @@ where
                     error_code: Some("unavailable"),
                 });
             };
-            store.write_upstream(
-                key,
-                &UpstreamRow {
-                    etag,
-                    payload_json: serde_json::to_string(&parsed).ok(),
-                    fetched_at: now,
-                    rate_limited_until: None,
-                },
-            )?;
+            store
+                .write_upstream(
+                    key,
+                    &UpstreamRow {
+                        etag,
+                        payload_json: serde_json::to_string(&parsed).ok(),
+                        fetched_at: now,
+                        rate_limited_until: None,
+                    },
+                )
+                .await?;
             Ok(Feed {
                 value: Some(parsed),
                 fresh: true,
@@ -665,6 +681,7 @@ async fn request_github(
             headers,
             timeout: Duration::from_millis(timeout_ms as u64),
             max_bytes: 262_144,
+            allow_private: false,
         })
         .await
     else {
@@ -827,7 +844,7 @@ fn security_alerts(
         now,
         Some(status.as_str()),
     );
-    let route = route_for(settings, severity);
+    let route = route_for(settings, get, monitor.project_id, severity);
     let mut drafts = Vec::new();
     if route.nip17 {
         drafts.push(security_draft(

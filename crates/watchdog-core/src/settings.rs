@@ -139,15 +139,123 @@ pub struct TransportRoute {
     pub telegram: bool,
 }
 
-/// Severity routing. Marmot and NIP-17 are independent. Telegram remains critical-only.
-pub fn route_for(settings: &Settings, severity: crate::domain::Severity) -> TransportRoute {
-    let warning_or_worse = matches!(
-        severity,
-        crate::domain::Severity::Warning | crate::domain::Severity::Critical
-    );
+/// Severity routing. Global flags are the default. `NOTIFY_<PROJECT>_<TRANSPORT>`
+/// overrides one project. An empty override keeps the global rule. `false`
+/// disables that transport. `true` allows every severity. A comma-separated
+/// list allows only those severities. Queued alerts keep the destination they
+/// were created with; changing configuration does not rewrite the outbox.
+pub fn route_for(
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    project_id: &str,
+    severity: crate::domain::Severity,
+) -> TransportRoute {
+    let project = project_id.to_ascii_uppercase().replace('-', "_");
     TransportRoute {
-        marmot: settings.marmot_enabled && warning_or_worse,
-        nip17: settings.nip17_enabled,
-        telegram: severity == crate::domain::Severity::Critical,
+        marmot: transport_choice(
+            get,
+            &project,
+            "MARMOT",
+            settings.marmot_enabled,
+            severity,
+            TransportDefault::WarningOrCritical,
+        ),
+        nip17: transport_choice(
+            get,
+            &project,
+            "NIP17",
+            settings.nip17_enabled,
+            severity,
+            TransportDefault::All,
+        ),
+        telegram: transport_choice(
+            get,
+            &project,
+            "TELEGRAM",
+            true,
+            severity,
+            TransportDefault::CriticalOnly,
+        ),
+    }
+}
+
+enum TransportDefault {
+    All,
+    WarningOrCritical,
+    CriticalOnly,
+}
+
+fn transport_choice(
+    get: &impl Fn(&str) -> String,
+    project: &str,
+    transport: &str,
+    enabled: bool,
+    severity: crate::domain::Severity,
+    default: TransportDefault,
+) -> bool {
+    let override_value = get(&format!("NOTIFY_{project}_{transport}"));
+    if override_value.is_empty() {
+        if !enabled {
+            return false;
+        }
+        return match default {
+            TransportDefault::All => true,
+            TransportDefault::WarningOrCritical => matches!(
+                severity,
+                crate::domain::Severity::Warning | crate::domain::Severity::Critical
+            ),
+            TransportDefault::CriticalOnly => severity == crate::domain::Severity::Critical,
+        };
+    }
+    match override_value.to_ascii_lowercase().as_str() {
+        "false" | "off" | "disabled" => false,
+        "true" | "all" => true,
+        list => list.split(',').any(|item| item.trim() == severity.as_str()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(marmot: bool, nip17: bool) -> Settings {
+        load_settings(|key| match key {
+            "ENABLE_MARMOT" => marmot.to_string(),
+            "ENABLE_NIP17" => {
+                if nip17 {
+                    String::new()
+                } else {
+                    "false".to_string()
+                }
+            }
+            _ => String::new(),
+        })
+    }
+
+    #[test]
+    fn project_override_disables_nip17_without_changing_the_global_default() {
+        let settings = settings(true, true);
+        let get = |key: &str| {
+            if key == "NOTIFY_SMARTFLOWSOCIAL_NIP17" {
+                "false".to_string()
+            } else {
+                String::new()
+            }
+        };
+        let smartflow = route_for(
+            &settings,
+            &get,
+            "smartflowsocial",
+            crate::domain::Severity::Critical,
+        );
+        let nostrmash = route_for(
+            &settings,
+            &|_| String::new(),
+            "nostrmash",
+            crate::domain::Severity::Critical,
+        );
+        assert!(!smartflow.nip17);
+        assert!(smartflow.marmot);
+        assert!(nostrmash.nip17);
     }
 }

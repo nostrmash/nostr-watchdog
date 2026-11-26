@@ -31,6 +31,7 @@ use watchdog_notify::{
 use watchdog_notify::{select_inbox, MARMOT_ENGINE_STATUS};
 use watchdog_store::{OutboxRow, SqliteStore};
 
+mod net;
 mod relay;
 
 struct AppState {
@@ -39,17 +40,28 @@ struct AppState {
     http: ReqwestClient,
 }
 
-struct ReqwestClient {
-    client: reqwest::Client,
-}
+struct ReqwestClient;
 
 #[async_trait]
 impl HttpClient for ReqwestClient {
     async fn send(&self, request: ProbeRequest) -> Result<ProbeResponse, String> {
-        let mut builder = self.client.request(
+        let url = reqwest::Url::parse(&request.url).map_err(|_| "probe_url_invalid".to_string())?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| "probe_url_invalid".to_string())?
+            .to_string();
+        let port = url.port_or_known_default().unwrap_or(443);
+        let address = net::resolve_pinned(&host, port, request.allow_private).await?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .resolve(&host, address)
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mut builder = client.request(
             reqwest::Method::from_bytes(request.method.as_bytes())
                 .map_err(|error| error.to_string())?,
-            &request.url,
+            url,
         );
         builder = builder.timeout(request.timeout);
         for (key, value) in &request.headers {
@@ -67,17 +79,41 @@ impl HttpClient for ReqwestClient {
                 headers.insert(name.to_string(), value.to_string());
             }
         }
-        let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-        let too_large = bytes.len() > request.max_bytes;
+        let encoded = response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .is_some();
+        if !encoded
+            && response
+                .content_length()
+                .is_some_and(|len| len > request.max_bytes as u64)
+        {
+            return Ok(ProbeResponse {
+                status,
+                headers,
+                body: Vec::new(),
+                too_large: true,
+            });
+        }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+            let chunk = chunk.map_err(|error| error.to_string())?;
+            if body.len().saturating_add(chunk.len()) > request.max_bytes {
+                return Ok(ProbeResponse {
+                    status,
+                    headers,
+                    body: Vec::new(),
+                    too_large: true,
+                });
+            }
+            body.extend_from_slice(&chunk);
+        }
         Ok(ProbeResponse {
             status,
             headers,
-            body: if too_large {
-                Vec::new()
-            } else {
-                bytes.to_vec()
-            },
-            too_large,
+            body,
+            too_large: false,
         })
     }
 }
@@ -131,7 +167,7 @@ async fn main() {
         .json()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let vars = load_vars();
+    let vars = load_vars().expect("configuration");
     let database = vars
         .get("DATABASE_PATH")
         .cloned()
@@ -140,12 +176,7 @@ async fn main() {
     let state = Arc::new(AppState {
         store,
         vars,
-        http: ReqwestClient {
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("http client"),
-        },
+        http: ReqwestClient,
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -158,18 +189,27 @@ async fn main() {
         .route("/v1/outbox/{id}/retry", post(retry_outbox))
         .route("/v1/incidents/{id}/{action}", post(incident))
         .with_state(state.clone());
-    let addr: SocketAddr = state
-        .vars
-        .get("LISTEN_ADDR")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| "127.0.0.1:8787".parse().unwrap());
+    let addr: SocketAddr = match state.vars.get("LISTEN_ADDR") {
+        Some(value) => value.parse().unwrap_or_else(|_| {
+            panic!("LISTEN_ADDR is not a valid socket address");
+        }),
+        None => "127.0.0.1:8787".parse().expect("default listen address"),
+    };
     let listener = TcpListener::bind(addr).await.expect("bind");
     info!(%addr, "nostr-watchdog listening");
     let scheduler = state.clone();
-    tokio::spawn(async move {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let scheduler_stop = stop.clone();
+    let scheduler_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         loop {
+            if scheduler_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             ticker.tick().await;
+            if scheduler_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             let now = now_ms();
             let settings =
                 load_settings(|key| scheduler.vars.get(key).cloned().unwrap_or_default());
@@ -215,13 +255,27 @@ async fn main() {
         }
     });
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
+        .with_graceful_shutdown(shutdown(stop.clone()))
         .await
         .expect("serve");
+    let _ = scheduler_task.await;
 }
 
-async fn shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
+async fn shutdown(stop: Arc<std::sync::atomic::AtomicBool>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).expect("sigterm handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
     info!("shutting down");
 }
 
@@ -428,19 +482,19 @@ struct ProjectQuery {
     project: Option<String>,
 }
 
-fn load_vars() -> HashMap<String, String> {
+fn load_vars() -> Result<HashMap<String, String>, String> {
     let mut vars = HashMap::new();
     if let Ok(path) = std::env::var("WATCHDOG_CONFIG") {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if let Ok(file) = toml::from_str::<FileConfig>(&text) {
-                vars.extend(file.vars);
-            }
-        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("WATCHDOG_CONFIG could not be read: {error}"))?;
+        let file = toml::from_str::<FileConfig>(&text)
+            .map_err(|error| format!("WATCHDOG_CONFIG is not valid TOML: {error}"))?;
+        vars.extend(file.vars);
     }
     for (key, value) in std::env::vars() {
         vars.insert(key, value);
     }
-    vars
+    Ok(vars)
 }
 
 #[derive(Deserialize)]
@@ -479,90 +533,70 @@ async fn deliver_nostr(
     let Ok(recipient) = recipient_pubkey(&recipient_raw) else {
         return terminal("recipient_invalid");
     };
-    let relays = match store.relay_cache(&recipient, now_ms()) {
-        Ok(Some((json, true))) if !json.is_empty() || true => {
-            if true {
-                let negative = store
-                    .relay_cache(&recipient, now_ms())
-                    .ok()
-                    .flatten()
-                    .is_some_and(|(_, negative)| negative);
-                if negative {
-                    return terminal("recipient_inbox_missing");
+    let relays = match interpret_cache(store.relay_cache(&recipient, now_ms()).ok().flatten()) {
+        CachedInbox::Negative => return terminal("recipient_inbox_missing"),
+        CachedInbox::Fresh(relays) => relays,
+        CachedInbox::Discover => {
+            let remembered = store.remembered_inbox(&recipient).unwrap_or_default();
+            let mut candidates = settings.bootstrap.clone();
+            candidates.extend(remembered);
+            candidates = dedupe_relays(candidates);
+            if candidates.is_empty() {
+                return terminal("bootstrap_relays_missing");
+            }
+            let mut events = Vec::new();
+            let mut failures = 0;
+            let mut completed = 0;
+            for relay in candidates.iter().take(8) {
+                if assert_wss_url(relay).is_err() {
+                    failures += 1;
+                    continue;
                 }
-            }
-            store
-                .relay_cache(&recipient, now_ms())
-                .ok()
-                .flatten()
-                .and_then(|(json, negative)| {
-                    if negative {
-                        None
-                    } else {
-                        serde_json::from_str::<Vec<String>>(&json).ok()
-                    }
-                })
-        }
-        _ => None,
-    };
-    let relays = if let Some(relays) = relays {
-        relays
-    } else {
-        if settings.bootstrap.is_empty() {
-            return terminal("bootstrap_relays_missing");
-        }
-        let mut events = Vec::new();
-        let mut failures = 0;
-        let mut completed = 0;
-        for relay in &settings.bootstrap {
-            if assert_wss_url(relay).is_err() {
-                failures += 1;
-                continue;
-            }
-            match relay::query_inbox(relay, &recipient, timeout_ms).await {
-                Ok((frames, eose)) => {
-                    if eose {
-                        completed += 1;
-                    } else {
-                        failures += 1;
-                    }
-                    for frame in frames {
-                        if let Some(event) =
-                            verify_inbox_event(&frame, &recipient, (now_ms() / 1000) as u64)
-                        {
-                            events.push(event);
+                match relay::query_inbox(relay, &recipient, timeout_ms).await {
+                    Ok((frames, eose)) => {
+                        if eose {
+                            completed += 1;
+                        } else {
+                            failures += 1;
+                        }
+                        for frame in frames {
+                            if let Some(event) =
+                                verify_inbox_event(&frame, &recipient, (now_ms() / 1000) as u64)
+                            {
+                                events.push(event);
+                            }
                         }
                     }
+                    Err(_) => failures += 1,
                 }
-                Err(_) => failures += 1,
             }
-        }
-        let selected = select_inbox(&events);
-        if selected
-            .as_ref()
-            .is_none_or(|event| event.relays.is_empty())
-        {
-            if completed > 0 && failures == 0 {
-                let _ = store.save_relay_cache(
-                    &recipient,
-                    "[]",
-                    true,
-                    now_ms(),
-                    now_ms() + settings.relay_ttl_seconds.min(300) * 1000,
-                );
-                return terminal("recipient_inbox_missing");
+            let selected = select_inbox(&events);
+            if selected
+                .as_ref()
+                .is_none_or(|event| event.relays.is_empty())
+            {
+                if completed > 0 && failures == 0 {
+                    let _ = store.save_relay_cache(
+                        &recipient,
+                        "[]",
+                        true,
+                        now_ms(),
+                        now_ms() + settings.relay_ttl_seconds.min(300) * 1000,
+                    );
+                    return terminal("recipient_inbox_missing");
+                }
+                return retry_error("inbox_discovery_failed");
             }
-            return retry_error("inbox_discovery_failed");
+            let relays = dedupe_relays(selected.unwrap().relays);
+            let _ = store.save_relay_cache(
+                &recipient,
+                &serde_json::to_string(&relays).unwrap_or_else(|_| "[]".into()),
+                false,
+                now_ms(),
+                now_ms() + settings.relay_ttl_seconds * 1000,
+            );
+            relays
         }
-        let relays = selected.unwrap().relays;
-        let _ = store.save_relay_cache(
-            &recipient,
-            &serde_json::to_string(&relays).unwrap_or_else(|_| "[]".into()),
-            false,
-            now_ms(),
-            now_ms() + settings.relay_ttl_seconds * 1000,
-        );
-        relays
     };
     if !store
         .extend_claim(&row.id, claim, now_ms() + settings.delivery_claim_ms)
@@ -689,6 +723,38 @@ fn terminal(error: &str) -> DeliveryOutcome {
     }
 }
 
+enum CachedInbox {
+    Fresh(Vec<String>),
+    Negative,
+    Discover,
+}
+
+fn interpret_cache(entry: Option<(String, bool)>) -> CachedInbox {
+    match entry {
+        Some((_, true)) => CachedInbox::Negative,
+        Some((json, false)) => match serde_json::from_str::<Vec<String>>(&json) {
+            Ok(relays) if relays.iter().any(|relay| !relay.is_empty()) => {
+                CachedInbox::Fresh(dedupe_relays(relays))
+            }
+            _ => CachedInbox::Discover,
+        },
+        None => CachedInbox::Discover,
+    }
+}
+
+fn dedupe_relays(relays: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut unique = Vec::new();
+    for relay in relays {
+        let normalized = relay.trim().trim_end_matches('/').to_ascii_lowercase();
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        unique.push(normalized);
+    }
+    unique
+}
+
 fn retry_error(error: &str) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
@@ -700,5 +766,43 @@ fn retry_error(error: &str) -> DeliveryOutcome {
         push_phase: None,
         message_event_id: None,
         push_envelope: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dedupe_relays, interpret_cache, CachedInbox};
+
+    #[test]
+    fn positive_cache_is_reused_and_negative_cache_is_terminal() {
+        match interpret_cache(Some((r#"["wss://relay.example"]"#.to_string(), false))) {
+            CachedInbox::Fresh(relays) => assert_eq!(relays, vec!["wss://relay.example"]),
+            _ => panic!("positive cache was ignored"),
+        }
+        assert!(matches!(
+            interpret_cache(Some(("[]".to_string(), true))),
+            CachedInbox::Negative
+        ));
+        assert!(matches!(interpret_cache(None), CachedInbox::Discover));
+        assert!(matches!(
+            interpret_cache(Some(("not-json".to_string(), false))),
+            CachedInbox::Discover
+        ));
+    }
+
+    #[test]
+    fn relay_urls_are_normalized_and_deduplicated() {
+        let relays = dedupe_relays(vec![
+            "wss://Relay.Example/".to_string(),
+            "wss://relay.example".to_string(),
+            "wss://other.example".to_string(),
+        ]);
+        assert_eq!(
+            relays,
+            vec![
+                "wss://relay.example".to_string(),
+                "wss://other.example".to_string()
+            ]
+        );
     }
 }

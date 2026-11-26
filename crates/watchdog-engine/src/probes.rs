@@ -29,6 +29,9 @@ pub struct ProbeRequest {
     pub headers: HashMap<String, String>,
     pub timeout: Duration,
     pub max_bytes: usize,
+    /// Configured monitors may use the private-network profile. Discovered
+    /// relays never set this.
+    pub allow_private: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +171,7 @@ async fn fetch_checked(
             headers,
             timeout: Duration::from_millis(timeout_ms as u64),
             max_bytes: spec.max_bytes,
+            allow_private: private_network,
         })
         .await
     {
@@ -313,7 +317,15 @@ async fn run_alby(
     }
     let info_url = target.join("/api/info").unwrap_or(target.clone());
     let started = std::time::Instant::now();
-    let info = match vendor_get(http, info_url.as_str(), headers.clone(), timeout_ms, 32_768).await
+    let info = match vendor_get(
+        http,
+        info_url.as_str(),
+        headers.clone(),
+        timeout_ms,
+        32_768,
+        private_network,
+    )
+    .await
     {
         Ok(response) => response,
         Err(error) => return vendor_error(&error, started.elapsed().as_millis() as i64),
@@ -364,9 +376,18 @@ async fn run_alby(
         headers.clone(),
         timeout_ms,
         16_384,
+        private_network,
     )
     .await;
-    let node = vendor_get(http, node_url.as_str(), headers, timeout_ms, 16_384).await;
+    let node = vendor_get(
+        http,
+        node_url.as_str(),
+        headers,
+        timeout_ms,
+        16_384,
+        private_network,
+    )
+    .await;
     let done = started.elapsed().as_millis() as i64;
     let (Ok(health), Ok(node)) = (health, node) else {
         return vendor_error("network", done);
@@ -444,6 +465,7 @@ async fn run_btcpay(
         json_headers(None),
         timeout_ms,
         16_384,
+        private_network,
     )
     .await
     {
@@ -500,7 +522,16 @@ async fn run_btcpay(
     let info_url = target.join("/api/v1/server/info").unwrap_or(target);
     let mut headers = json_headers(None);
     headers.insert("authorization".to_string(), format!("token {api_key}"));
-    let info = match vendor_get(http, info_url.as_str(), headers, timeout_ms, 32_768).await {
+    let info = match vendor_get(
+        http,
+        info_url.as_str(),
+        headers,
+        timeout_ms,
+        32_768,
+        private_network,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(error) => return vendor_error(&error, started.elapsed().as_millis() as i64),
     };
@@ -556,6 +587,7 @@ async fn vendor_get(
     headers: HashMap<String, String>,
     timeout_ms: i64,
     max_bytes: usize,
+    allow_private: bool,
 ) -> Result<ProbeResponse, String> {
     let response = http
         .send(ProbeRequest {
@@ -564,6 +596,7 @@ async fn vendor_get(
             headers,
             timeout: Duration::from_millis(timeout_ms as u64),
             max_bytes,
+            allow_private,
         })
         .await?;
     if (300..400).contains(&response.status) {

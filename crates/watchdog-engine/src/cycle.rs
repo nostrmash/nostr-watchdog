@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use uuid::Uuid;
 use watchdog_core::catalog::{project_by_id, telegram_chat, PROJECTS};
 use watchdog_core::domain::{
@@ -11,7 +12,7 @@ use watchdog_core::format::{format_incident_message, IncidentMessage};
 use watchdog_core::settings::{route_for, Settings, TelegramMode};
 use watchdog_core::transition::{transition, TransitionInput};
 use watchdog_notify::marmot_blocker;
-use watchdog_store::{OutboxRow, SqliteStore};
+use watchdog_store::{OperationalStore, OutboxRow};
 
 use crate::probes::{probe_monitor, HttpClient};
 
@@ -35,8 +36,8 @@ pub trait Notifier: Send + Sync {
     async fn deliver_marmot(&self, row: &OutboxRow, claim: &str) -> DeliveryOutcome;
 }
 
-pub async fn run_check_cycle(
-    store: &SqliteStore,
+pub async fn run_check_cycle<S: OperationalStore>(
+    store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     http: &dyn HttpClient,
@@ -44,129 +45,179 @@ pub async fn run_check_cycle(
     now: i64,
 ) -> Result<(), watchdog_store::StoreError> {
     if !settings.enabled {
-        store.mark_run("checks", Some(now), Some(now), Some("disabled"), None)?;
+        store
+            .mark_run("checks", Some(now), Some(now), Some("disabled"), None)
+            .await?;
         return Ok(());
     }
     let owner = Uuid::new_v4().to_string();
-    if !store.acquire_lease("checks", &owner, now + 50_000, now)? {
+    let monitor_count = watchdog_core::catalog::enabled_monitors(get).len() as i64;
+    let width_for_lease = settings.concurrency.max(1);
+    let waves = (monitor_count + width_for_lease - 1) / width_for_lease;
+    let lease_ms =
+        (settings.timeout_ms.saturating_mul(waves.max(1)) + 20_000).clamp(50_000, 180_000);
+    if !store
+        .acquire_lease("checks", &owner, now + lease_ms, now)
+        .await?
+    {
         dispatch_due(store, settings, get, notifier, now).await?;
         return Ok(());
     }
     let mut cycle_error: Option<String> = None;
-    let due = due_monitors(store, get, now)?;
-    for monitor in due {
-        let heartbeat = if monitor.kind == watchdog_core::CheckKind::SignedHeartbeat {
-            store.read_heartbeat(monitor.id)?
-        } else {
-            None
-        };
-        let result = probe_monitor(
-            &monitor,
-            get,
-            settings.private_network,
-            settings.timeout_ms,
-            now,
-            settings.stale_seconds,
-            settings.progress_seconds,
-            heartbeat.as_ref(),
-            http,
-        )
+    let due = due_monitors(store, get, now).await?;
+    let width = settings.concurrency.max(1) as usize;
+    for chunk in due.chunks(width) {
+        let probed = join_all(chunk.iter().map(|monitor| async move {
+            let heartbeat = if monitor.kind == watchdog_core::CheckKind::SignedHeartbeat {
+                store.read_heartbeat(monitor.id).await.ok().flatten()
+            } else {
+                None
+            };
+            let result = probe_monitor(
+                monitor,
+                get,
+                settings.private_network,
+                settings.timeout_ms,
+                now,
+                settings.stale_seconds,
+                settings.progress_seconds,
+                heartbeat.as_ref(),
+                http,
+            )
+            .await;
+            (monitor, result)
+        }))
         .await;
-        if apply_probe(store, settings, get, &monitor, &result, now).is_err() {
-            cycle_error = Some("monitor_commit_failed".to_string());
+        for (monitor, result) in probed {
+            if apply_probe(store, settings, get, monitor, &result, now)
+                .await
+                .is_err()
+            {
+                cycle_error = Some("monitor_commit_failed".to_string());
+            }
         }
     }
-    let _ = store.prune(now);
+    let _ = store.prune(now).await;
     if dispatch_due(store, settings, get, notifier, now)
         .await
         .is_err()
     {
         cycle_error.get_or_insert("dispatch_failed".to_string());
     }
-    store.release_lease("checks", &owner, now)?;
-    store.mark_run(
-        "checks",
-        Some(now),
-        Some(now),
-        cycle_error.as_deref(),
-        cycle_error.is_none().then_some(now),
-    )?;
+    store.release_lease("checks", &owner, now).await?;
+    store
+        .mark_run(
+            "checks",
+            Some(now),
+            Some(now),
+            cycle_error.as_deref(),
+            cycle_error.is_none().then_some(now),
+        )
+        .await?;
     Ok(())
 }
 
-pub async fn dispatch_due(
-    store: &SqliteStore,
+pub async fn dispatch_due<S: OperationalStore>(
+    store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     notifier: &dyn Notifier,
     now: i64,
 ) -> Result<(), watchdog_store::StoreError> {
+    let _ = now;
     if !settings.alerts_enabled {
         return Ok(());
     }
-    let rows = store.claim_outbox(now, now + settings.delivery_claim_ms)?;
-    for row in rows {
-        let token = row.claim_token.clone().unwrap_or_default();
-        let outcome = match Destination::parse(&row.destination) {
-            Some(Destination::Telegram) => notifier.deliver_telegram(&row).await,
-            Some(Destination::Marmot) => notifier.deliver_marmot(&row, &token).await,
-            Some(Destination::Nostr) => notifier.deliver_nostr(&row, &token).await,
-            None => DeliveryOutcome {
-                accepted: false,
-                terminal: true,
-                error: Some("project_invalid".to_string()),
-                accepted_relays: Vec::new(),
-                failed_relays: Vec::new(),
-                message_phase: None,
-                push_phase: None,
-                message_event_id: None,
-                push_envelope: None,
-            },
-        };
-        let attempt = row.attempt_count + 1;
-        let state = if outcome.accepted {
-            DeliveryState::RelayAccepted
-        } else {
-            next_delivery_state(attempt, outcome.terminal)
-        };
-        let owned = store.finish_delivery(
-            &row.id,
-            &token,
-            state,
-            attempt,
-            now + watchdog_core::backoff_ms(attempt),
-            outcome.error.as_deref(),
-            Some(
-                &serde_json::to_string(&outcome.accepted_relays)
-                    .unwrap_or_else(|_| "[]".to_string()),
-            ),
-            Some(
-                &serde_json::to_string(&outcome.failed_relays).unwrap_or_else(|_| "[]".to_string()),
-            ),
-            outcome.message_phase.as_deref(),
-            outcome.push_phase.as_deref(),
-            outcome.message_event_id.as_deref(),
-            outcome.push_envelope.as_deref(),
-            now,
-        )?;
-        if owned
-            && !outcome.accepted
-            && settings.telegram_mode == TelegramMode::NostrFallback
-            && row.severity == "critical"
-            && row.destination == "nostr"
-        {
-            enqueue_fallback(store, get, &row, now)?;
+    for destination in ["telegram", "marmot", "nostr"] {
+        let claimed_at = unix_ms();
+        let rows = store
+            .claim_outbox(
+                claimed_at,
+                claimed_at + settings.delivery_claim_ms,
+                Some(destination),
+                2,
+            )
+            .await?;
+        for row in rows {
+            let token = row.claim_token.clone().unwrap_or_default();
+            if !store
+                .extend_claim(&row.id, &token, unix_ms() + settings.delivery_claim_ms)
+                .await
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let outcome = match Destination::parse(&row.destination) {
+                Some(Destination::Telegram) => notifier.deliver_telegram(&row).await,
+                Some(Destination::Marmot) => notifier.deliver_marmot(&row, &token).await,
+                Some(Destination::Nostr) => notifier.deliver_nostr(&row, &token).await,
+                None => DeliveryOutcome {
+                    accepted: false,
+                    terminal: true,
+                    error: Some("project_invalid".to_string()),
+                    accepted_relays: Vec::new(),
+                    failed_relays: Vec::new(),
+                    message_phase: None,
+                    push_phase: None,
+                    message_event_id: None,
+                    push_envelope: None,
+                },
+            };
+            let attempt = row.attempt_count + 1;
+            let state = if outcome.accepted {
+                DeliveryState::RelayAccepted
+            } else {
+                next_delivery_state(attempt, outcome.terminal)
+            };
+            let owned = store
+                .finish_delivery(
+                    &row.id,
+                    &token,
+                    state,
+                    attempt,
+                    unix_ms() + watchdog_core::backoff_ms(attempt),
+                    outcome.error.as_deref(),
+                    Some(
+                        &serde_json::to_string(&outcome.accepted_relays)
+                            .unwrap_or_else(|_| "[]".to_string()),
+                    ),
+                    Some(
+                        &serde_json::to_string(&outcome.failed_relays)
+                            .unwrap_or_else(|_| "[]".to_string()),
+                    ),
+                    outcome.message_phase.as_deref(),
+                    outcome.push_phase.as_deref(),
+                    outcome.message_event_id.as_deref(),
+                    outcome.push_envelope.as_deref(),
+                    unix_ms(),
+                )
+                .await?;
+            if owned
+                && !outcome.accepted
+                && settings.telegram_mode == TelegramMode::NostrFallback
+                && row.severity == "critical"
+                && matches!(row.destination.as_str(), "nostr" | "marmot")
+            {
+                enqueue_fallback(store, get, &row, unix_ms()).await?;
+            }
         }
     }
     Ok(())
 }
 
-fn due_monitors(
-    store: &SqliteStore,
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+async fn due_monitors<S: OperationalStore>(
+    store: &S,
     get: &impl Fn(&str) -> String,
     now: i64,
 ) -> Result<Vec<MonitorDefinition>, watchdog_store::StoreError> {
-    let last: HashMap<_, _> = store.last_checks()?.into_iter().collect();
+    let last: HashMap<_, _> = store.last_checks().await?.into_iter().collect();
     Ok(watchdog_core::catalog::enabled_monitors(get)
         .into_iter()
         .filter(|monitor| match last.get(monitor.id) {
@@ -176,15 +227,15 @@ fn due_monitors(
         .collect())
 }
 
-fn apply_probe(
-    store: &SqliteStore,
+async fn apply_probe<S: OperationalStore>(
+    store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     monitor: &MonitorDefinition,
     check: &CheckResult,
     now: i64,
 ) -> Result<(), watchdog_store::StoreError> {
-    let loaded = store.load_memory(monitor.id)?;
+    let loaded = store.load_memory(monitor.id).await?;
     let incident_id = format!("inc_{}", Uuid::new_v4());
     let integrity_id = format!("inc_{}", Uuid::new_v4());
     let next = transition(TransitionInput {
@@ -209,16 +260,18 @@ fn apply_probe(
         .iter()
         .flat_map(|notice| incident_alerts(settings, get, monitor, notice, check, now))
         .collect::<Vec<_>>();
-    store.commit_check(
-        monitor.id,
-        monitor.project_id,
-        loaded.generation,
-        &next.memory,
-        check,
-        now,
-        &next.notices,
-        &alerts,
-    )?;
+    store
+        .commit_check(
+            monitor.id,
+            monitor.project_id,
+            loaded.generation,
+            &next.memory,
+            check,
+            now,
+            &next.notices,
+            &alerts,
+        )
+        .await?;
     Ok(())
 }
 
@@ -260,7 +313,7 @@ fn incident_alerts(
         NoticeEvent::Open => "open".to_string(),
         NoticeEvent::Close => "close".to_string(),
     };
-    let route = route_for(settings, notice.severity);
+    let route = route_for(settings, get, monitor.project_id, notice.severity);
     let mut drafts = Vec::new();
     if route.nip17 {
         drafts.push(draft(
@@ -327,8 +380,8 @@ fn draft(
     }
 }
 
-fn enqueue_fallback(
-    store: &SqliteStore,
+async fn enqueue_fallback<S: OperationalStore>(
+    store: &S,
     get: &impl Fn(&str) -> String,
     row: &OutboxRow,
     now: i64,
@@ -341,18 +394,20 @@ fn enqueue_fallback(
     {
         return Ok(());
     }
-    store.insert_alert(
-        &AlertDraft {
-            id: format!("alt_{}", Uuid::new_v4()),
-            alert_class: AlertClass::parse(&row.alert_class).unwrap_or(AlertClass::Outage),
-            incident_id: row.incident_id.clone(),
-            monitor_id: row.monitor_id.clone(),
-            project_id: row.project_id.clone(),
-            dedupe_key: format!("fallback:{}", row.dedupe_key),
-            destination: Destination::Telegram,
-            severity: Severity::Critical,
-            text: row.payload_text.clone(),
-        },
-        now,
-    )
+    store
+        .insert_alert(
+            &AlertDraft {
+                id: format!("alt_{}", Uuid::new_v4()),
+                alert_class: AlertClass::parse(&row.alert_class).unwrap_or(AlertClass::Outage),
+                incident_id: row.incident_id.clone(),
+                monitor_id: row.monitor_id.clone(),
+                project_id: row.project_id.clone(),
+                dedupe_key: format!("fallback:{}", row.dedupe_key),
+                destination: Destination::Telegram,
+                severity: Severity::Critical,
+                text: row.payload_text.clone(),
+            },
+            now,
+        )
+        .await
 }
