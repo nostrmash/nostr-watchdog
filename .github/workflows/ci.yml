@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - feat/rust-rewrite
+      - feat/rust-production-hardening
   pull_request:
   workflow_dispatch:
 
@@ -32,7 +33,9 @@ jobs:
         run: cargo clippy --workspace --exclude watchdog-worker --all-targets -- -W clippy::all
 
       - name: Test
-        run: cargo test --workspace --exclude watchdog-worker
+        run: |
+          cargo test --workspace --exclude watchdog-worker
+          cargo test -p watchdog-store --features sqlite --lib
 
       - name: Release binary
         run: cargo build --release -p watchdog-native
