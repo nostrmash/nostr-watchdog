@@ -75,7 +75,15 @@ pub async fn deliver(
         if nsec.is_empty() {
             return failed("sender_key_missing");
         }
-        match ensure_onboard(&socket, &nsec, &settings.bootstrap, &recipient, &setup).await {
+        match renew_until(
+            store,
+            row,
+            claim,
+            settings.delivery_claim_ms,
+            ensure_onboard(&socket, &nsec, &settings.bootstrap, &recipient, &setup),
+        )
+        .await
+        {
             Ok((account, group)) => {
                 if let Some(expected) = &expected_sender {
                     if !account.eq_ignore_ascii_case(expected) {
@@ -89,15 +97,21 @@ pub async fn deliver(
         }
     } else {
         let account = cached_sender.unwrap_or_default().to_string();
-        let identity = match call(
-            &socket,
-            json!({
-                "op": "identity",
-                "account": account,
-                "recipient": recipient,
-                "group": cached_group.clone().unwrap_or_default()
-            }),
-            Duration::from_secs(30),
+        let identity = match renew_until(
+            store,
+            row,
+            claim,
+            settings.delivery_claim_ms,
+            call(
+                &socket,
+                json!({
+                    "op": "identity",
+                    "account": account,
+                    "recipient": recipient,
+                    "group": cached_group.clone().unwrap_or_default()
+                }),
+                Duration::from_secs(30),
+            ),
         )
         .await
         {
@@ -116,15 +130,21 @@ pub async fn deliver(
             if !owns_claim(store, row, claim, &settings) {
                 return pending("claim_lost");
             }
-            let created = match call(
-                &socket,
-                json!({
-                    "op": "create_group",
-                    "account": account,
-                    "name": format!("watchdog-{}", project.id),
-                    "members": [recipient]
-                }),
-                Duration::from_secs(90),
+            let created = match renew_until(
+                store,
+                row,
+                claim,
+                settings.delivery_claim_ms,
+                call(
+                    &socket,
+                    json!({
+                        "op": "create_group",
+                        "account": account,
+                        "name": format!("watchdog-{}", project.id),
+                        "members": [recipient]
+                    }),
+                    Duration::from_secs(90),
+                ),
             )
             .await
             {
@@ -150,17 +170,24 @@ pub async fn deliver(
     if !owns_claim(store, row, claim, &settings) {
         return pending("claim_lost");
     }
-    let sent = match call(
-        &socket,
-        json!({
-            "op": "send",
-            "alert": row.id,
-            "account": account,
-            "group": group,
-            "text": row.payload_text,
-            "allow": [recipient]
-        }),
-        Duration::from_secs(90),
+    let sent = match renew_until(
+        store,
+        row,
+        claim,
+        settings.delivery_claim_ms,
+        call(
+            &socket,
+            json!({
+                "op": "send",
+                "alert": row.id,
+                "project": row.project_id,
+                "account": account,
+                "group": group,
+                "text": row.payload_text,
+                "allow": [recipient]
+            }),
+            Duration::from_secs(90),
+        ),
     )
     .await
     {
@@ -557,6 +584,33 @@ fn identity_error(step: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Extends a live claim while `work` is still running. An expired claim is not
+/// given a new token. The in-flight helper call is allowed to finish.
+async fn renew_until<T>(
+    store: &SqliteStore,
+    row: &OutboxRow,
+    claim: &str,
+    claim_ms: i64,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    let interval = (claim_ms / 3).clamp(5_000, 60_000) as u64;
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut work => return result,
+            _ = tokio::time::sleep(Duration::from_millis(interval)) => {
+                let renewed = store
+                    .extend_claim(&row.id, claim, now_ms() + claim_ms, now_ms())
+                    .unwrap_or(false);
+                if !renewed {
+                    return work.await;
+                }
+            }
+        }
+    }
+}
+
 fn owns_claim(
     store: &SqliteStore,
     row: &OutboxRow,
@@ -634,8 +688,7 @@ fn hold_error(message: &str, push: &str) -> &'static str {
         "relay_accepted" => match push {
             "token_unavailable" => "recipient_push_token_unavailable",
             "rejected" | "terminal_failure" => "push_terminal_failure",
-            "unobservable" => "push_unobservable",
-            _ => "push_publication_attempted",
+            _ => "push_unobservable",
         },
         "accepted_pending" => "marmot_publish_pending",
         _ => "marmot_completion_unknown",
@@ -798,7 +851,7 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{may_unlink_socket, onboard_request};
+    use super::{may_unlink_socket, now_ms, onboard_request};
 
     fn get<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> String + 'a {
         move |key| {
@@ -830,5 +883,54 @@ mod tests {
         assert_eq!(initial.operation_id, "initial:smartflowsocial");
         assert!(!initial.replace);
         assert!(onboard_request(&get(&[]), "smartflowsocial", false).is_none());
+    }
+
+    #[test]
+    fn an_expired_claim_is_not_revived_and_a_live_claim_can_be_renewed() {
+        use watchdog_core::domain::{AlertClass, AlertDraft, Destination, Severity};
+        use watchdog_store::SqliteStore;
+        let dir = std::env::temp_dir().join(format!(
+            "watchdog-claim-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("claim dir");
+        let path = dir.join("watchdog.sqlite");
+        let store = SqliteStore::open(&path).expect("store");
+        let now = now_ms();
+        store
+            .insert_alert(
+                &AlertDraft {
+                    id: "alt_claim".to_string(),
+                    alert_class: AlertClass::Test,
+                    incident_id: None,
+                    monitor_id: "acceptance".to_string(),
+                    project_id: "smartflowsocial".to_string(),
+                    dedupe_key: "claim".to_string(),
+                    destination: Destination::Marmot,
+                    severity: Severity::Info,
+                    text: "claim".to_string(),
+                },
+                now,
+            )
+            .expect("insert");
+        let token = store
+            .claim_row("alt_claim", now, now + 60_000)
+            .expect("claim")
+            .expect("token");
+        assert!(store
+            .extend_claim("alt_claim", &token, now + 120_000, now)
+            .expect("renew"));
+        assert!(store
+            .extend_claim("alt_claim", &token, now - 1, now)
+            .expect("expire"));
+        assert!(!store
+            .extend_claim("alt_claim", &token, now + 60_000, now)
+            .expect("expired"));
+        assert!(!store
+            .extend_claim("alt_claim", "different-token", now + 60_000, now)
+            .expect("foreign"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

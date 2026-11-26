@@ -4,6 +4,7 @@
 //! runtime. It is not part of the Cloudflare deployment.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -101,12 +102,18 @@ async fn run() {
         let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
         let _ = std::fs::set_permissions(&health_path, std::fs::Permissions::from_mode(0o600));
     }
+    let health_permits = Arc::new(tokio::sync::Semaphore::new(4));
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = health.accept().await else {
                 break;
             };
+            let Ok(permit) = health_permits.clone().try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
             tokio::spawn(async move {
+                let _permit = permit;
                 let (_, mut write) = stream.into_split();
                 let response = json!({"ok": true, "pong": true});
                 let _ = tokio::time::timeout(
@@ -216,7 +223,7 @@ async fn dispatch(session: &Session, request: Value) -> Value {
             let body = text(&request, "text");
             let allow = strings(request.get("allow"));
             session
-                .send_once(&alert, &account, &group, &body, &allow)
+                .send_in_project(&alert, &text(&request, "project"), &account, &group, &body, &allow)
                 .await
         }
         "onboard" => {

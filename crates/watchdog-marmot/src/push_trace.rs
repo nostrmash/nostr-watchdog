@@ -1,19 +1,18 @@
-//! Records the one push-publish failure MDK actually logs.
+//! Diagnostic capture of MDK push warnings.
 //!
-//! `publish_notification_trigger_best_effort` swallows the error after a
-//! `tracing` warning. Success is not logged and the event id is discarded.
-//! This layer keeps the privacy-safe `error_kind` only.
+//! `publish_notification_trigger_best_effort` logs a warning and discards the
+//! event id. Background workers can emit that warning for a different message
+//! while this process is submitting. Those warnings stay diagnostic. They do
+//! not select an alert's push state.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 use tracing::field::{Field, Visit};
 use tracing::Subscriber;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
-static FAILURES: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
-static GENERATION: AtomicU64 = AtomicU64::new(1);
+static DIAGNOSTICS: AtomicU64 = AtomicU64::new(0);
 
 pub fn install() {
     use std::sync::Once;
@@ -27,24 +26,15 @@ pub fn install() {
     });
 }
 
-/// Starts one submission's observation window. Later warnings keep this id,
-/// so a refresh can see a failure that MDK logs after `submit_text` returns.
-pub fn begin_submit() -> u64 {
-    let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    if let Ok(mut failures) = FAILURES.lock() {
-        failures.retain(|(id, _)| generation.saturating_sub(*id) < 8);
-    }
-    generation
+/// Warnings observed since process start. Not keyed to an operation.
+#[allow(dead_code)]
+pub fn diagnostic_warnings() -> u64 {
+    DIAGNOSTICS.load(Ordering::Relaxed)
 }
 
-pub fn observed_for(generation: u64) -> Option<String> {
-    FAILURES.lock().ok().and_then(|failures| {
-        failures
-            .iter()
-            .rev()
-            .find(|(id, _)| *id == generation)
-            .map(|(_, kind)| kind.clone())
-    })
+/// No warning from this layer is evidence about a particular alert.
+pub fn operation_push_failure() -> Option<String> {
+    None
 }
 
 struct PushPublishCapture;
@@ -62,13 +52,8 @@ where
         let mut visitor = KindVisitor::default();
         event.record(&mut visitor);
         if visitor.failed {
-            if let Ok(mut failures) = FAILURES.lock() {
-                let generation = GENERATION.load(Ordering::Relaxed);
-                failures.push((
-                    generation,
-                    visitor.kind.unwrap_or_else(|| "publish_failed".to_string()),
-                ));
-            }
+            DIAGNOSTICS.fetch_add(1, Ordering::Relaxed);
+            let _ = visitor.kind;
         }
     }
 }
@@ -132,5 +117,11 @@ mod tests {
         assert_eq!(sanitize_error_kind("nsec1secret"), "publish_failed");
         assert_eq!(sanitize_error_kind("device token abc"), "publish_failed");
         assert_eq!(sanitize_error_kind("a b"), "ab");
+    }
+
+    #[test]
+    fn a_warning_is_not_an_operation_result() {
+        assert!(operation_push_failure().is_none());
+        let _ = diagnostic_warnings();
     }
 }

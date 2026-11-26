@@ -214,7 +214,28 @@ async fn exchange() {
         .finalize(&Keys::generate())
         .expect("decoy");
     post_json(&format!("{}/event", http_base(&relay.url)), &serde_json::to_value(&decoy).expect("decoy json"));
+    let alien = EventBuilder::new(Kind::Custom(445), "bm90LXRoZS1hbGVydC1ldmVudA==")
+        .tag(Tag::parse(["h", "00"]).expect("alien tag"))
+        .finalize(&Keys::generate())
+        .expect("alien");
+    let alien_id = alien.id.to_string();
+    post_json(
+        &format!("{}/event", http_base(&relay.url)),
+        &serde_json::to_value(&alien).expect("alien json"),
+    );
     let baseline = max_seq(&relay.url);
+    post_json(
+        &format!("{}/event", http_base(&relay.url)),
+        &serde_json::json!({
+            "id": "f".repeat(64),
+            "pubkey": "e".repeat(64),
+            "created_at": 1,
+            "kind": 1,
+            "tags": [],
+            "content": "not-the-group-message",
+            "sig": "a".repeat(128)
+        }),
+    );
 
     let alert = "alt_fixture_exchange";
     let text = "watchdog fixture alert";
@@ -265,7 +286,45 @@ async fn exchange() {
     assert!(first.get("push_event_id").is_none() || first.get("push_event_id") == Some(&Value::Null));
     let trigger = wait_for_trigger(&relay.url, &server, &decoy.id.to_string(), baseline)
         .expect("kind 446 trigger");
-    assert_message_precedes_trigger(&relay.url, baseline, trigger.seq);
+    assert!(trigger.seq > baseline);
+    let route = runtime
+        .group_conversation_snapshot(&recipient_hex, &group_id)
+        .await
+        .expect("route")
+        .group
+        .nostr_routing
+        .nostr_group_id_hex;
+    assert_eq!(route.len(), 64, "nostr group route was not a 32-byte id");
+    let group_event = alert_group_event(&relay.url, &server, &route, baseline);
+    assert_ne!(
+        group_event.pubkey.to_hex(),
+        account,
+        "the kind-445 author must be the ephemeral transport key"
+    );
+    assert_ne!(
+        group_event.id.to_string(),
+        alien_id,
+        "an unrelated group event satisfied the alert check"
+    );
+    assert!(session.group_was_accepted(&account, &group).await.expect("delivery"));
+    let rows = runtime
+        .messages_with_query(
+            &recipient_hex,
+            AppMessageQuery {
+                group_id_hex: Some(group.clone()),
+                kinds: Some(vec![9]),
+                limit: Some(20),
+            },
+        )
+        .expect("messages");
+    assert!(rows.iter().any(|row| {
+        row.plaintext == text
+            && !row.invalidated
+            && row.sender.eq_ignore_ascii_case(&account)
+            && row.group_id_hex.eq_ignore_ascii_case(&group)
+            && row.kind == 9
+            && first_ids.iter().any(|id| id.as_str() == Some(row.message_id_hex.as_str()))
+    }));
     assert_routed_token(&runtime, &recipient_hex, &group_id, &server_hex, b"fixture-token").await;
 
     session.shutdown().await.expect("shutdown");
@@ -282,6 +341,14 @@ async fn exchange() {
         .unwrap_or_default();
     assert_eq!(first_ids, second_ids);
     assert_eq!(second.get("operation_id").and_then(Value::as_str), Some(alert));
+    let mismatch = resumed
+        .send_once(alert, &account, &group, "a different payload", &[recipient_hex.clone()])
+        .await;
+    assert!(
+        matches!(mismatch, Err(error) if error == "alert_identity_mismatch"),
+        "a reused alert id accepted a different payload"
+    );
+    assert_eq!(plaintext_count(&runtime, &recipient_hex, &group, "a different payload").await, 0);
 
     tokio::time::sleep(Duration::from_millis(20)).await;
     let replacement = runtime
@@ -417,19 +484,19 @@ async fn exchange() {
         &recipient_hex,
     )
     .await;
-    assert_ne!(
-        rejected.get("push").and_then(Value::as_str),
+    assert_eq!(
+        rejected.get("message_phase").and_then(Value::as_str),
         Some("relay_accepted")
     );
+    assert_eq!(
+        rejected.get("push").and_then(Value::as_str),
+        Some("unobservable"),
+        "a relay refusal is not an alert-specific push result"
+    );
+    assert!(rejected.get("push_event_id").is_none_or(Value::is_null));
     assert!(wait_plaintext(&runtime, &recipient_hex, &group, "watchdog rejected trigger").await);
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(max_seq_kind(&relay.url, 1059), before_reject);
-    if rejected.get("push").and_then(Value::as_str) != Some("rejected") {
-        panic!(
-            "relay rejection was not observed as a push failure ({})",
-            rejected.get("push").and_then(Value::as_str).unwrap_or("")
-        );
-    }
     post_json(
         &format!("{}/control", http_base(&relay.url)),
         &serde_json::json!({"rejectKinds": []}),
@@ -665,18 +732,80 @@ fn wrap_ids(url: &str) -> Vec<String> {
         .collect()
 }
 
-fn assert_message_precedes_trigger(url: &str, baseline: u64, trigger_seq: u64) {
-    let order = get_json(&format!("{}/order", http_base(url)));
-    let preceded = order.as_array().is_some_and(|items| {
-        items.iter().any(|item| {
+fn alert_group_event(url: &str, server: &Keys, group_hex: &str, baseline: u64) -> Event {
+    let mut notes = Vec::new();
+    for _ in 0..20 {
+        let events = get_json(&format!("{}/events?kind=445", http_base(url)));
+        let items = events.as_array().cloned().unwrap_or_default();
+        let triggers = gift_wraps(url);
+        let mut matched = None;
+        notes.clear();
+        for item in &items {
             let seq = item.get("seq").and_then(Value::as_u64).unwrap_or(0);
-            let kind = item.get("kind").and_then(Value::as_u64).unwrap_or(0);
-            kind != 1059 && seq > baseline && seq < trigger_seq
-        })
-    });
-    assert!(
-        preceded,
-        "no application event was stored before the gift wrap"
+            let Some(raw) = item.get("event") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_value::<Event>(raw.clone()) else {
+                notes.push(format!("seq {seq} did not deserialize"));
+                continue;
+            };
+            if seq <= baseline {
+                notes.push(format!("seq {seq} is not after the alert baseline"));
+                continue;
+            }
+            let route = event.tags.iter().find_map(|tag| {
+                let values = tag.as_slice();
+                if values.first().map(String::as_str) == Some("h") {
+                    values.get(1).cloned()
+                } else {
+                    None
+                }
+            });
+            if route.as_deref().is_none_or(|value| !value.eq_ignore_ascii_case(group_hex)) {
+                notes.push(format!(
+                    "seq {seq} group tag {:?} is not this alert",
+                    route.as_deref().unwrap_or("")
+                ));
+                continue;
+            }
+            if let Err(error) = event.verify() {
+                notes.push(format!("seq {seq} signature: {error}"));
+                continue;
+            }
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(event.content.as_str())
+                .or_else(|_| {
+                    base64::engine::general_purpose::STANDARD_NO_PAD.decode(event.content.as_str())
+                });
+            let Ok(decoded) = decoded else {
+                notes.push(format!("seq {seq} content is not the pinned base64 framing"));
+                continue;
+            };
+            if decoded.len() < 28 {
+                notes.push(format!("seq {seq} framed payload is {} bytes", decoded.len()));
+                continue;
+            }
+            let followed = triggers.iter().any(|(trigger_seq, trigger)| {
+                *trigger_seq > seq && validated_rumor(server, trigger).is_some()
+            });
+            if !followed {
+                notes.push(format!(
+                    "seq {seq} has no later kind-446 gift wrap (triggers: {})",
+                    triggers.len()
+                ));
+                continue;
+            }
+            matched = Some(event);
+            break;
+        }
+        if let Some(event) = matched {
+            return event;
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    let order = get_json(&format!("{}/order", http_base(url)));
+    panic!(
+        "the alert's kind-445 group event was not accepted before its trigger\n{notes:?}\norder={order}"
     );
 }
 
@@ -1125,6 +1254,19 @@ async fn executable_exchange() {
     }
     assert_eq!(account, sender_hex, "the packaged helper imported a different sender");
     assert!(!group.is_empty(), "the packaged helper did not establish a conversation");
+    let again = helper_ipc(
+        &socket,
+        serde_json::json!({
+            "op": "onboard",
+            "operation_id": "initial:smartflowsocial",
+            "nsec": sender_nsec,
+            "relays": [relay.url],
+            "recipient": recipient_hex,
+            "replace": false
+        }),
+    );
+    assert_eq!(again.get("reused"), Some(&Value::Bool(true)));
+    assert_eq!(again.get("group").and_then(Value::as_str), Some(group.as_str()));
     let group_id = GroupId::new(hex::decode(&group).expect("group hex"));
     let mut welcomed = false;
     for _ in 0..20 {
@@ -1231,7 +1373,35 @@ async fn executable_exchange() {
     );
     let trigger = wait_for_trigger(&relay.url, &server, &decoy.id.to_string(), baseline)
         .expect("packaged kind 446 trigger");
-    assert_message_precedes_trigger(&relay.url, baseline, trigger.seq);
+    assert!(trigger.seq > baseline);
+    let route = runtime
+        .group_conversation_snapshot(&recipient_hex, &group_id)
+        .await
+        .expect("route")
+        .group
+        .nostr_routing
+        .nostr_group_id_hex;
+    assert_eq!(route.len(), 64, "nostr group route was not a 32-byte id");
+    let group_event = alert_group_event(&relay.url, &server, &route, baseline);
+    assert_ne!(group_event.pubkey.to_hex(), account);
+    assert!(group_event.verify().is_ok());
+    let packaged_rows = runtime
+        .messages_with_query(
+            &recipient_hex,
+            AppMessageQuery {
+                group_id_hex: Some(group.clone()),
+                kinds: Some(vec![9]),
+                limit: Some(20),
+            },
+        )
+        .expect("packaged messages");
+    let packaged_ids = journal_ids(&root, &alert);
+    assert!(packaged_rows.iter().any(|row| {
+        row.plaintext == text
+            && row.sender.eq_ignore_ascii_case(&account)
+            && row.group_id_hex.eq_ignore_ascii_case(&group)
+            && packaged_ids.iter().any(|id| id == &row.message_id_hex)
+    }));
     let ids = journal_ids(&root, &alert);
     assert!(!ids.is_empty(), "the helper journal has no message id");
     let recorded = sql_value(
@@ -1315,6 +1485,73 @@ async fn executable_exchange() {
 
     watchdog.stop();
     helper.stop();
+    let crash_text = "process crash boundary";
+    let mut crashing = start_crash_helper(&helper_bin, &root, &socket, &relay.url);
+    wait_health(&root.join("health.sock"));
+    let crashed = helper_ipc_result(
+        &socket,
+        serde_json::json!({
+            "op": "send",
+            "alert": "alt_process_crash",
+            "project": "smartflowsocial",
+            "account": account,
+            "group": group,
+            "text": crash_text,
+            "allow": [recipient_hex]
+        }),
+    );
+    assert!(
+        crashed.is_err(),
+        "the helper answered after it was told to stop"
+    );
+    let status = crashing.0.wait().expect("crash wait");
+    assert_eq!(status.code(), Some(75), "the helper did not exit at the crash boundary");
+    let recovered_helper = start_helper(&helper_bin, &root, &socket, &relay.url);
+    wait_health(&root.join("health.sock"));
+    let recovered = helper_ipc(
+        &socket,
+        serde_json::json!({
+            "op": "send",
+            "alert": "alt_process_crash",
+            "project": "smartflowsocial",
+            "account": account,
+            "group": group,
+            "text": crash_text,
+            "allow": [recipient_hex]
+        }),
+    );
+    assert_eq!(recovered.get("ok"), Some(&Value::Bool(true)));
+    let recovered_ids = recovered
+        .get("message_ids")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(!recovered_ids.is_empty(), "restart did not recover the submitted message");
+    let repeated = helper_ipc(
+        &socket,
+        serde_json::json!({
+            "op": "send",
+            "alert": "alt_process_crash",
+            "project": "smartflowsocial",
+            "account": account,
+            "group": group,
+            "text": crash_text,
+            "allow": [recipient_hex]
+        }),
+    );
+    assert_eq!(
+        repeated
+            .get("message_ids")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice),
+        Some(recovered_ids.as_slice())
+    );
+    assert_eq!(
+        plaintext_count(&runtime, &recipient_hex, &group, crash_text).await,
+        1,
+        "process restart encrypted the alert a second time"
+    );
+    drop(recovered_helper);
     let _ = runtime.shutdown_and_close().await;
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&recipient_root);
@@ -1356,7 +1593,27 @@ impl Drop for OwnedProc {
 }
 
 fn start_helper(binary: &Path, root: &Path, socket: &Path, relay: &str) -> OwnedProc {
-    let child = Command::new(binary)
+    spawn_helper(binary, root, socket, relay, false)
+}
+
+fn start_crash_helper(binary: &Path, root: &Path, socket: &Path, relay: &str) -> OwnedProc {
+    spawn_helper(binary, root, socket, relay, true)
+}
+
+fn spawn_helper(
+    binary: &Path,
+    root: &Path,
+    socket: &Path,
+    relay: &str,
+    crash: bool,
+) -> OwnedProc {
+    let mut command = Command::new(binary);
+    if crash {
+        command
+            .env("WATCHDOG_MARMOT_CRASH_AT", "accepted")
+            .env("WATCHDOG_MARMOT_CRASH_EXIT", "1");
+    }
+    let child = command
         .arg("--root")
         .arg(root)
         .arg("--socket")
@@ -1455,15 +1712,26 @@ fn wait_http(url: &str) {
 }
 
 fn helper_ipc(socket: &Path, request: Value) -> Value {
-    let mut stream = UnixStream::connect(socket).expect("helper socket");
+    helper_ipc_result(socket, request).expect("helper ipc")
+}
+
+fn helper_ipc_result(socket: &Path, request: Value) -> Result<Value, String> {
+    let mut stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    let mut bytes = serde_json::to_vec(&request).expect("ipc");
+    let mut bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
-    stream.write_all(&bytes).expect("ipc write");
+    stream
+        .write_all(&bytes)
+        .map_err(|error| error.to_string())?;
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).expect("ipc read");
-    serde_json::from_str(&line).expect("ipc json")
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|error| error.to_string())?;
+    if line.is_empty() {
+        return Err("helper_closed".to_string());
+    }
+    serde_json::from_str(&line).map_err(|error| error.to_string())
 }
 
 fn post_alert(listen: &str, operator: &str) -> Value {

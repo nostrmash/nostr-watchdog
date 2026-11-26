@@ -9,7 +9,7 @@ helper="$root/crates/watchdog-marmot/target/release/watchdog-marmot"
 watchdog="$root/target/release/nostr-watchdog"
 odin="${ODIN:-$HOME/.local/odin-dev-2026-10/odin}"
 state="${WATCHDOG_ACCEPTANCE_ROOT:-$root/data/whitenoise-acceptance}"
-listen="127.0.0.1:8791"
+listen="${WATCHDOG_ACCEPTANCE_ADDR:-127.0.0.1:8791}"
 relays="wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat"
 project="smartflowsocial"
 operation="initial:${project}"
@@ -229,30 +229,63 @@ start_watchdog() {
   exit 1
 }
 
+owns_acceptance_process() {
+  pid=$1
+  expected=$2
+  comm=$(ps -p "$pid" -o comm= 2>/dev/null | awk '{$1=$1; print}')
+  comm=${comm##*/}
+  if [ "$comm" != "$expected" ]; then
+    return 1
+  fi
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "lsof is required before this script will signal a process." >&2
+    return 1
+  fi
+  case "$expected" in
+    nostr-watchdog)
+      lsof -nP -a -p "$pid" -iTCP:"${listen##*:}" -sTCP:LISTEN >/dev/null 2>&1
+      ;;
+    watchdog-marmot)
+      lsof -nP -a -p "$pid" "$state/marmot/watchdog.sock" >/dev/null 2>&1 \
+        || lsof -nP -a -p "$pid" "$state/marmot/health.sock" >/dev/null 2>&1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 stop_pid() {
   file=$1
+  expected=$2
   if [ ! -f "$file" ]; then
     return
   fi
   pid=$(cat "$file")
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$file"
+    return
+  fi
+  if ! owns_acceptance_process "$pid" "$expected"; then
+    echo "Refusing to signal pid $pid from $file. It is not the isolated $expected for this state directory." >&2
+    rm -f "$file"
+    return
+  fi
+  kill "$pid" 2>/dev/null || true
+  i=0
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
   if kill -0 "$pid" 2>/dev/null; then
-    pkill -P "$pid" 2>/dev/null || true
-    kill "$pid" 2>/dev/null || true
-    i=0
-    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do
-      sleep 0.1
-      i=$((i + 1))
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -9 "$pid" 2>/dev/null || true
-    fi
+    kill -9 "$pid" 2>/dev/null || true
   fi
   rm -f "$file"
 }
 
 stop_watchdog() {
-  stop_pid "$state/watchdog.pid"
-  stop_pid "$state/helper.pid"
+  stop_pid "$state/watchdog.pid" nostr-watchdog
+  stop_pid "$state/helper.pid" watchdog-marmot
 }
 
 helper_call() {

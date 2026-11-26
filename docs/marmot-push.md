@@ -16,7 +16,7 @@ From that MDK tree at the pinned revision, the push path uses:
 - Encrypted token records of 1084 bytes over a 1024-byte plaintext.
 - HKDF salt `marmot-push-token-v1` and info `marmot-push-token-encryption`, as implemented in that file.
 
-`watchdog-marmot` does not implement those events itself. Chat alerts go through `MarmotAppRuntime::submit_text` with the alert id as the client token. The pinned runtime does not return a push-trigger publication result. After MDK reports the application message published, the helper reports `publication_attempted` when the recipient has an active token and no publish failure was logged, `rejected` when that publish logs a failure, and `token_unavailable` when no active recipient token exists. A later bounded refresh reports `unobservable`. It does not report push relay acceptance or phone delivery. The Worker does not call this path. Neither process returns token bytes. The exact states and the fields Agent C should store are in `docs/agent-a-integration.md`.
+`watchdog-marmot` does not implement those events itself. Chat alerts go through `MarmotAppRuntime::submit_text` with the alert id as the client token. The pinned runtime does not return a push-trigger publication result. After MDK reports the application message published, the helper reports `token_unavailable` when the recipient has no active token and `unobservable` when tokens exist. A tracing warning is not tied to one alert, so it does not change that alert's push state. The helper does not report push relay acceptance or phone delivery. The Worker does not call this path. Neither process returns token bytes. The exact states and the fields Agent C should store are in `docs/agent-a-integration.md`.
 
 ## Identity
 

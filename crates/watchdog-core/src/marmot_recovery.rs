@@ -286,7 +286,6 @@ pub fn advance_phase(
         "relay_accepted" => match push_phase {
             "rejected" => settled("rejected", true, false),
             "terminal_failure" => settled("terminal_failure", true, false),
-            "unobservable" => settled("unobservable", true, false),
             "token_unavailable" | "recipient_push_token_unavailable" => {
                 if attempts.token_wait >= TOKEN_WAIT_BUDGET
                     || aged_out(attempts, now_ms, OPERATION_MAX_AGE_MS)
@@ -303,21 +302,16 @@ pub fn advance_phase(
                     }
                 }
             }
-            "publication_attempted" | "prepared" | "push_disposition_unknown" | "not_attempted" => {
-                if attempts.unobservable >= UNOBSERVABLE_ATTEMPT_BUDGET
-                    || aged_out(attempts, now_ms, OPERATION_MAX_AGE_MS)
-                {
-                    settled("unobservable", true, false)
-                } else {
-                    attempts.unobservable = attempts.unobservable.saturating_add(1);
-                    if attempts.unobservable >= UNOBSERVABLE_ATTEMPT_BUDGET
-                        || aged_out(attempts, now_ms, OPERATION_MAX_AGE_MS)
-                    {
-                        settled("unobservable", true, false)
-                    } else {
-                        hold("publication_attempted", attempts.unobservable)
-                    }
-                }
+            "unobservable"
+            | "unknown"
+            | "publication_attempted"
+            | "prepared"
+            | "push_disposition_unknown"
+            | "not_attempted" => {
+                // A missing warning is not an attempt. Stop polling MDK for a
+                // result this revision does not return.
+                attempts.unobservable = attempts.unobservable.saturating_add(1);
+                settled("unobservable", true, false)
             }
             other => {
                 let _ = other;
@@ -350,26 +344,24 @@ pub fn advance_phase(
 
 /// What the helper can say about push from the current MDK API.
 ///
-/// Relay acceptance is absent on purpose. `submit_text` publishes the trigger
-/// and discards the event id and the relay acknowledgement.
+/// Token count is evidence about registrations. It is not evidence that a
+/// trigger was built or that a relay saw it. `submit_text` discards the event
+/// id and the relay acknowledgement, and a tracing warning is not tied to one
+/// alert. Those gaps are `unobservable`.
 pub fn classify_push(
     message_published: bool,
     active_recipient_tokens: i64,
-    publish_error_observed: bool,
 ) -> (&'static str, &'static str) {
     if !message_published {
-        return ("not_attempted", "not_attempted");
+        return ("not_attempted", "message_not_published");
     }
-    if publish_error_observed {
-        return ("rejected", "publish_error_observed");
+    if active_recipient_tokens < 0 {
+        return ("unknown", "token_lookup_failed");
     }
-    if active_recipient_tokens <= 0 {
+    if active_recipient_tokens == 0 {
         return ("token_unavailable", "token_availability_only");
     }
-    (
-        "publication_attempted",
-        "mdk_discards_publish_result",
-    )
+    ("unobservable", "no_correlated_push_evidence")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -657,28 +649,18 @@ mod tests {
         assert_eq!(attempts.message, 1);
         assert_eq!(attempts.unobservable, 0);
 
-        let mut published = started;
         let (attempts, first) = advance_phase(
             "relay_accepted",
             "publication_attempted",
-            published,
+            started,
             2_000,
         );
-        assert!(first.hold);
-        assert_eq!(first.push_phase, "publication_attempted");
+        assert!(!first.hold);
+        assert_eq!(first.push_phase, "unobservable");
         assert!(first.preserve_message);
-        published = attempts;
-        let (attempts, second) = advance_phase(
-            "relay_accepted",
-            "publication_attempted",
-            published,
-            3_000,
-        );
-        assert!(!second.hold);
-        assert_eq!(second.push_phase, "unobservable");
-        assert!(second.preserve_message);
-        assert!(!second.terminal);
+        assert!(!first.terminal);
         assert_eq!(attempts.message, 0);
+        assert!(attempts.unobservable >= 1);
 
         let rejected = advance_phase("relay_accepted", "rejected", started, 2_000).1;
         assert!(!rejected.hold);
@@ -699,21 +681,23 @@ mod tests {
     #[test]
     fn push_classification_uses_only_observed_evidence() {
         assert_eq!(
-            classify_push(false, 2, false),
-            ("not_attempted", "not_attempted")
+            classify_push(false, 2),
+            ("not_attempted", "message_not_published")
         );
         assert_eq!(
-            classify_push(true, 0, false),
+            classify_push(true, 0),
             ("token_unavailable", "token_availability_only")
         );
         assert_eq!(
-            classify_push(true, 2, false),
-            ("publication_attempted", "mdk_discards_publish_result")
+            classify_push(true, -1),
+            ("unknown", "token_lookup_failed")
         );
         assert_eq!(
-            classify_push(true, 2, true),
-            ("rejected", "publish_error_observed")
+            classify_push(true, 2),
+            ("unobservable", "no_correlated_push_evidence")
         );
+        assert_ne!(classify_push(true, 2).0, "publication_attempted");
+        assert_ne!(classify_push(true, 2).0, "relay_accepted");
     }
 
     #[test]

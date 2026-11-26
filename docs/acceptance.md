@@ -40,7 +40,7 @@ scripts/whitenoise-acceptance.sh restart
 scripts/whitenoise-acceptance.sh stop
 ```
 
-`start` listens on `127.0.0.1:8791` with a fresh database, a fresh MDK directory, the generated sender, and the two WhiteNoise relays. Inherited Telegram credentials, production sender keys, monitor settings, and `WATCHDOG_CONFIG` are not passed in.
+`start` listens on `127.0.0.1:8791` with a fresh database, a fresh MDK directory, the generated sender, and the two WhiteNoise relays. Set `WATCHDOG_ACCEPTANCE_ADDR` only when that port is already taken by another program. Inherited Telegram credentials, production sender keys, monitor settings, and `WATCHDOG_CONFIG` are not passed in.
 
 The watchdog starts the helper, clears the helper environment, and checks health with an IPC ping. A socket file left behind by an exited helper is not treated as healthy.
 
@@ -51,7 +51,7 @@ The watchdog starts the helper, clears the helper environment, and checks health
 3. Send one test alert:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8787/v1/diagnostics/test-alert \
+curl -sS -X POST http://127.0.0.1:8791/v1/diagnostics/test-alert \
   -H "authorization: Bearer $OPERATOR_TOKEN" \
   -H "content-type: application/json" \
   -d '{"projectId":"smartflowsocial","transport":"marmot"}'
@@ -73,7 +73,7 @@ Expected queue state after dispatch is `relay_accepted` only when a relay accept
 - `recipient_absent` or `sender_absent`: the group does not contain both configured accounts. Do not send.
 - `membership_rejected`: an account other than the sender and recipient is in the group.
 - `recipient_push_token_unavailable`: MDK has no active push-token record for a current member. The group message can still be accepted. Push was not attempted.
-- `publication_attempted`: a token record exists and MDK did not log a trigger failure. This build does not treat that as relay acceptance of the gift wrap. `unobservable` means the bounded refresh still has no acknowledgement.
+- `push_unobservable`: the group message can be `relay_accepted` while the helper has no alert-specific push attempt or relay answer. Token presence is not a publication attempt. A gift wrap on a fixture relay is separate evidence and is not phone delivery.
 - `DirectConversationIndexNotReady`: MDK has not finished its conversation index. Retry after the helper stays up; do not create a second group by hand.
 - Relay `AUTH` that the sender cannot satisfy is an error, not an empty inbox.
 

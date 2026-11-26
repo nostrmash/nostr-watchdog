@@ -9,15 +9,16 @@
 //! MDK local submissions are the send journal. The files under `outbox-boundary`
 //! are a projection of that journal plus the direct-conversation id. A pending
 //! projection is refreshed from MDK on every retry. It is not a terminal result.
-//! `consumed.json` is the durable operation index. Journal files may be pruned.
-//! Entries in that index are not.
+//! `operations.log` is the durable operation index. Per-alert files may be pruned.
+//! Operation ids in that index are not.
 
+mod journal;
 mod push_trace;
 mod relays;
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cgka_traits::{GroupId, SendAcceptDisposition};
@@ -41,6 +42,7 @@ const JOURNAL_KEEP: usize = 64;
 pub struct Session {
     runtime: MarmotAppRuntime,
     boundary: PathBuf,
+    journal: Mutex<journal::Journal>,
     allow_loopback: bool,
     _lock: File,
 }
@@ -71,9 +73,11 @@ pub fn open(root: &Path, relays: &[String], allow_loopback: bool) -> Result<Sess
     restrict_dir(&boundary)?;
     fs::create_dir_all(boundary.join("onboard")).map_err(|error| format!("marmot_boundary: {error}"))?;
     restrict_dir(&boundary.join("onboard"))?;
+    let operations = journal::Journal::open(&boundary)?;
     Ok(Session {
         runtime: app.runtime(),
         boundary,
+        journal: Mutex::new(operations),
         allow_loopback,
         _lock: lock,
     })
@@ -400,6 +404,19 @@ impl Session {
         text: &str,
         allow: &[String],
     ) -> Result<Value, String> {
+        self.send_in_project(alert_id, "", account, group_hex, text, allow)
+            .await
+    }
+
+    pub async fn send_in_project(
+        &self,
+        alert_id: &str,
+        project: &str,
+        account: &str,
+        group_hex: &str,
+        text: &str,
+        allow: &[String],
+    ) -> Result<Value, String> {
         if !operation_token(alert_id) {
             return Err("alert_id_invalid".to_string());
         }
@@ -419,7 +436,7 @@ impl Session {
             .or(legacy_started.then_some(StoredSend::Submitting));
         let identity_matches = stored
             .as_ref()
-            .map(|value| journal_identity_matches(value, &account, &group_hex, &payload))
+            .map(|value| journal_identity_matches(value, project, &account, &group_hex, &payload))
             .unwrap_or(true);
         if stored.is_some() && !identity_matches {
             return Err("alert_identity_mismatch".to_string());
@@ -446,12 +463,12 @@ impl Session {
                 let value = self
                     .project_status(
                         alert_id,
+                        project,
                         &account,
                         &group,
                         &recipient,
                         &payload,
                         status,
-                        false,
                         prior,
                         stored.as_ref(),
                     )
@@ -466,7 +483,7 @@ impl Session {
                 Ok(value)
             }
             SendStep::CompletionUnknown => {
-                let mut value = unknown_value(alert_id, &account, &group_hex, &payload);
+                let mut value = unknown_value(alert_id, project, &account, &group_hex, &payload);
                 value = self.finish_record(value, prior)?;
                 self.write_record(alert_id, &value)?;
                 Ok(value)
@@ -476,28 +493,28 @@ impl Session {
                     return Err("operation_already_recorded".to_string());
                 }
                 self.authorize_send(&account, &group_hex, &recipient).await?;
-                let mut intent = json!({
+                let intent = json!({
                     "operation_id": alert_id,
+                    "project": project,
                     "account": account,
                     "group": group_hex,
                     "payload_sha256": payload,
                     "disposition": "submitting",
-                    "message_phase": "accepted_pending",
+                    "message_phase": "prepared",
+                    "message_state": "prepared",
                     "published": 0,
                     "message_ids": [],
                     "message_event_id": Value::Null,
-                    "push": "prepared",
+                    "push": "unknown",
+                    "push_state": "unknown",
                     "push_event_id": Value::Null,
-                    "push_evidence": "not_attempted",
+                    "push_evidence": "intent_recorded",
                     "push_error": Value::Null,
+                    "push_attempts": Value::Null,
                     "hold": true,
                     "preserve_message": true,
                     "terminal": false
                 });
-                let generation = push_trace::begin_submit();
-                if let Some(object) = intent.as_object_mut() {
-                    object.insert("push_trace_generation".to_string(), json!(generation));
-                }
                 self.write_record(alert_id, &intent)?;
                 crash_after("intent")?;
                 if let Err(error) = self
@@ -524,12 +541,12 @@ impl Session {
                 let value = self
                     .project_status(
                         alert_id,
+                        project,
                         &account,
                         &group,
                         &recipient,
                         &payload,
                         status,
-                        true,
                         prior,
                         Some(&intent),
                     )
@@ -568,12 +585,12 @@ impl Session {
     async fn project_status(
         &self,
         alert_id: &str,
+        project: &str,
         account: &str,
         group: &GroupId,
         recipient: &str,
         payload: &str,
         status: LocalSendStatus,
-        fresh_submit: bool,
         prior: PhaseAttempts,
         previous: Option<&Value>,
     ) -> Result<Value, String> {
@@ -598,37 +615,38 @@ impl Session {
         };
         let message_published = disposition == "published";
         let tokens = if message_published {
-            self.recipient_token_count(account, group, recipient)
-                .await
-                .unwrap_or(0)
+            match self.recipient_token_count(account, group, recipient).await {
+                Ok(count) => count,
+                Err(_) => -1,
+            }
         } else {
             0
         };
-        let generation = previous
-            .and_then(|value| value.get("push_trace_generation"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let observed = push_trace::observed_for(generation).or_else(|| {
-            previous
-                .and_then(|value| value.get("push_error"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-        let _ = fresh_submit;
-        let (push, evidence) = classify_push(message_published, tokens, observed.is_some());
+        let _ = push_trace::operation_push_failure();
+        let _ = previous;
+        let (push, evidence) = classify_push(message_published, tokens);
+        let stored_project = previous
+            .and_then(|value| value.get("project"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(project);
         let mut value = json!({
             "operation_id": alert_id,
+            "project": stored_project,
             "account": account,
             "group": group_hex,
             "payload_sha256": payload,
             "disposition": disposition,
             "message_phase": message_phase_name(disposition),
+            "message_state": message_phase_name(disposition),
             "published": published,
             "message_ids": message_ids,
             "push": push,
+            "push_state": push,
             "push_evidence": evidence,
-            "push_error": observed,
+            "push_error": Value::Null,
             "push_event_id": Value::Null,
+            "push_attempts": Value::Null,
             "status_detail": detail,
         });
         if let Some(object) = value.as_object_mut() {
@@ -639,11 +657,6 @@ impl Session {
                 .cloned()
                 .unwrap_or(Value::Null);
             object.insert("message_event_id".to_string(), first);
-        }
-        if let Some(generation) = previous.and_then(|item| item.get("push_trace_generation")) {
-            if let Some(object) = value.as_object_mut() {
-                object.insert("push_trace_generation".to_string(), generation.clone());
-            }
         }
         self.finish_record(value, prior)
     }
@@ -677,11 +690,38 @@ impl Session {
                 json!(attempts.unobservable),
             );
             object.insert("started_at_ms".to_string(), json!(attempts.started_at_ms));
+            object.insert(
+                "operation_age_ms".to_string(),
+                json!(unix_ms().saturating_sub(attempts.started_at_ms)),
+            );
+            object.insert("settled".to_string(), json!(!decision.hold));
+            object.insert("reconcile".to_string(), json!(decision.hold));
+            object.insert("message_state".to_string(), json!(message));
+            object.insert("push_state".to_string(), json!(decision.push_phase));
             if !object.contains_key("push_event_id") {
                 object.insert("push_event_id".to_string(), Value::Null);
             }
+            if !object.contains_key("push_attempts") {
+                object.insert("push_attempts".to_string(), Value::Null);
+            }
         }
         Ok(value)
+    }
+
+    /// MDK's view of whether this account's group changes were refused.
+    /// `None` from MDK means nothing is owed and nothing was refused.
+    pub async fn group_was_accepted(&self, account: &str, group_hex: &str) -> Result<bool, String> {
+        let account = account_hex(account)?;
+        let group = group_id(group_hex)?;
+        match self
+            .runtime
+            .group_commit_delivery(&account, &group)
+            .await
+            .map_err(safe_error)?
+        {
+            None => Ok(true),
+            Some(delivery) => Ok(delivery.refused_relays.is_empty()),
+        }
     }
 
     pub async fn sees_recipient_token(
@@ -747,83 +787,53 @@ impl Session {
         self.runtime.shutdown_and_close().await.map_err(safe_error)
     }
 
-    fn journal_path(&self, alert_id: &str) -> PathBuf {
-        self.boundary.join(format!("{alert_id}.json"))
-    }
-
     fn started_path(&self, alert_id: &str) -> PathBuf {
         self.boundary.join(format!("{alert_id}.started"))
     }
 
-    fn consumed_path(&self) -> PathBuf {
-        self.boundary.join("consumed.json")
+    fn journal(&self) -> Result<std::sync::MutexGuard<'_, journal::Journal>, String> {
+        self.journal
+            .lock()
+            .map_err(|_| "boundary_lock".to_string())
     }
 
     fn read_record(&self, alert_id: &str) -> Result<Option<Value>, String> {
-        let path = self.journal_path(alert_id);
-        if path.exists() {
-            let bytes = fs::read(&path).map_err(|error| format!("boundary_read: {error}"))?;
-            return serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|_| "boundary_corrupt".to_string());
-        }
-        let consumed = self.consumed_index()?;
-        Ok(consumed.get(alert_id).cloned())
-    }
-
-    fn consumed_index(&self) -> Result<Value, String> {
-        let path = self.consumed_path();
-        if !path.exists() {
-            return Ok(json!({}));
-        }
-        let bytes = fs::read(&path).map_err(|error| format!("boundary_read: {error}"))?;
-        serde_json::from_slice(&bytes).map_err(|_| "boundary_corrupt".to_string())
+        Ok(self.journal()?.visible(alert_id))
     }
 
     fn write_record(&self, alert_id: &str, value: &Value) -> Result<(), String> {
-        let mut consumed = self.consumed_index()?;
-        if let Some(object) = consumed.as_object_mut() {
-            object.insert(alert_id.to_string(), value.clone());
-        }
-        atomic_json(&self.consumed_path(), &consumed)?;
-        atomic_json(&self.journal_path(alert_id), value)?;
+        self.journal()?.record(alert_id, value)?;
         let _ = fs::remove_file(self.started_path(alert_id));
         self.prune_journals()
     }
 
     fn forget_unadmitted(&self, alert_id: &str) -> Result<(), String> {
-        let _ = fs::remove_file(self.journal_path(alert_id));
-        let mut consumed = self.consumed_index()?;
-        let drop_entry = consumed
-            .get(alert_id)
-            .and_then(|value| value.get("disposition"))
-            .and_then(Value::as_str)
-            == Some("submitting");
-        if drop_entry {
-            if let Some(object) = consumed.as_object_mut() {
-                object.remove(alert_id);
-            }
-            atomic_json(&self.consumed_path(), &consumed)?;
+        let mut journal = self.journal()?;
+        if journal.disposition(alert_id).as_deref() == Some("submitting") {
+            journal.release(alert_id)?;
         }
         Ok(())
     }
 
     fn prune_journals(&self) -> Result<(), String> {
-        let consumed = self.consumed_index()?;
+        let journal = self.journal()?;
         let mut terminal = Vec::new();
         let entries = fs::read_dir(&self.boundary).map_err(|error| format!("boundary_read: {error}"))?;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !name.ends_with(".json") || name == "consumed.json" || name == "conversations.json" || name == "storage-epoch.json" {
+            if !name.ends_with(".json")
+                || name == "consumed.json"
+                || name == "conversations.json"
+                || name == "storage-epoch.json"
+            {
                 continue;
             }
             let id = name.trim_end_matches(".json");
-            let disposition = consumed
-                .get(id)
-                .and_then(|value| value.get("disposition"))
-                .and_then(Value::as_str);
-            if matches!(disposition, Some("published" | "rejected")) {
+            if matches!(
+                journal.disposition(id).as_deref(),
+                Some("published" | "rejected")
+            ) {
                 let modified = entry
                     .metadata()
                     .and_then(|metadata| metadata.modified())
@@ -896,7 +906,7 @@ impl Session {
                 json!({"group_id": group, "phase": "established"}),
             );
         }
-        atomic_json(&self.conversation_path(), &value)
+        journal::atomic_json(&self.conversation_path(), &value)
     }
 
     fn mark_intending(&self, account: &str, peer: &str) -> Result<(), String> {
@@ -913,7 +923,7 @@ impl Session {
                 json!({"phase": "intending", "started_at_ms": unix_ms(), "empty_lookups": 0}),
             );
         }
-        atomic_json(&self.conversation_path(), &value)
+        journal::atomic_json(&self.conversation_path(), &value)
     }
 
     fn note_empty_lookup(&self, account: &str, peer: &str) -> Result<(), String> {
@@ -935,7 +945,7 @@ impl Session {
                 }),
             );
         }
-        atomic_json(&self.conversation_path(), &value)
+        journal::atomic_json(&self.conversation_path(), &value)
     }
 
     fn onboard_path(&self, operation_id: &str) -> PathBuf {
@@ -960,7 +970,7 @@ impl Session {
             .get("operation_id")
             .and_then(Value::as_str)
             .ok_or_else(|| "operation_id_invalid".to_string())?;
-        atomic_json(&self.onboard_path(operation_id), value)
+        journal::atomic_json(&self.onboard_path(operation_id), value)
     }
 
     fn epoch_path(&self) -> PathBuf {
@@ -993,7 +1003,7 @@ impl Session {
             accounts.push(account.to_string());
             accounts.sort();
         }
-        atomic_json(&self.epoch_path(), &json!({"accounts": accounts}))
+        journal::atomic_json(&self.epoch_path(), &json!({"accounts": accounts}))
     }
 
     fn managed_accounts(&self) -> Result<Vec<ManagedAccount>, String> {
@@ -1110,7 +1120,18 @@ fn read_attempts(value: &Value) -> PhaseAttempts {
     }
 }
 
-fn journal_identity_matches(value: &Value, account: &str, group: &str, payload: &str) -> bool {
+fn journal_identity_matches(
+    value: &Value,
+    project: &str,
+    account: &str,
+    group: &str,
+    payload: &str,
+) -> bool {
+    if let Some(stored_project) = value.get("project").and_then(Value::as_str) {
+        if !stored_project.is_empty() && !project.is_empty() && stored_project != project {
+            return false;
+        }
+    }
     match (
         value.get("account").and_then(Value::as_str),
         value.get("group").and_then(Value::as_str),
@@ -1126,9 +1147,10 @@ fn journal_identity_matches(value: &Value, account: &str, group: &str, payload: 
     }
 }
 
-fn unknown_value(alert_id: &str, account: &str, group: &str, payload: &str) -> Value {
+fn unknown_value(alert_id: &str, project: &str, account: &str, group: &str, payload: &str) -> Value {
     json!({
         "operation_id": alert_id,
+        "project": project,
         "account": account,
         "group": group,
         "payload_sha256": payload,
@@ -1218,43 +1240,14 @@ fn unix_ms() -> i64 {
 }
 
 fn crash_after(point: &str) -> Result<(), String> {
-    if std::env::var("WATCHDOG_MARMOT_CRASH_AT").ok().as_deref() == Some(point) {
-        Err(format!("crash_injected:{point}"))
-    } else {
-        Ok(())
+    if std::env::var("WATCHDOG_MARMOT_CRASH_AT").ok().as_deref() != Some(point) {
+        return Ok(());
     }
-}
-
-fn atomic_json(path: &Path, value: &Value) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("boundary_write: {error}"))?;
+    if std::env::var("WATCHDOG_MARMOT_CRASH_EXIT").ok().as_deref() == Some("1") {
+        eprintln!("watchdog-marmot stopped at {point}");
+        std::process::exit(75);
     }
-    let bytes = serde_json::to_vec(value).map_err(|_| "boundary_encode".to_string())?;
-    let tmp = path.with_extension("tmp");
-    let _ = fs::remove_file(&tmp);
-    {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&tmp)
-            .map_err(|error| format!("boundary_write: {error}"))?;
-        file.write_all(&bytes)
-            .map_err(|error| format!("boundary_write: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("boundary_write: {error}"))?;
-    }
-    fs::rename(&tmp, path).map_err(|error| format!("boundary_write: {error}"))?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-    restrict(path)
+    Err(format!("crash_injected:{point}"))
 }
 
 fn safe_error(error: impl ToString) -> String {
