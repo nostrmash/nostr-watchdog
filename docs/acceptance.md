@@ -26,24 +26,21 @@ The helper process uses an 8 MiB Tokio worker stack. MDK futures overflow the de
 
 Use a new sender and a WhiteNoise account that is not a daily driver. Do not reuse production `SFS_BOT_NSEC` or `NOSTRMASH_BOT_NSEC`.
 
-`scripts/whitenoise-acceptance.sh` checks the Odin binary, both executables, and `OPERATOR_TOKEN`, then prints this environment for an isolated directory. It does not send an alert.
+`scripts/whitenoise-acceptance.sh` creates the isolated directory. The native process reads `DATABASE_PATH`. The script does not export `WATCHDOG_DB`, does not read the parent shell's secrets, and does not send an alert until you run an alert command.
 
 ```bash
-export OPERATOR_TOKEN="<fresh local secret>"
-export MARMOT_ROOT="$PWD/data/marmot-test"
-export MARMOT_SOCKET="$MARMOT_ROOT/watchdog.sock"
-export MARMOT_HELPER="$PWD/crates/watchdog-marmot/target/release/watchdog-marmot"
-export ENABLE_MARMOT=true
-export ENABLE_NIP17=false
-export ALERTS_ENABLED=true
-export WATCHDOG_ENABLED=true
-export SFS_BOT_NSEC="<test sender nsec>"
-export ADMIN_NPUB="<test recipient hex or npub>"
-export BOOTSTRAP_RELAYS="wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat"
-mkdir -p "$MARMOT_ROOT"
-chmod 700 "$MARMOT_ROOT"
-./target/release/nostr-watchdog
+scripts/whitenoise-acceptance.sh prepare <test phone hex or npub>
+scripts/whitenoise-acceptance.sh start
+scripts/whitenoise-acceptance.sh init
+scripts/whitenoise-acceptance.sh conversation
+scripts/whitenoise-acceptance.sh status
+scripts/whitenoise-acceptance.sh alert-foreground
+scripts/whitenoise-acceptance.sh alert-locked
+scripts/whitenoise-acceptance.sh restart
+scripts/whitenoise-acceptance.sh stop
 ```
+
+`start` listens on `127.0.0.1:8791` with a fresh database, a fresh MDK directory, the generated sender, and the two WhiteNoise relays. Set `WATCHDOG_ACCEPTANCE_ADDR` only when that port is already taken by another program. Inherited Telegram credentials, production sender keys, monitor settings, and `WATCHDOG_CONFIG` are not passed in.
 
 The watchdog starts the helper, clears the helper environment, and checks health with an IPC ping. A socket file left behind by an exited helper is not treated as healthy.
 
@@ -54,7 +51,7 @@ The watchdog starts the helper, clears the helper environment, and checks health
 3. Send one test alert:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8787/v1/diagnostics/test-alert \
+curl -sS -X POST http://127.0.0.1:8791/v1/diagnostics/test-alert \
   -H "authorization: Bearer $OPERATOR_TOKEN" \
   -H "content-type: application/json" \
   -d '{"projectId":"smartflowsocial","transport":"marmot"}'
@@ -71,12 +68,12 @@ Expected queue state after dispatch is `relay_accepted` only when a relay accept
 - `marmot_helper_unavailable`: the helper did not answer a ping. Check `MARMOT_HELPER`, `MARMOT_ROOT` mode `0700`, and that Odin was present at build time.
 - `marmot_helper_busy`: the helper process is alive and a command is in progress. That is not a dead process. Do not start a second helper against the same root.
 - `--allow-loopback` exists only for a loopback fixture relay. The watchdog does not pass it. WhiteNoise onboarding uses public `wss` relays.
-- `sender_identity_mismatch`, `recipient_identity_mismatch`, or `recipient_identity_unbound`: the saved project row does not match the current keys. Set `MARMOT_REONBOARD` to the project id for one process start, then unset it. The helper will not create a replacement conversation on its own.
+- `sender_identity_mismatch`, `recipient_identity_mismatch`, or `recipient_identity_unbound`: the saved project row does not match the current keys. Set `MARMOT_ONBOARD_OPERATION` to a new id such as `reonboard:smartflowsocial` and `MARMOT_ONBOARD_REPLACE=true` for a deliberate rotation. `MARMOT_REONBOARD=smartflowsocial` is the same stable operation id, so leaving it set does not onboard again on the next alert.
 - `push_unobservable` or `recipient_push_token_unavailable` after repeated retries: reconciliation stopped. The group message is not sent again. A phone notification was not confirmed.
 - `recipient_absent` or `sender_absent`: the group does not contain both configured accounts. Do not send.
 - `membership_rejected`: an account other than the sender and recipient is in the group.
 - `recipient_push_token_unavailable`: MDK has no active push-token record for a current member. The group message can still be accepted. Push was not attempted.
-- `push_disposition_unknown`: a token record exists. This build does not treat message publication as evidence that a push trigger was accepted.
+- `push_unobservable`: the group message can be `relay_accepted` while the helper has no alert-specific push attempt or relay answer. Token presence is not a publication attempt. A gift wrap on a fixture relay is separate evidence and is not phone delivery.
 - `DirectConversationIndexNotReady`: MDK has not finished its conversation index. Retry after the helper stays up; do not create a second group by hand.
 - Relay `AUTH` that the sender cannot satisfy is an error, not an empty inbox.
 

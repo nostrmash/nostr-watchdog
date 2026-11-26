@@ -4,6 +4,7 @@
 //! runtime. It is not part of the Cloudflare deployment.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,6 +12,7 @@ use tokio::net::{UnixListener, UnixStream};
 use watchdog_marmot::Session;
 
 fn main() {
+    tighten_umask();
     // MDK futures are deep. Upstream integration tests use an 8 MiB worker stack.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -25,6 +27,8 @@ async fn run() {
     let mut socket = None;
     let mut relays = Vec::new();
     let mut allow_loopback = false;
+    let mut write_identity = None;
+    let mut normalize_pubkey = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -36,8 +40,27 @@ async fn run() {
                 }
             }
             "--allow-loopback" => allow_loopback = true,
+            "--write-identity" => write_identity = args.next().map(PathBuf::from),
+            "--normalize-pubkey" => normalize_pubkey = args.next(),
             _ => {}
         }
+    }
+    if let Some(value) = normalize_pubkey {
+        match normalize_public_key(&value) {
+            Ok(hex_key) => println!("{hex_key}"),
+            Err(error) => {
+                eprintln!("watchdog-marmot public key: {error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+    if let Some(path) = write_identity {
+        if let Err(error) = write_identity_file(&path) {
+            eprintln!("watchdog-marmot identity failed: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
     let Some(root) = root else {
         eprintln!("watchdog-marmot requires --root");
@@ -51,6 +74,7 @@ async fn run() {
             std::process::exit(1);
         }
     };
+    // The process lock is already held. A socket left by a dead helper is stale.
     if socket.exists() {
         let _ = std::fs::remove_file(&socket);
     }
@@ -78,12 +102,18 @@ async fn run() {
         let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
         let _ = std::fs::set_permissions(&health_path, std::fs::Permissions::from_mode(0o600));
     }
+    let health_permits = Arc::new(tokio::sync::Semaphore::new(4));
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = health.accept().await else {
                 break;
             };
+            let Ok(permit) = health_permits.clone().try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
             tokio::spawn(async move {
+                let _permit = permit;
                 let (_, mut write) = stream.into_split();
                 let response = json!({"ok": true, "pong": true});
                 let _ = tokio::time::timeout(
@@ -193,8 +223,38 @@ async fn dispatch(session: &Session, request: Value) -> Value {
             let body = text(&request, "text");
             let allow = strings(request.get("allow"));
             session
-                .send_once(&alert, &account, &group, &body, &allow)
+                .send_in_project(&alert, &text(&request, "project"), &account, &group, &body, &allow)
                 .await
+        }
+        "onboard" => {
+            let operation_id = text(&request, "operation_id");
+            let nsec = text(&request, "nsec");
+            let recipient = text(&request, "recipient");
+            let relays = strings(request.get("relays"));
+            let replace = request.get("replace").and_then(Value::as_bool).unwrap_or(false);
+            if nsec.is_empty() {
+                Err("sender_missing".to_string())
+            } else {
+                session
+                    .onboard(&operation_id, nsec, &relays, &recipient, replace)
+                    .await
+            }
+        }
+        "onboard_status" => {
+            let operation_id = text(&request, "operation_id");
+            session.onboard_status(&operation_id)
+        }
+        "identity" => {
+            let account = text(&request, "account");
+            let recipient = text(&request, "recipient");
+            let group = text(&request, "group");
+            session.identity(&account, &recipient, &group).await
+        }
+        "readiness" => {
+            let account = text(&request, "account");
+            let recipient = text(&request, "recipient");
+            let group = text(&request, "group");
+            session.readiness(&account, &recipient, &group).await
         }
         "sync" => session.sync().await.map(|_| json!({"synced": true})),
         _ => Err("op_invalid".to_string()),
@@ -251,6 +311,64 @@ async fn read_bounded_line(stream: &mut UnixStream, max: usize) -> Result<String
         return Err("request_invalid".to_string());
     }
     String::from_utf8(bytes).map_err(|_| "request_invalid".to_string())
+}
+
+fn tighten_umask() {
+    #[cfg(unix)]
+    unsafe {
+        // macOS mode_t is 16 bits. Linux mode_t is 32 bits. The value is
+        // zero-extended in the register either way.
+        #[cfg(target_os = "linux")]
+        type Mode = u32;
+        #[cfg(not(target_os = "linux"))]
+        type Mode = u16;
+        extern "C" {
+            fn umask(mask: Mode) -> Mode;
+        }
+        umask(0o077);
+    }
+}
+
+fn normalize_public_key(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.starts_with("nsec") {
+        return Err("secret_refused".to_string());
+    }
+    if trimmed.len() == 64 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Ok(trimmed.to_ascii_lowercase());
+    }
+    nostr::prelude::PublicKey::parse(trimmed)
+        .map(|key| key.to_hex())
+        .map_err(|_| "pubkey_invalid".to_string())
+}
+
+fn write_identity_file(path: &std::path::Path) -> Result<(), String> {
+    use nostr::prelude::{Keys, ToBech32};
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let keys = Keys::generate();
+    let secret = keys
+        .secret_key()
+        .to_bech32()
+        .map_err(|_| "identity_failed".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("identity_path: {error}"))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| format!("identity_path: {error}"))?;
+    file.write_all(secret.as_bytes())
+        .map_err(|error| format!("identity_path: {error}"))?;
+    file.write_all(b"\n")
+        .map_err(|error| format!("identity_path: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("identity_path: {error}"))?;
+    println!("{}", keys.public_key().to_hex());
+    Ok(())
 }
 
 async fn write_json(

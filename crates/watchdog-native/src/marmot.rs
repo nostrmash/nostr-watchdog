@@ -7,14 +7,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use watchdog_core::catalog::{project_by_id, project_recipient};
-use watchdog_core::marmot_recovery::{bind_identity, IdentityStep};
 use watchdog_core::settings::load_settings;
 use watchdog_engine::DeliveryOutcome;
 use watchdog_notify::{public_key_hex, recipient_pubkey};
@@ -66,127 +65,129 @@ pub async fn deliver(
             Err(_) => return failed("sender_key_invalid"),
         }
     };
-    let reonboard = get("MARMOT_REONBOARD") == project.id;
     let cached_sender = known.as_ref().and_then(|item| item.pubkey.as_deref());
-    let cached_peer = known.as_ref().and_then(|item| item.peer_pubkey.as_deref());
-    let cached_group = known.as_ref().and_then(|item| item.group_id_hex.as_deref());
-    let account = match bind_identity(
-        cached_sender,
-        expected_sender.as_deref(),
-        cached_peer,
-        cached_group,
-        &recipient,
-        reonboard,
-    ) {
-        IdentityStep::SenderMismatch => return failed("sender_identity_mismatch"),
-        IdentityStep::RecipientMismatch => return failed("recipient_identity_mismatch"),
-        IdentityStep::RecipientUnbound => return failed("recipient_identity_unbound"),
-        IdentityStep::UseCached => cached_sender.unwrap_or_default().to_string(),
-        IdentityStep::Import => {
-            if nsec.is_empty() {
-                return failed("sender_key_missing");
+    let cached_group = known.as_ref().and_then(|item| item.group_id_hex.clone());
+    let setup = onboard_request(&get, project.id, cached_sender.is_none());
+    let (account, group) = if let Some(setup) = setup {
+        if !owns_claim(store, row, claim, &settings) {
+            return pending("claim_lost");
+        }
+        if nsec.is_empty() {
+            return failed("sender_key_missing");
+        }
+        match renew_until(
+            store,
+            row,
+            claim,
+            settings.delivery_claim_ms,
+            ensure_onboard(&socket, &nsec, &settings.bootstrap, &recipient, &setup),
+        )
+        .await
+        {
+            Ok((account, group)) => {
+                if let Some(expected) = &expected_sender {
+                    if !account.eq_ignore_ascii_case(expected) {
+                        return failed("sender_identity_mismatch");
+                    }
+                }
+                remember(store, row, &account, &recipient, Some(&group), None);
+                (account, group)
             }
-            let relays = settings.bootstrap.clone();
-            let imported = match call(
+            Err(error) => return error,
+        }
+    } else {
+        let account = cached_sender.unwrap_or_default().to_string();
+        let identity = match renew_until(
+            store,
+            row,
+            claim,
+            settings.delivery_claim_ms,
+            call(
                 &socket,
-                json!({"op": "import", "nsec": nsec, "relays": relays}),
-                Duration::from_secs(60),
+                json!({
+                    "op": "identity",
+                    "account": account,
+                    "recipient": recipient,
+                    "group": cached_group.clone().unwrap_or_default()
+                }),
+                Duration::from_secs(30),
+            ),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => return pending(&error),
+        };
+        if identity.get("ok") != Some(&Value::Bool(true)) {
+            return outcome_from_error(&identity, true);
+        }
+        if let Some(error) = identity_error(identity.get("step").and_then(Value::as_str)) {
+            return failed(error);
+        }
+        let group = if let Some(group) = cached_group.filter(|group| !group.is_empty()) {
+            group
+        } else {
+            if !owns_claim(store, row, claim, &settings) {
+                return pending("claim_lost");
+            }
+            let created = match renew_until(
+                store,
+                row,
+                claim,
+                settings.delivery_claim_ms,
+                call(
+                    &socket,
+                    json!({
+                        "op": "create_group",
+                        "account": account,
+                        "name": format!("watchdog-{}", project.id),
+                        "members": [recipient]
+                    }),
+                    Duration::from_secs(90),
+                ),
             )
             .await
             {
                 Ok(value) => value,
                 Err(error) => return pending(&error),
             };
-            if imported.get("ok") != Some(&Value::Bool(true)) {
-                return outcome_from_error(&imported, false);
+            if created.get("ok") != Some(&Value::Bool(true)) {
+                remember(store, row, &account, &recipient, None, error_code(&created));
+                return outcome_from_error(&created, true);
             }
-            let Some(account) = imported.get("account").and_then(Value::as_str) else {
-                return pending("marmot_account_missing");
+            let Some(group) = created
+                .get("group")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return pending("marmot_group_missing");
             };
-            if let Some(expected) = &expected_sender {
-                if !account.eq_ignore_ascii_case(expected) {
-                    return failed("sender_identity_mismatch");
-                }
-            }
-            account.to_string()
-        }
+            remember(store, row, &account, &recipient, Some(&group), None);
+            group
+        };
+        (account, group)
     };
-    let existing = if reonboard {
-        None
-    } else {
-        known.and_then(|row| row.group_id_hex)
-    };
-    let group = if let Some(group) = existing.filter(|group| !group.is_empty()) {
-        group
-    } else if reonboard {
-        let created = match call(
+    if !owns_claim(store, row, claim, &settings) {
+        return pending("claim_lost");
+    }
+    let sent = match renew_until(
+        store,
+        row,
+        claim,
+        settings.delivery_claim_ms,
+        call(
             &socket,
             json!({
-                "op": "reonboard",
+                "op": "send",
+                "alert": row.id,
+                "project": row.project_id,
                 "account": account,
-                "members": [recipient]
+                "group": group,
+                "text": row.payload_text,
+                "allow": [recipient]
             }),
             Duration::from_secs(90),
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => return pending(&error),
-        };
-        if created.get("ok") != Some(&Value::Bool(true)) {
-            remember(store, row, &account, &recipient, None, error_code(&created));
-            return outcome_from_error(&created, true);
-        }
-        let Some(group) = created
-            .get("group")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
-            return pending("marmot_group_missing");
-        };
-        remember(store, row, &account, &recipient, Some(&group), None);
-        group
-    } else {
-        let created = match call(
-            &socket,
-            json!({
-                "op": "create_group",
-                "account": account,
-                "name": format!("watchdog-{}", project.id),
-                "members": [recipient]
-            }),
-            Duration::from_secs(90),
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => return pending(&error),
-        };
-        if created.get("ok") != Some(&Value::Bool(true)) {
-            remember(store, row, &account, &recipient, None, error_code(&created));
-            return outcome_from_error(&created, true);
-        }
-        let Some(group) = created
-            .get("group")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
-            return pending("marmot_group_missing");
-        };
-        remember(store, row, &account, &recipient, Some(&group), None);
-        group
-    };
-    let sent = match call(
-        &socket,
-        json!({
-            "op": "send",
-            "alert": row.id,
-            "account": account,
-            "group": group,
-            "text": row.payload_text,
-            "allow": [recipient]
-        }),
-        Duration::from_secs(90),
+        ),
     )
     .await
     {
@@ -204,14 +205,6 @@ pub async fn deliver(
         );
         return outcome_from_error(&sent, true);
     }
-    let disposition = sent
-        .get("disposition")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let push = sent
-        .get("push")
-        .and_then(Value::as_str)
-        .unwrap_or("not_attempted");
     let message_id = sent
         .get("message_ids")
         .and_then(Value::as_array)
@@ -219,25 +212,7 @@ pub async fn deliver(
         .and_then(Value::as_str)
         .map(str::to_string);
     remember(store, row, &account, &recipient, Some(&group), None);
-    match disposition {
-        "rejected" => failed("marmot_send_rejected"),
-        // A relay-accepted group message is not a phone notification. MDK does
-        // not currently expose push-trigger acceptance, so the outbox keeps
-        // reconciling and the configured Telegram redundancy may run once.
-        "published" => held(push, "relay_accepted", push, message_id),
-        "accepted_pending" => held(
-            "marmot_publish_pending",
-            "accepted_pending",
-            push,
-            message_id,
-        ),
-        _ => held(
-            "marmot_completion_unknown",
-            "completion_unknown",
-            push,
-            message_id,
-        ),
-    }
+    outcome_from_send(&sent, message_id)
 }
 
 pub async fn sync(vars: &HashMap<String, String>) -> Result<(), String> {
@@ -267,14 +242,16 @@ fn socket_path(vars: &HashMap<String, String>) -> Option<PathBuf> {
 }
 
 async fn ensure_helper(vars: &HashMap<String, String>, socket: &Path) -> Result<(), String> {
+    let _startup = startup_gate().lock().await;
     reap_helper();
     if ping_health(vars).await.is_ok() {
         return Ok(());
     }
     // A live process that does not answer is busy or still starting. Killing
-    // it would interrupt an MDK mutation. A socket that accepts connections
-    // belongs to a process this parent may not have spawned.
-    if child_running() || UnixStream::connect(socket).await.is_ok() {
+    // it would interrupt an MDK mutation. The socket is removed only when this
+    // parent can see that no helper holds the root lock.
+    let socket_accepts = UnixStream::connect(socket).await.is_ok();
+    if child_running() || !may_unlink_socket(helper_lock_free(vars), socket_accepts) {
         return Err("marmot_helper_busy".to_string());
     }
     if socket.exists() {
@@ -483,12 +460,322 @@ fn remember(
     );
 }
 
+struct OnboardRequest {
+    operation_id: String,
+    replace: bool,
+}
+
+fn onboard_request(
+    get: &impl Fn(&str) -> String,
+    project_id: &str,
+    uncached: bool,
+) -> Option<OnboardRequest> {
+    if let Some(operation_id) = nonempty(&get("MARMOT_ONBOARD_OPERATION")) {
+        return Some(OnboardRequest {
+            operation_id,
+            replace: get("MARMOT_ONBOARD_REPLACE") == "true" || get("MARMOT_REONBOARD") == project_id,
+        });
+    }
+    if get("MARMOT_REONBOARD") == project_id {
+        return Some(OnboardRequest {
+            operation_id: format!("reonboard:{project_id}"),
+            replace: true,
+        });
+    }
+    if uncached {
+        return Some(OnboardRequest {
+            operation_id: format!("initial:{project_id}"),
+            replace: false,
+        });
+    }
+    None
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+async fn ensure_onboard(
+    socket: &Path,
+    nsec: &str,
+    relays: &[String],
+    recipient: &str,
+    setup: &OnboardRequest,
+) -> Result<(String, String), DeliveryOutcome> {
+    let status = call(
+        socket,
+        json!({"op": "onboard_status", "operation_id": setup.operation_id}),
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(|error| pending(&error))?;
+    if status.get("ok") != Some(&Value::Bool(true)) {
+        return Err(outcome_from_error(&status, false));
+    }
+    let established = status.get("phase").and_then(Value::as_str) == Some("established")
+        && status.get("recipient").and_then(Value::as_str) == Some(recipient)
+        && status.get("replace").and_then(Value::as_bool) == Some(setup.replace);
+    if established {
+        let account = status
+            .get("account")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let group = status
+            .get("group")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if account.is_empty() || group.is_empty() {
+            return Err(pending("marmot_group_missing"));
+        }
+        return Ok((account, group));
+    }
+    let created = call(
+        socket,
+        json!({
+            "op": "onboard",
+            "operation_id": setup.operation_id,
+            "nsec": nsec,
+            "relays": relays,
+            "recipient": recipient,
+            "replace": setup.replace
+        }),
+        Duration::from_secs(90),
+    )
+    .await
+    .map_err(|error| pending(&error))?;
+    if created.get("ok") != Some(&Value::Bool(true)) {
+        return Err(outcome_from_error(&created, true));
+    }
+    let account = created
+        .get("account")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let group = created
+        .get("group")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if account.is_empty() || group.is_empty() {
+        return Err(pending("marmot_group_missing"));
+    }
+    Ok((account, group))
+}
+
+fn identity_error(step: Option<&str>) -> Option<&'static str> {
+    match step {
+        Some("use_cached") => None,
+        Some("sender_identity_mismatch") => Some("sender_identity_mismatch"),
+        Some("recipient_identity_mismatch") => Some("recipient_identity_mismatch"),
+        Some("recipient_identity_unbound") => Some("recipient_identity_unbound"),
+        Some("mdk_storage_missing") => Some("mdk_storage_missing"),
+        Some("device_identity_invalid") => Some("device_identity_invalid"),
+        Some("mdk_storage_replaced") => Some("mdk_storage_replaced"),
+        Some("conversation_unavailable") => Some("conversation_unavailable"),
+        Some("import") => Some("sender_identity_mismatch"),
+        _ => Some("marmot_identity_invalid"),
+    }
+}
+
+/// Extends a live claim while `work` is still running. An expired claim is not
+/// given a new token. The in-flight helper call is allowed to finish.
+async fn renew_until<T>(
+    store: &SqliteStore,
+    row: &OutboxRow,
+    claim: &str,
+    claim_ms: i64,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    let interval = (claim_ms / 3).clamp(5_000, 60_000) as u64;
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut work => return result,
+            _ = tokio::time::sleep(Duration::from_millis(interval)) => {
+                let renewed = store
+                    .extend_claim(&row.id, claim, now_ms() + claim_ms, now_ms())
+                    .unwrap_or(false);
+                if !renewed {
+                    return work.await;
+                }
+            }
+        }
+    }
+}
+
+fn owns_claim(
+    store: &SqliteStore,
+    row: &OutboxRow,
+    claim: &str,
+    settings: &watchdog_core::settings::Settings,
+) -> bool {
+    store
+        .extend_claim(
+            &row.id,
+            claim,
+            now_ms() + settings.delivery_claim_ms,
+            now_ms(),
+        )
+        .unwrap_or(false)
+}
+
+fn outcome_from_send(sent: &Value, message_id: Option<String>) -> DeliveryOutcome {
+    let message = sent
+        .get("message_phase")
+        .and_then(Value::as_str)
+        .unwrap_or("completion_unknown");
+    let push = sent
+        .get("push")
+        .and_then(Value::as_str)
+        .unwrap_or("not_attempted");
+    let hold = sent.get("hold").and_then(Value::as_bool).unwrap_or(false);
+    let preserve = sent
+        .get("preserve_message")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let terminal = sent.get("terminal").and_then(Value::as_bool).unwrap_or(false);
+    let detail = sent.get("status_detail").and_then(Value::as_str);
+    let accepted = message == "relay_accepted" && preserve && !hold;
+    let error = if accepted {
+        None
+    } else if detail == Some("refused_new_members") {
+        Some("membership_rejected".to_string())
+    } else if message == "rejected" {
+        Some("marmot_send_rejected".to_string())
+    } else if hold {
+        Some(hold_error(message, push).to_string())
+    } else if message == "accepted_pending" {
+        Some("marmot_publish_unconfirmed".to_string())
+    } else if message == "completion_unknown" {
+        Some("marmot_completion_unknown".to_string())
+    } else {
+        sent.get("push_error")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    DeliveryOutcome {
+        accepted,
+        terminal: terminal && !accepted,
+        hold_attempt: hold,
+        error,
+        accepted_relays: Vec::new(),
+        failed_relays: Vec::new(),
+        message_phase: Some(if preserve || message != "not_published" {
+            message.to_string()
+        } else {
+            "not_published".to_string()
+        }),
+        push_phase: Some(push.to_string()),
+        message_event_id: message_id.or_else(|| {
+            sent.get("message_event_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }),
+        push_envelope: None,
+    }
+}
+
+fn hold_error(message: &str, push: &str) -> &'static str {
+    match message {
+        "relay_accepted" => match push {
+            "token_unavailable" => "recipient_push_token_unavailable",
+            "rejected" | "terminal_failure" => "push_terminal_failure",
+            _ => "push_unobservable",
+        },
+        "accepted_pending" => "marmot_publish_pending",
+        _ => "marmot_completion_unknown",
+    }
+}
+
+/// The socket file is removed only when no helper owns the root and nothing is
+/// accepting connections on it.
+pub fn may_unlink_socket(lock_free: bool, socket_accepts: bool) -> bool {
+    lock_free && !socket_accepts
+}
+
+fn helper_lock_free(vars: &HashMap<String, String>) -> bool {
+    let Some(root) = vars.get("MARMOT_ROOT").filter(|path| !path.is_empty()) else {
+        return false;
+    };
+    if std::fs::create_dir_all(root).is_err() {
+        return false;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(Path::new(root).join("helper.lock"))
+    else {
+        return false;
+    };
+    if !exclusive_lock(&file) {
+        return false;
+    }
+    unlock(&file);
+    true
+}
+
+fn exclusive_lock(file: &std::fs::File) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        true
+    }
+}
+
+fn unlock(file: &std::fs::File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        const LOCK_UN: i32 = 8;
+        unsafe {
+            let _ = flock(file.as_raw_fd(), LOCK_UN);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+}
+
+fn startup_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn outcome_from_error(value: &Value, membership_is_terminal: bool) -> DeliveryOutcome {
     let code = error_code(value).unwrap_or("marmot_helper_error");
     if membership_is_terminal
         && matches!(
             code,
-            "membership_rejected" | "membership_unknown" | "no_eligible_member"
+            "membership_rejected"
+                | "membership_unknown"
+                | "no_eligible_member"
+                | "sender_absent"
+                | "recipient_absent"
+                | "conversation_mismatch"
+                | "conversation_not_reusable"
+                | "conversation_unavailable"
         )
     {
         failed(code)
@@ -516,21 +803,6 @@ fn pending_phase(error: &str, message: &str, push: &str) -> DeliveryOutcome {
         message_phase: Some(message.to_string()),
         push_phase: Some(push.to_string()),
         message_event_id: None,
-        push_envelope: None,
-    }
-}
-
-fn held(error: &str, message: &str, push: &str, message_id: Option<String>) -> DeliveryOutcome {
-    DeliveryOutcome {
-        accepted: false,
-        terminal: false,
-        hold_attempt: true,
-        error: Some(error.to_string()),
-        accepted_relays: Vec::new(),
-        failed_relays: Vec::new(),
-        message_phase: Some(message.to_string()),
-        push_phase: Some(push.to_string()),
-        message_event_id: message_id,
         push_envelope: None,
     }
 }
@@ -575,4 +847,90 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{may_unlink_socket, now_ms, onboard_request};
+
+    fn get<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> String + 'a {
+        move |key| {
+            values
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_string())
+                .unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn a_stale_socket_is_removed_only_when_the_helper_lock_is_free() {
+        assert!(may_unlink_socket(true, false));
+        assert!(!may_unlink_socket(false, false));
+        assert!(!may_unlink_socket(false, true));
+        assert!(!may_unlink_socket(true, true));
+    }
+
+    #[test]
+    fn reonboard_is_one_stable_operation_and_does_not_change_its_id_per_alert() {
+        let env = get(&[("MARMOT_REONBOARD", "smartflowsocial")]);
+        let first = onboard_request(&env, "smartflowsocial", false).expect("operation");
+        let second = onboard_request(&env, "smartflowsocial", false).expect("operation");
+        assert_eq!(first.operation_id, "reonboard:smartflowsocial");
+        assert_eq!(first.operation_id, second.operation_id);
+        assert!(first.replace);
+        let initial = onboard_request(&get(&[]), "smartflowsocial", true).expect("initial");
+        assert_eq!(initial.operation_id, "initial:smartflowsocial");
+        assert!(!initial.replace);
+        assert!(onboard_request(&get(&[]), "smartflowsocial", false).is_none());
+    }
+
+    #[test]
+    fn an_expired_claim_is_not_revived_and_a_live_claim_can_be_renewed() {
+        use watchdog_core::domain::{AlertClass, AlertDraft, Destination, Severity};
+        use watchdog_store::SqliteStore;
+        let dir = std::env::temp_dir().join(format!(
+            "watchdog-claim-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("claim dir");
+        let path = dir.join("watchdog.sqlite");
+        let store = SqliteStore::open(&path).expect("store");
+        let now = now_ms();
+        store
+            .insert_alert(
+                &AlertDraft {
+                    id: "alt_claim".to_string(),
+                    alert_class: AlertClass::Test,
+                    incident_id: None,
+                    monitor_id: "acceptance".to_string(),
+                    project_id: "smartflowsocial".to_string(),
+                    dedupe_key: "claim".to_string(),
+                    destination: Destination::Marmot,
+                    severity: Severity::Info,
+                    text: "claim".to_string(),
+                },
+                now,
+            )
+            .expect("insert");
+        let token = store
+            .claim_row("alt_claim", now, now + 60_000)
+            .expect("claim")
+            .expect("token");
+        assert!(store
+            .extend_claim("alt_claim", &token, now + 120_000, now)
+            .expect("renew"));
+        assert!(store
+            .extend_claim("alt_claim", &token, now - 1, now)
+            .expect("expire"));
+        assert!(!store
+            .extend_claim("alt_claim", &token, now + 60_000, now)
+            .expect("expired"));
+        assert!(!store
+            .extend_claim("alt_claim", "different-token", now + 60_000, now)
+            .expect("foreign"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
