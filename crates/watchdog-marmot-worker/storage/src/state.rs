@@ -35,6 +35,7 @@ pub(crate) const MAX_MESSAGES_PER_GROUP: usize = 4_096;
 pub(crate) const MAX_MLS_ENTRIES: usize = 20_000;
 pub(crate) const MAX_SNAPSHOTS_PER_GROUP: usize = 32;
 pub(crate) const MAX_INGRESS_MARKERS: usize = 4_096;
+pub(crate) const MAX_JOURNAL: usize = 64;
 
 #[derive(Clone)]
 pub(crate) struct State {
@@ -79,6 +80,7 @@ pub(crate) struct State {
     pub floors: HashMap<GroupId, u64>,
     pub account_secret: Option<Zeroizing<Vec<u8>>>,
     pub revision: u64,
+    pub binding: AccountBinding,
 }
 
 #[derive(Clone)]
@@ -149,6 +151,7 @@ impl State {
             floors: HashMap::new(),
             account_secret: None,
             revision: 0,
+            binding: AccountBinding::default(),
         }
     }
 
@@ -550,6 +553,7 @@ impl State {
                 .as_ref()
                 .map(|secret| hex::encode(secret.as_slice())),
             revision: self.revision,
+            binding: self.binding.clone(),
         })
     }
 
@@ -704,6 +708,10 @@ impl State {
             state.account_secret = Some(Zeroizing::new(bytes));
         }
         state.revision = saved.revision;
+        state.binding = saved.binding;
+        if state.journal.len() > MAX_JOURNAL.saturating_mul(2) {
+            return Err(PersistError::Capacity);
+        }
         for group in state.groups.values() {
             if let Some(floor) = state.floors.get(&group.id) {
                 if group.epoch.0 < *floor {
@@ -1002,20 +1010,73 @@ pub(crate) struct SavedState {
     pub account_secret_hex: Option<String>,
     #[serde(default)]
     pub revision: u64,
+    #[serde(default)]
+    pub binding: AccountBinding,
 }
 
-/// One prepared publication. A retry with the same alert id returns this
+/// Project sender binding stored inside the sealed account.
+///
+/// Revision 0 means the account has not been committed to a Durable Object.
+/// Row absence is a missing SQL row, never this value.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountBinding {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub recipient_hex: String,
+    #[serde(default)]
+    pub extra_recipients: Vec<String>,
+    #[serde(default)]
+    pub relays: Vec<String>,
+    #[serde(default)]
+    pub nostr_group_hex: Option<String>,
+    #[serde(default)]
+    pub group_id_hex: Option<String>,
+}
+
+/// One prepared publication. A retry with the same operation id returns this
 /// message instead of encrypting again.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PreparedPublication {
     pub alert_id: String,
+    #[serde(default = "default_operation_kind")]
+    pub operation_kind: String,
     pub payload_sha256: [u8; 32],
     pub group_id: GroupId,
     pub message: TransportMessage,
+    /// Local MDK confirmation. This is not relay acceptance.
     pub confirmed: bool,
+    #[serde(default = "default_message_phase")]
+    pub message_phase: String,
     pub pending_ref: Option<u64>,
+    #[serde(default)]
+    pub needs_mdk_confirm: bool,
+    #[serde(default)]
+    pub welcomes: Vec<TransportMessage>,
     pub push_trigger: Option<Vec<u8>>,
     pub push_published: bool,
+    #[serde(default = "default_push_phase")]
+    pub push_phase: String,
+    #[serde(default)]
+    pub push_event_id: Option<String>,
+    #[serde(default)]
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub message_attempts: u64,
+    #[serde(default)]
+    pub push_attempts: u64,
+}
+
+fn default_operation_kind() -> String {
+    "chat".into()
+}
+
+fn default_message_phase() -> String {
+    "prepared".into()
+}
+
+fn default_push_phase() -> String {
+    "not_required".into()
 }
 
 #[derive(Clone, Serialize, Deserialize)]

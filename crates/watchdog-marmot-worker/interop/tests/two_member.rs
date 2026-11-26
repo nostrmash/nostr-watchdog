@@ -18,8 +18,12 @@ async fn cloud_sender_exchanges_marmot_chats_with_official_sqlite_mdk() {
     package.source = Some(KeyPackageSource {
         event_id: MessageId::new(vec![0x44; 32]),
     });
+    cloud
+        .configure("watchdog", &native.public_key_hex(), &[], false)
+        .expect("bind recipient");
     let (group_id, welcomes) = cloud
         .create_group(
+            "create-1",
             "watchdog",
             vec![package],
             vec!["wss://relay.example".into()],
@@ -36,6 +40,16 @@ async fn cloud_sender_exchanges_marmot_chats_with_official_sqlite_mdk() {
         .send_chat("alert-1", &group_id, "relay down")
         .await
         .expect("first alert");
+    let stored = cloud.storage().publication("alert-1").unwrap().unwrap();
+    assert_eq!(stored.message_phase, "accepted_pending");
+    assert!(!stored.confirmed);
+    assert!(cloud
+        .send_chat("alert-1", &cgka_traits::GroupId::new(vec![9; 16]), "relay down")
+        .await
+        .is_err());
+    let staged = cloud.stage_push("alert-1", b"trigger-bytes").unwrap();
+    cloud.note_push("alert-1", "rejected", None).unwrap();
+    assert_eq!(cloud.stage_push("alert-1", b"other-trigger").unwrap(), staged);
     assert_eq!(
         native.ingest(first.clone()).await.expect("decrypt first"),
         vec!["relay down".to_owned()]
@@ -50,9 +64,10 @@ async fn cloud_sender_exchanges_marmot_chats_with_official_sqlite_mdk() {
         vec!["ack".to_owned()]
     );
 
-    let sealed = cloud.seal(&key).expect("seal");
+    let account = cloud.public_key_hex();
+    let sealed = cloud.seal(&key, "watchdog").expect("seal");
     drop(cloud);
-    let cloud = Session::open(&key, &sealed).expect("restore");
+    let cloud = Session::open(&key, "watchdog", &account, &sealed).expect("restore");
     let second = cloud
         .send_chat("alert-2", &group_id, "after restart")
         .await
@@ -78,9 +93,10 @@ async fn cloud_sender_exchanges_marmot_chats_with_official_sqlite_mdk() {
         .self_update("rotate-1", &group_id)
         .await
         .expect("stage update");
-    let sealed = cloud.seal(&key).expect("seal staged update");
+    let account = cloud.public_key_hex();
+    let sealed = cloud.seal(&key, "watchdog").expect("seal staged update");
     drop(cloud);
-    let cloud = Session::open(&key, &sealed).expect("restore staged update");
+    let cloud = Session::open(&key, "watchdog", &account, &sealed).expect("restore staged update");
     let (again, again_pending) = cloud
         .self_update("rotate-1", &group_id)
         .await

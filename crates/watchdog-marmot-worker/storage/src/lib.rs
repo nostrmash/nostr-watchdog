@@ -43,13 +43,13 @@ use openmls_traits::storage::CURRENT_VERSION;
 use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 use zeroize::Zeroizing;
 
-pub use persist::{Document, PersistError, open_sealed, seal};
+pub use persist::{Document, PersistError, SealBinding, open_sealed, seal};
 
 use state::{
     Forgotten, GroupImage, SnapKey, State, export_mls, import_mls, is_key_package_storage_key,
 };
 
-pub use state::PreparedPublication;
+pub use state::{AccountBinding, PreparedPublication};
 
 const KEY_PACKAGE_LABEL: &[u8] = b"KeyPackage";
 
@@ -164,18 +164,72 @@ impl MemoryMdkStorage {
                 .iter()
                 .find(|row| row.alert_id == publication.alert_id)
             {
-                if existing.payload_sha256 != publication.payload_sha256 {
+                if existing.payload_sha256 != publication.payload_sha256
+                    || existing.group_id != publication.group_id
+                    || existing.operation_kind != publication.operation_kind
+                    || existing.message != publication.message
+                {
                     return Err(StorageError::Backend(
-                        "alert id is already bound to a different payload".into(),
-                    ));
-                }
-                if existing.message != publication.message && existing.confirmed {
-                    return Err(StorageError::Backend(
-                        "confirmed publication cannot be replaced".into(),
+                        "operation id is already bound to a different group, payload, or ciphertext"
+                            .into(),
                     ));
                 }
             }
             upsert_alert(&mut state.journal, publication);
+            trim_journal(&mut state.journal)?;
+            Ok(())
+        })
+    }
+
+    pub fn binding(&self) -> StorageResult<AccountBinding> {
+        Ok(self.lock()?.state.binding.clone())
+    }
+
+    pub fn set_binding(&self, binding: AccountBinding, replace: bool) -> StorageResult<()> {
+        if binding.project_id.is_empty() || binding.recipient_hex.len() != 64 {
+            return Err(StorageError::Backend(
+                "project and recipient are required".into(),
+            ));
+        }
+        self.mutate(|state| {
+            if !state.binding.project_id.is_empty()
+                && state.binding.project_id != binding.project_id
+            {
+                return Err(StorageError::Backend(
+                    "project id does not match the stored account".into(),
+                ));
+            }
+            if !state.binding.recipient_hex.is_empty()
+                && state.binding.recipient_hex != binding.recipient_hex
+                && !replace
+            {
+                return Err(StorageError::Backend(
+                    "operation identity does not match the stored recipient".into(),
+                ));
+            }
+            if replace && !state.groups.is_empty() && state.binding.recipient_hex != binding.recipient_hex
+            {
+                return Err(StorageError::Backend(
+                    "recipient replacement requires a new sender object once a group exists".into(),
+                ));
+            }
+            state.binding = binding;
+            Ok(())
+        })
+    }
+
+    pub fn note_group_route(
+        &self,
+        group_id_hex: &str,
+        nostr_group_hex: &str,
+        relays: &[String],
+    ) -> StorageResult<()> {
+        self.mutate(|state| {
+            state.binding.group_id_hex = Some(group_id_hex.to_owned());
+            state.binding.nostr_group_hex = Some(nostr_group_hex.to_owned());
+            if !relays.is_empty() {
+                state.binding.relays = relays.to_vec();
+            }
             Ok(())
         })
     }
@@ -1584,6 +1638,27 @@ impl StorageProvider for MemoryMdkStorage {
     }
 }
 
+fn trim_journal(rows: &mut Vec<PreparedPublication>) -> StorageResult<()> {
+    if rows.len() <= state::MAX_JOURNAL {
+        return Ok(());
+    }
+    let mut index = 0;
+    while rows.len() > state::MAX_JOURNAL && index < rows.len() {
+        let phase = rows[index].message_phase.as_str();
+        if phase == "relay_accepted" || phase == "rejected" {
+            rows.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    if rows.len() > state::MAX_JOURNAL.saturating_mul(2) {
+        return Err(StorageError::Backend(
+            "publication journal exceeded its bound".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn upsert_alert(rows: &mut Vec<PreparedPublication>, row: PreparedPublication) {
     if let Some(slot) = rows.iter_mut().find(|item| item.alert_id == row.alert_id) {
         *slot = row;
@@ -1674,14 +1749,43 @@ mod tests {
         storage.put_message(&message(7, 3)).unwrap();
         let document = storage.to_document().unwrap();
         let key = [7u8; 32];
-        let sealed = seal(&key, &document).unwrap();
-        let opened = MemoryMdkStorage::from_document(open_sealed(&key, &sealed).unwrap()).unwrap();
+        let binding = SealBinding {
+            project_id: "smartflowsocial",
+            account_hex: &"ab".repeat(32),
+        };
+        let sealed = seal(&key, binding, &document).unwrap();
+        let opened =
+            MemoryMdkStorage::from_document(open_sealed(&key, binding, &sealed).unwrap()).unwrap();
         let restored = opened.get_message(&MessageId::new(vec![7])).unwrap();
         assert_eq!(restored.epoch, EpochId(3));
         let mut tampered = sealed.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0xff;
-        assert!(open_sealed(&key, &tampered).is_err());
-        assert!(open_sealed(&[8u8; 32], &sealed).is_err());
+        assert!(open_sealed(&key, binding, &tampered).is_err());
+        assert!(open_sealed(&[8u8; 32], binding, &sealed).is_err());
+        let other = SealBinding {
+            project_id: "other-project",
+            account_hex: binding.account_hex,
+        };
+        assert!(open_sealed(&key, other, &sealed).is_err());
+    }
+
+    #[test]
+    fn a_rolled_back_commit_callback_is_not_kept() {
+        use cgka_traits::StorageProvider;
+        let storage = MemoryMdkStorage::empty();
+        let failed: Result<(), StorageError> = storage.with_transaction(|storage| {
+            storage.after_commit(Box::new(|| {}));
+            Err(StorageError::Backend("boom".into()))
+        });
+        assert!(failed.is_err());
+        assert!(storage.drain_commit_hooks().is_empty());
+        storage
+            .with_transaction(|storage| {
+                storage.after_commit(Box::new(|| {}));
+                Ok::<(), StorageError>(())
+            })
+            .unwrap();
+        assert_eq!(storage.drain_commit_hooks().len(), 1);
     }
 }

@@ -1,0 +1,9 @@
+{
+  "name": "marmot-sender-probe",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "wrangler": "^4.166.0",
+    "ws": "^8.23.0"
+  }
+}

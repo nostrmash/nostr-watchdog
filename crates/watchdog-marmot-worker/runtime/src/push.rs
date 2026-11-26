@@ -1,10 +1,17 @@
-//! Marmot push triggers, copied from the official `marmot-app` encoding.
+//! Marmot push triggers, adapted from official `marmot-app`.
 //!
-//! `marmot-app` cannot be linked into a Worker. These functions follow
-//! `crates/marmot-app/src/notifications.rs` at MDK `ca52a047`: the same HKDF
-//! labels, plaintext layout, kind 451 owner proof, and kind 446 gift wrap.
-//! A notification server decrypts with the inverse of that layout. No Apple
-//! or Google credentials are used.
+//! Source: `marmot-protocol/mdk` `crates/marmot-app/src/notifications.rs` at
+//! `ca52a04718628f08ed76b777df9c444594074182`. That file is MIT, copyright
+//! 2024-2026 Internet Privacy Foundation. `marmot-app` cannot be linked into
+//! a Worker. The HKDF labels, plaintext layout, kind 451 owner proof, kind
+//! 446 rumor, and signed-record bytes follow that revision.
+//!
+//! A sender stores the encrypted wake capability, not the recipient's
+//! plaintext APNs or FCM token. The slot is group, member, leaf, platform,
+//! and notification server. The token fingerprint is not part of the slot.
+
+// The encoding above is adapted from MIT-licensed marmot-app. The rest of
+// this crate is Unlicense, the same license as the watchdog.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -61,12 +68,14 @@ impl Platform {
     }
 }
 
+/// Sender-side wake record. It does not contain the raw device token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenRecord {
+    pub group_id_hex: String,
     pub member_id_hex: String,
     pub leaf_index: u32,
     pub platform: Platform,
-    pub token: Vec<u8>,
+    pub token_fingerprint: String,
     pub server_pubkey_hex: String,
     pub relay_hint: Option<String>,
     pub owner_ts: i64,
@@ -81,25 +90,42 @@ pub struct PushDirectory {
 }
 
 impl PushDirectory {
-    pub fn upsert(&mut self, record: TokenRecord) {
-        if let Some(existing) = self.records.iter_mut().find(|item| same_slot(item, &record)) {
-            if record.owner_ts < existing.owner_ts {
-                return;
-            }
-            if record.owner_ts == existing.owner_ts && record.owner_sig == existing.owner_sig {
-                return;
-            }
-            *existing = record;
-            return;
+    /// Accept a record only after its owner proof checks and the leaf is active.
+    /// A newer `(owner_ts, record_digest)` supersedes the previous token in the
+    /// same slot. An older record does not resurrect a tombstone.
+    pub fn admit(&mut self, record: TokenRecord, leaves: &[(String, u32)]) -> Result<(), String> {
+        if record.owner_sig.len() != 128 || !verify_owner_proof(&record, record.removed) {
+            return Err("owner proof rejected".into());
         }
-        self.records.push(record);
+        let active = leaves
+            .iter()
+            .any(|(member, leaf)| member == &record.member_id_hex && *leaf == record.leaf_index);
+        if !record.removed && !active {
+            return Err("token leaf is not an active member".into());
+        }
+        self.insert_ordered(record)
     }
 
-    pub fn revoke(&mut self, tombstone: TokenRecord) {
-        let mut tombstone = tombstone;
+    pub fn revoke(&mut self, mut tombstone: TokenRecord, leaves: &[(String, u32)]) -> Result<(), String> {
         tombstone.removed = true;
         tombstone.encrypted_token.clear();
-        self.upsert(tombstone);
+        self.admit(tombstone, leaves)
+    }
+
+    fn insert_ordered(&mut self, record: TokenRecord) -> Result<(), String> {
+        let digest = record_digest(&record)?;
+        if let Some(existing) = self.records.iter_mut().find(|item| same_slot(item, &record)) {
+            let existing_digest = record_digest(existing)?;
+            let newer = record.owner_ts > existing.owner_ts
+                || (record.owner_ts == existing.owner_ts && digest > existing_digest);
+            if !newer {
+                return Ok(());
+            }
+            *existing = record;
+            return Ok(());
+        }
+        self.records.push(record);
+        Ok(())
     }
 
     pub fn active_tokens(&self, members: &[String]) -> Vec<Vec<u8>> {
@@ -189,11 +215,10 @@ pub fn decrypt_token(blob: &[u8], server_secret: &[u8; 32]) -> Result<(Platform,
 
 pub fn sign_owner_proof(
     keys: &Keys,
-    group_id_hex: &str,
     record: &TokenRecord,
     removal: bool,
 ) -> Result<String, String> {
-    let proof = owner_proof_event(group_id_hex, record, removal)?;
+    let proof = owner_proof_event(record, removal)?;
     let signed = proof
         .clone()
         .finalize(keys)
@@ -205,8 +230,8 @@ pub fn sign_owner_proof(
     Ok(hex::encode(signed.sig.to_bytes()))
 }
 
-pub fn verify_owner_proof(group_id_hex: &str, record: &TokenRecord, removal: bool) -> bool {
-    let Ok(proof) = owner_proof_event(group_id_hex, record, removal) else {
+pub fn verify_owner_proof(record: &TokenRecord, removal: bool) -> bool {
+    let Ok(proof) = owner_proof_event(record, removal) else {
         return false;
     };
     let Ok(bytes) = hex::decode(&record.owner_sig) else {
@@ -258,22 +283,18 @@ pub fn unwrap_notification(
     Ok(opened.rumor.content)
 }
 
-fn owner_proof_event(
-    group_id_hex: &str,
-    record: &TokenRecord,
-    removal: bool,
-) -> Result<UnsignedEvent, String> {
+fn owner_proof_event(record: &TokenRecord, removal: bool) -> Result<UnsignedEvent, String> {
     let member = PublicKey::parse(&record.member_id_hex).map_err(|error| error.to_string())?;
     let relay = record.relay_hint.as_deref().unwrap_or("").trim();
     let domain = if removal { REMOVAL_DOMAIN } else { RECORD_DOMAIN };
     let mut tags = vec![
         Tag::custom("d", [domain.to_owned()]),
-        Tag::custom("group_id", [group_id_hex.to_owned()]),
+        Tag::custom("group_id", [record.group_id_hex.clone()]),
         Tag::custom("member_id", [record.member_id_hex.clone()]),
         Tag::custom("leaf_index", [record.leaf_index.to_string()]),
         Tag::custom("platform", [record.platform.name().to_owned()]),
         Tag::custom("server_pubkey", [record.server_pubkey_hex.clone()]),
-        Tag::custom("token_fingerprint", [fingerprint(record.platform, &record.token)]),
+        Tag::custom("token_fingerprint", [record.token_fingerprint.clone()]),
         Tag::custom("owner_ts", [record.owner_ts.to_string()]),
         Tag::custom("relay_hint", [relay.to_owned()]),
     ];
@@ -294,6 +315,7 @@ fn owner_proof_event(
     Ok(event)
 }
 
+#[cfg(test)]
 fn fingerprint(platform: Platform, token: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update([platform.byte()]);
@@ -303,11 +325,53 @@ fn fingerprint(platform: Platform, token: &[u8]) -> String {
 }
 
 fn same_slot(left: &TokenRecord, right: &TokenRecord) -> bool {
-    left.member_id_hex == right.member_id_hex
+    left.group_id_hex == right.group_id_hex
+        && left.member_id_hex == right.member_id_hex
         && left.leaf_index == right.leaf_index
         && left.platform == right.platform
         && left.server_pubkey_hex == right.server_pubkey_hex
-        && fingerprint(left.platform, &left.token) == fingerprint(right.platform, &right.token)
+}
+
+fn record_digest(record: &TokenRecord) -> Result<String, String> {
+    let bytes = signed_record_bytes(record)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn signed_record_bytes(record: &TokenRecord) -> Result<Vec<u8>, String> {
+    let group_id = hex::decode(&record.group_id_hex).map_err(|_| "group id must be hex".to_owned())?;
+    let member_id = decode_hex_32(&record.member_id_hex)?;
+    let server = decode_hex_32(&record.server_pubkey_hex)?;
+    let fingerprint = fingerprint_bytes(&record.token_fingerprint)?;
+    let group_len = u16::try_from(group_id.len()).map_err(|_| "group id too long".to_owned())?;
+    let relay = record.relay_hint.as_deref().unwrap_or("").trim();
+    let relay_len = u16::try_from(relay.len()).map_err(|_| "relay hint too long".to_owned())?;
+    let domain = if record.removed { REMOVAL_DOMAIN } else { RECORD_DOMAIN };
+    let mut buf = Vec::new();
+    buf.extend_from_slice(domain.as_bytes());
+    buf.extend_from_slice(&group_len.to_be_bytes());
+    buf.extend_from_slice(&group_id);
+    buf.extend_from_slice(&member_id);
+    buf.extend_from_slice(&record.leaf_index.to_be_bytes());
+    buf.push(record.platform.byte());
+    buf.extend_from_slice(&server);
+    buf.extend_from_slice(&fingerprint);
+    buf.extend_from_slice(&record.owner_ts.to_be_bytes());
+    buf.extend_from_slice(&relay_len.to_be_bytes());
+    buf.extend_from_slice(relay.as_bytes());
+    if !record.removed {
+        buf.extend_from_slice(&record.encrypted_token);
+    }
+    Ok(buf)
+}
+
+fn fingerprint_bytes(token_fingerprint: &str) -> Result<[u8; 12], String> {
+    let hex_part = token_fingerprint
+        .strip_prefix("sha256:")
+        .ok_or("token fingerprint must start with sha256:")?;
+    let decoded = hex::decode(hex_part).map_err(|_| "token fingerprint must be hex".to_owned())?;
+    decoded
+        .try_into()
+        .map_err(|_| "token fingerprint must be 12 bytes".to_owned())
 }
 
 fn derive_key(shared_x: &[u8; 32]) -> Result<[u8; 32], String> {
@@ -361,25 +425,39 @@ mod tests {
 
     #[tokio::test]
     async fn a_server_decrypts_the_official_trigger_layout() {
-        let server_secret = random_secret().unwrap();
+        for parity in [Parity::Even, Parity::Odd] {
+            let server_secret = secret_with_parity(parity);
+            let secp = Secp256k1::new();
+            let server_public = SecpPublicKey::from_secret_key(&secp, &server_secret);
+            let (server_xonly, found) = server_public.x_only_public_key();
+            assert_eq!(found, parity);
+            let server_hex = hex::encode(server_xonly.serialize());
+            let token = b"fcm-device-token".to_vec();
+            let encrypted = encrypt_token(Platform::Fcm, &token, &server_hex).unwrap();
+            let (platform, opened) = decrypt_token(&encrypted, server_secret.as_ref()).unwrap();
+            assert_eq!(platform, Platform::Fcm);
+            assert_eq!(opened, token);
+        }
+
+        let server_secret = secret_with_parity(Parity::Even);
         let secp = Secp256k1::new();
         let server_public = SecpPublicKey::from_secret_key(&secp, &server_secret);
-        let (server_xonly, parity) = server_public.x_only_public_key();
-        assert_eq!(parity, Parity::Even);
+        let (server_xonly, _) = server_public.x_only_public_key();
         let server_hex = hex::encode(server_xonly.serialize());
         let server_keys = random_nostr_keys_from(&server_secret);
         let owner = random_nostr_keys().unwrap();
         let token = b"fcm-device-token".to_vec();
         let encrypted = encrypt_token(Platform::Fcm, &token, &server_hex).unwrap();
-        let (platform, opened) = decrypt_token(&encrypted, server_secret.as_ref()).unwrap();
-        assert_eq!(platform, Platform::Fcm);
-        assert_eq!(opened, token);
+        let replacement = encrypt_token(Platform::Fcm, b"fcm-replacement", &server_hex).unwrap();
+        let group_id_hex = "ab".repeat(16);
+        let leaves = [(hex::encode(owner.public_key().to_bytes()), 0u32)];
 
         let mut record = TokenRecord {
-            member_id_hex: hex::encode(owner.public_key().to_bytes()),
+            group_id_hex: group_id_hex.clone(),
+            member_id_hex: leaves[0].0.clone(),
             leaf_index: 0,
             platform: Platform::Fcm,
-            token: token.clone(),
+            token_fingerprint: fingerprint(Platform::Fcm, &token),
             server_pubkey_hex: server_hex.clone(),
             relay_hint: Some("wss://relay.example".into()),
             owner_ts: 1_700_000_000_000,
@@ -387,22 +465,38 @@ mod tests {
             owner_sig: String::new(),
             removed: false,
         };
-        record.owner_sig = sign_owner_proof(&owner, "aabbccdd", &record, false).unwrap();
-        assert!(verify_owner_proof("aabbccdd", &record, false));
+        record.owner_sig = sign_owner_proof(&owner, &record, false).unwrap();
+        assert!(verify_owner_proof(&record, false));
 
         let mut directory = PushDirectory::default();
-        directory.upsert(record.clone());
-        let older = TokenRecord {
-            owner_ts: record.owner_ts - 1,
-            encrypted_token: vec![0; ENCRYPTED_TOKEN_LEN],
-            ..record.clone()
-        };
-        directory.upsert(older);
+        directory.admit(record.clone(), &leaves).unwrap();
+        let mut unsigned = record.clone();
+        unsigned.owner_sig.clear();
+        assert!(directory.admit(unsigned, &leaves).is_err());
+        let mut older = record.clone();
+        older.owner_ts -= 1;
+        older.encrypted_token = vec![0; ENCRYPTED_TOKEN_LEN];
+        older.token_fingerprint = fingerprint(Platform::Fcm, b"old");
+        older.owner_sig = sign_owner_proof(&owner, &older, false).unwrap();
+        directory.admit(older, &leaves).unwrap();
         assert_eq!(directory.records[0].encrypted_token, encrypted);
-        directory.revoke(TokenRecord {
-            owner_ts: record.owner_ts + 1,
-            ..record.clone()
-        });
+
+        let mut newer = record.clone();
+        newer.owner_ts += 1;
+        newer.encrypted_token = replacement.clone();
+        newer.token_fingerprint = fingerprint(Platform::Fcm, b"fcm-replacement");
+        newer.owner_sig = sign_owner_proof(&owner, &newer, false).unwrap();
+        directory.admit(newer, &leaves).unwrap();
+        assert_eq!(directory.records[0].encrypted_token, replacement);
+
+        let mut tombstone = record.clone();
+        tombstone.owner_ts += 2;
+        tombstone.removed = true;
+        tombstone.encrypted_token.clear();
+        tombstone.owner_sig = sign_owner_proof(&owner, &tombstone, true).unwrap();
+        directory.revoke(tombstone, &leaves).unwrap();
+        assert!(directory.active_tokens(&[record.member_id_hex.clone()]).is_empty());
+        directory.admit(record.clone(), &leaves).unwrap();
         assert!(directory.active_tokens(&[record.member_id_hex.clone()]).is_empty());
 
         let trigger = notification_gift_wrap(&server_hex, &[encrypted.clone()]).await.unwrap();
@@ -410,6 +504,17 @@ mod tests {
         let content = unwrap_notification(&server_keys, &serde_json::to_vec(&trigger).unwrap()).unwrap();
         let raw = BASE64.decode(content).unwrap();
         assert!(raw.windows(encrypted.len()).any(|window| window == encrypted));
+    }
+
+    fn secret_with_parity(want: Parity) -> SecretKey {
+        for _ in 0..64 {
+            let secret = random_secret().unwrap();
+            let public = SecpPublicKey::from_secret_key(&Secp256k1::new(), &secret);
+            if public.x_only_public_key().1 == want {
+                return secret;
+            }
+        }
+        panic!("no secp256k1 key with parity {want:?}");
     }
 
     fn random_nostr_keys_from(secret: &SecretKey) -> Keys {

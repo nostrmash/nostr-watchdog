@@ -11,8 +11,22 @@ use zeroize::Zeroize;
 use crate::state::SavedState;
 
 pub const FORMAT_VERSION: u32 = 1;
+pub const KEY_VERSION: u8 = 1;
 const MAGIC: &[u8] = b"MWDO";
 const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+const HEADER: usize = 4 + 1 + 1 + 12;
+
+/// Binds a snapshot to one project Durable Object and one account.
+///
+/// The associated data is authenticated by ChaCha20-Poly1305. A snapshot sealed
+/// for another project or account does not decrypt. Restoring an older backup
+/// of both the ciphertext and this binding together is still a rollback; the
+/// Durable Object revision compare-and-swap is what rejects a losing writer.
+#[derive(Clone, Copy)]
+pub struct SealBinding<'a> {
+    pub project_id: &'a str,
+    pub account_hex: &'a str,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
@@ -34,7 +48,12 @@ pub struct Document {
     pub state: SavedState,
 }
 
-pub fn seal(key: &[u8; 32], document: &Document) -> Result<Vec<u8>, PersistError> {
+pub fn seal(
+    key: &[u8; 32],
+    binding: SealBinding<'_>,
+    document: &Document,
+) -> Result<Vec<u8>, PersistError> {
+    let aad = associated_data(binding)?;
     let mut plain = serde_json::to_vec(document).map_err(|_| PersistError::Corrupt)?;
     if plain.len() > MAX_DOCUMENT_BYTES {
         plain.zeroize();
@@ -48,7 +67,7 @@ pub fn seal(key: &[u8; 32], document: &Document) -> Result<Vec<u8>, PersistError
             Nonce::from_slice(&nonce),
             Payload {
                 msg: &plain,
-                aad: MAGIC,
+                aad: &aad,
             },
         )
         .map_err(|_| {
@@ -56,16 +75,24 @@ pub fn seal(key: &[u8; 32], document: &Document) -> Result<Vec<u8>, PersistError
             PersistError::Corrupt
         })?;
     plain.zeroize();
-    let mut out = Vec::with_capacity(4 + 1 + nonce.len() + ciphertext.len());
+    let mut out = Vec::with_capacity(HEADER + ciphertext.len());
     out.extend_from_slice(MAGIC);
     out.push(FORMAT_VERSION as u8);
+    out.push(KEY_VERSION);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
     Ok(out)
 }
 
-pub fn open_sealed(key: &[u8; 32], bytes: &[u8]) -> Result<Document, PersistError> {
-    if bytes.len() < 4 + 1 + 12 + 16 || &bytes[..4] != MAGIC {
+pub fn open_sealed(
+    key: &[u8; 32],
+    binding: SealBinding<'_>,
+    bytes: &[u8],
+) -> Result<Document, PersistError> {
+    if bytes.len() < HEADER + 16 || bytes.len() > HEADER + MAX_DOCUMENT_BYTES + 16 {
+        return Err(PersistError::Corrupt);
+    }
+    if &bytes[..4] != MAGIC {
         return Err(PersistError::Corrupt);
     }
     let version = u32::from(bytes[4]);
@@ -75,15 +102,23 @@ pub fn open_sealed(key: &[u8; 32], bytes: &[u8]) -> Result<Document, PersistErro
             latest: FORMAT_VERSION,
         });
     }
-    let nonce = &bytes[5..17];
-    let ciphertext = &bytes[17..];
+    let key_version = bytes[5];
+    if key_version != KEY_VERSION {
+        return Err(PersistError::Unsupported {
+            found: u32::from(key_version),
+            latest: u32::from(KEY_VERSION),
+        });
+    }
+    let aad = associated_data(binding)?;
+    let nonce = &bytes[6..18];
+    let ciphertext = &bytes[18..];
     let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| PersistError::Corrupt)?;
     let mut plain = cipher
         .decrypt(
             Nonce::from_slice(nonce),
             Payload {
                 msg: ciphertext,
-                aad: MAGIC,
+                aad: &aad,
             },
         )
         .map_err(|_| PersistError::Corrupt)?;
@@ -97,4 +132,22 @@ pub fn open_sealed(key: &[u8; 32], bytes: &[u8]) -> Result<Document, PersistErro
         });
     }
     Ok(document)
+}
+
+fn associated_data(binding: SealBinding<'_>) -> Result<Vec<u8>, PersistError> {
+    if binding.project_id.is_empty()
+        || binding.project_id.len() > 128
+        || binding.account_hex.len() != 64
+        || !binding.account_hex.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return Err(PersistError::Corrupt);
+    }
+    let mut aad = Vec::with_capacity(8 + binding.project_id.len() + binding.account_hex.len());
+    aad.extend_from_slice(MAGIC);
+    aad.push(FORMAT_VERSION as u8);
+    aad.push(KEY_VERSION);
+    aad.extend_from_slice(binding.project_id.as_bytes());
+    aad.push(0xff);
+    aad.extend_from_slice(binding.account_hex.as_bytes());
+    Ok(aad)
 }
