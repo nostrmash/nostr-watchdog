@@ -1,12 +1,11 @@
 //! Checks for relays this helper is configured to use.
 //!
-//! Official MDK classifies a relay URL before dialing. A domain is accepted
-//! without a DNS lookup, so a name that later resolves to a private address
-//! is not blocked by the pinned relay plane. This module checks the relays
-//! the operator configured. It does not sit on MDK's dial path, and it does
-//! not see group relays or notification-server hints discovered later.
-//! Resolving a name and then letting MDK resolve it again is not a pin: the
-//! address can change between the two lookups.
+//! Official MDK's `RelaySafetyPolicy` drops discovered private literals,
+//! localhost, and plaintext public endpoints before dialing. A domain is
+//! still accepted without a DNS lookup, and nostr-sdk resolves it later.
+//! This module checks the relays the operator configured. It does not sit on
+//! that dial path. Resolving a name here and letting MDK resolve it again is
+//! not a pin. Native deployment needs a process egress rule for that gap.
 
 use std::net::ToSocketAddrs;
 use std::time::Duration;

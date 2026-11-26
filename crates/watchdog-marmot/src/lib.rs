@@ -82,7 +82,8 @@ pub fn open(root: &Path, relays: &[String], allow_loopback: bool) -> Result<Sess
     let boundary = root.join("outbox-boundary");
     fs::create_dir_all(&boundary).map_err(|error| format!("marmot_boundary: {error}"))?;
     restrict_dir(&boundary)?;
-    fs::create_dir_all(boundary.join("onboard")).map_err(|error| format!("marmot_boundary: {error}"))?;
+    fs::create_dir_all(boundary.join("onboard"))
+        .map_err(|error| format!("marmot_boundary: {error}"))?;
     restrict_dir(&boundary.join("onboard"))?;
     let operations = journal::Journal::open(&boundary)?;
     Ok(Session {
@@ -269,7 +270,9 @@ impl Session {
                     .unwrap_or(0);
             }
             if let Ok(group_id) = group_id(group) {
-                if let Ok(count) = self.recipient_token_count(&account, &group_id, &recipient).await
+                if let Ok(count) = self
+                    .recipient_token_count(&account, &group_id, &recipient)
+                    .await
                 {
                     tokens = count;
                 }
@@ -428,7 +431,12 @@ impl Session {
             .map_err(safe_error)?;
         Ok(members
             .into_iter()
-            .map(|member| (member.member_id_hex.to_ascii_lowercase(), member.device_count))
+            .map(|member| {
+                (
+                    member.member_id_hex.to_ascii_lowercase(),
+                    member.device_count,
+                )
+            })
             .collect())
     }
 
@@ -466,7 +474,8 @@ impl Session {
         let payload = payload_hash(text);
         let binding = self.read_binding(alert_id)?;
         if let Some(value) = binding.as_ref() {
-            if !journal_identity_matches(value, project, &account, &group_hex, &payload) {
+            if !journal_identity_matches(value, project, &account, &recipient, &group_hex, &payload)
+            {
                 return Err("alert_identity_mismatch".to_string());
             }
         }
@@ -477,10 +486,7 @@ impl Session {
             .as_ref()
             .and_then(stored_phase)
             .or(legacy_started.then_some(StoredSend::Submitting));
-        let prior = stored
-            .as_ref()
-            .map(read_attempts)
-            .unwrap_or_default();
+        let prior = stored.as_ref().map(read_attempts).unwrap_or_default();
         let refresh = !matches!(
             stored_phase,
             None | Some(StoredSend::Published | StoredSend::Rejected)
@@ -518,22 +524,29 @@ impl Session {
                 self.write_record(alert_id, &value)?;
                 Ok(value)
             }
-            SendStep::CompletionUnknown => {
-                let mut value = unknown_value(alert_id, project, &account, &group_hex, &payload);
-                value = self.finish_record(value, prior)?;
-                self.write_record(alert_id, &value)?;
-                Ok(value)
-            }
+            SendStep::CompletionUnknown => self.mark_unknown(
+                alert_id,
+                project,
+                &account,
+                &recipient,
+                &group_hex,
+                &payload,
+                prior,
+                "completion_unknown",
+            ),
             SendStep::Submit => {
                 if stored_phase.is_some() {
                     return Err("operation_already_recorded".to_string());
                 }
-                self.authorize_send(&account, &group_hex, &recipient).await?;
+                self.authorize_send(&account, &group_hex, &recipient)
+                    .await?;
                 let intent = json!({
                     "operation_id": alert_id,
                     "project": project,
                     "account": account,
+                    "recipient": recipient,
                     "group": group_hex,
+                    "operation_type": "application_message",
                     "payload_sha256": payload,
                     "disposition": "submitting",
                     "message_phase": "prepared",
@@ -558,21 +571,29 @@ impl Session {
                     .submit_text(&account, &group, text.to_string(), alert_id.to_string())
                     .await
                 {
-                    let admitted = self
-                        .runtime
-                        .local_send_status(&account, &group, alert_id)
-                        .map_err(safe_error)?;
-                    if admitted.is_none() {
-                        self.forget_unadmitted(alert_id)?;
-                        return Err(safe_error(error));
-                    }
+                    return self
+                        .recover_submit_error(
+                            alert_id, project, &account, &group, &recipient, &group_hex, &payload,
+                            prior, &intent, error,
+                        )
+                        .await;
                 }
                 crash_after("submitted")?;
-                let status = self
-                    .runtime
-                    .local_send_status(&account, &group, alert_id)
-                    .map_err(safe_error)?
-                    .ok_or_else(|| "completion_unknown".to_string())?;
+                let status = match self.runtime.local_send_status(&account, &group, alert_id) {
+                    Ok(Some(status)) => status,
+                    Ok(None) | Err(_) => {
+                        return self.mark_unknown(
+                            alert_id,
+                            project,
+                            &account,
+                            &recipient,
+                            &group_hex,
+                            &payload,
+                            prior,
+                            "status_not_visible",
+                        );
+                    }
+                };
                 crash_after("pending")?;
                 let value = self
                     .project_status(
@@ -608,9 +629,13 @@ impl Session {
             .filter(|(_, devices)| *devices > 0)
             .map(|(id, _)| id)
             .collect();
+        // This read is not held across submit_text. A later membership change
+        // can still land. A failed or unusable roster refuses the send.
         authorize_group_members(&ids, account, recipient)?;
         match self.lookup_direct(account, recipient).await? {
-            (ConversationLookup::Reusable, Some(found)) if !found.eq_ignore_ascii_case(group_hex) => {
+            (ConversationLookup::Reusable, Some(found))
+                if !found.eq_ignore_ascii_case(group_hex) =>
+            {
                 Err("conversation_mismatch".to_string())
             }
             (ConversationLookup::NotReusable, _) => Err("conversation_not_reusable".to_string()),
@@ -650,7 +675,11 @@ impl Session {
             }
         };
         let previous_message = previous
-            .and_then(|value| value.get("message_state").or_else(|| value.get("message_phase")))
+            .and_then(|value| {
+                value
+                    .get("message_state")
+                    .or_else(|| value.get("message_phase"))
+            })
             .and_then(Value::as_str);
         let (disposition, message_ids) = if previous_message == Some("relay_accepted") {
             let ids = if message_ids.is_empty() {
@@ -692,7 +721,9 @@ impl Session {
             "operation_id": alert_id,
             "project": stored_project,
             "account": account,
+            "recipient": recipient,
             "group": group_hex,
+            "operation_type": "application_message",
             "payload_sha256": payload,
             "disposition": disposition,
             "message_phase": message_phase_name(disposition),
@@ -742,15 +773,20 @@ impl Session {
             object.insert("terminal".to_string(), json!(decision.terminal));
             object.insert("message_attempts".to_string(), json!(attempts.message));
             object.insert("unknown_attempts".to_string(), json!(attempts.unknown));
-            object.insert("token_wait_attempts".to_string(), json!(attempts.token_wait));
+            object.insert(
+                "token_wait_attempts".to_string(),
+                json!(attempts.token_wait),
+            );
             object.insert(
                 "unobservable_attempts".to_string(),
                 json!(attempts.unobservable),
             );
             object.insert("started_at_ms".to_string(), json!(attempts.started_at_ms));
+            let updated_at_ms = unix_ms();
+            object.insert("updated_at_ms".to_string(), json!(updated_at_ms));
             object.insert(
                 "operation_age_ms".to_string(),
-                json!(unix_ms().saturating_sub(attempts.started_at_ms)),
+                json!(updated_at_ms.saturating_sub(attempts.started_at_ms)),
             );
             object.insert("settled".to_string(), json!(!decision.hold));
             object.insert("reconcile".to_string(), json!(decision.hold));
@@ -767,6 +803,25 @@ impl Session {
                 .and_then(Value::as_str)
                 .map(transport_evidence)
                 .unwrap_or("not_observed");
+            let retry_after_ms = if decision.hold {
+                json!(decision.delay_ms)
+            } else {
+                Value::Null
+            };
+            let admitted = matches!(
+                message.as_str(),
+                "relay_accepted" | "accepted_pending" | "rejected"
+            );
+            let detail = object
+                .get("status_detail")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= 80
+                        && value
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                });
             object.insert(
                 "operation".to_string(),
                 json!({
@@ -777,16 +832,36 @@ impl Session {
                     "pushState": decision.push_phase,
                     "pushEventId": Value::Null,
                     "evidence": evidence,
-                    "error": Value::Null,
+                    "error": detail,
                     "disposition": if decision.hold { "reconcile" } else { "settled" },
-                    "retryAtMs": if decision.hold { json!(decision.delay_ms) } else { Value::Null },
+                    "retryAtMs": retry_after_ms.clone(),
+                    "retryAfterMs": retry_after_ms,
                     "phoneDelivery": false,
                     "startedAtMs": attempts.started_at_ms,
-                    "messageAttempts": attempts.message,
-                    "unknownAttempts": attempts.unknown,
-                    "tokenWaitAttempts": attempts.token_wait,
-                    "unobservableAttempts": attempts.unobservable,
-                    "pushPublicationAttempts": Value::Null
+                    "updatedAtMs": updated_at_ms,
+                    "messageSubmissions": if admitted { json!(1) } else { Value::Null },
+                    "messagePublications": Value::Null,
+                    "messageReconciles": if message == "accepted_pending" {
+                        json!(attempts.message)
+                    } else {
+                        Value::Null
+                    },
+                    "ambiguousReconciles": if matches!(message.as_str(), "completion_unknown" | "prepared") {
+                        json!(attempts.unknown)
+                    } else {
+                        Value::Null
+                    },
+                    "tokenWaits": if decision.push_phase == "token_unavailable" {
+                        json!(attempts.token_wait)
+                    } else {
+                        Value::Null
+                    },
+                    "pushPublications": Value::Null,
+                    "pushReconciles": if decision.push_phase == "unobservable" {
+                        json!(attempts.unobservable)
+                    } else {
+                        Value::Null
+                    }
                 }),
             );
         }
@@ -877,9 +952,14 @@ impl Session {
     }
 
     fn journal(&self) -> Result<std::sync::MutexGuard<'_, journal::Journal>, String> {
-        self.journal
+        let guard = self
+            .journal
             .lock()
-            .map_err(|_| "boundary_lock".to_string())
+            .map_err(|_| "boundary_lock".to_string())?;
+        if guard.poisoned() {
+            return Err("boundary_durable_failure".to_string());
+        }
+        Ok(guard)
     }
 
     fn read_binding(&self, alert_id: &str) -> Result<Option<Value>, String> {
@@ -890,6 +970,81 @@ impl Session {
         self.journal()?.record(alert_id, value)?;
         let _ = fs::remove_file(self.started_path(alert_id));
         self.prune_journals()
+    }
+
+    async fn recover_submit_error(
+        &self,
+        alert_id: &str,
+        project: &str,
+        account: &str,
+        group: &GroupId,
+        recipient: &str,
+        group_hex: &str,
+        payload: &str,
+        prior: PhaseAttempts,
+        intent: &Value,
+        error: marmot_app::AppError,
+    ) -> Result<Value, String> {
+        let status = self.runtime.local_send_status(account, group, alert_id);
+        match (
+            failed_submit_decision(
+                classify_submit_error(&error),
+                status.as_ref().ok().map(|value| value.is_some()),
+            ),
+            status,
+        ) {
+            (_, Ok(Some(status))) => {
+                let value = self
+                    .project_status(
+                        alert_id,
+                        project,
+                        account,
+                        group,
+                        recipient,
+                        payload,
+                        status,
+                        prior,
+                        Some(intent),
+                    )
+                    .await?;
+                self.write_record(alert_id, &value)?;
+                Ok(value)
+            }
+            (FailedSubmit::Resubmit, Ok(None)) => {
+                self.forget_unadmitted(alert_id)?;
+                Err(safe_error(error))
+            }
+            _ => self.mark_unknown(
+                alert_id,
+                project,
+                account,
+                recipient,
+                group_hex,
+                payload,
+                prior,
+                "submit_ambiguous",
+            ),
+        }
+    }
+
+    fn mark_unknown(
+        &self,
+        alert_id: &str,
+        project: &str,
+        account: &str,
+        recipient: &str,
+        group_hex: &str,
+        payload: &str,
+        prior: PhaseAttempts,
+        detail: &str,
+    ) -> Result<Value, String> {
+        let mut value = unknown_value(alert_id, project, account, recipient, group_hex, payload);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("status_detail".to_string(), json!(detail));
+        }
+        let value = self.finish_record(value, prior)?;
+        self.write_record(alert_id, &value)?;
+        Ok(value)
     }
 
     fn forget_unadmitted(&self, alert_id: &str) -> Result<(), String> {
@@ -1041,7 +1196,8 @@ impl Session {
             return Ok(Vec::new());
         }
         let bytes = fs::read(&path).map_err(|error| format!("boundary_read: {error}"))?;
-        let value: Value = serde_json::from_slice(&bytes).map_err(|_| "boundary_corrupt".to_string())?;
+        let value: Value =
+            serde_json::from_slice(&bytes).map_err(|_| "boundary_corrupt".to_string())?;
         Ok(value
             .get("accounts")
             .and_then(Value::as_array)
@@ -1103,7 +1259,9 @@ impl Session {
         } else if current.is_empty() {
             false
         } else {
-            adopted.iter().all(|id| current.iter().any(|item| item == id))
+            adopted
+                .iter()
+                .all(|id| current.iter().any(|item| item == id))
         };
         let group_available = if group.is_empty() {
             None
@@ -1131,7 +1289,10 @@ impl Session {
 
 enum ConversationState {
     Absent,
-    Intending { empty_lookups: i64, started_at_ms: i64 },
+    Intending {
+        empty_lookups: i64,
+        started_at_ms: i64,
+    },
     Established(String),
 }
 
@@ -1164,8 +1325,14 @@ fn stored_phase(value: &Value) -> Option<StoredSend> {
 
 fn read_attempts(value: &Value) -> PhaseAttempts {
     PhaseAttempts {
-        message: value.get("message_attempts").and_then(Value::as_i64).unwrap_or(0),
-        unknown: value.get("unknown_attempts").and_then(Value::as_i64).unwrap_or(0),
+        message: value
+            .get("message_attempts")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        unknown: value
+            .get("unknown_attempts")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
         token_wait: value
             .get("token_wait_attempts")
             .and_then(Value::as_i64)
@@ -1174,7 +1341,51 @@ fn read_attempts(value: &Value) -> PhaseAttempts {
             .get("unobservable_attempts")
             .and_then(Value::as_i64)
             .unwrap_or(0),
-        started_at_ms: value.get("started_at_ms").and_then(Value::as_i64).unwrap_or(0),
+        started_at_ms: value
+            .get("started_at_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitFailure {
+    ProvenNonAdmission,
+    Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailedSubmit {
+    Resubmit,
+    ProjectExisting,
+    KeepUnknown,
+}
+
+/// Errors returned before `insert_local_submission`, from MDK `ca52a04`.
+/// A timeout, a storage failure, or a panicked admission task can happen
+/// after the row exists, so those stay ambiguous even when the lookup is empty.
+fn classify_submit_error(error: &marmot_app::AppError) -> SubmitFailure {
+    use marmot_app::AppError::*;
+    match error {
+        InvalidAppMessagePayload(_)
+        | GroupRemoved(_)
+        | GroupDisbanding(_)
+        | UserBlocked
+        | UnknownGroup(_)
+        | InvalidEditTarget
+        | MessageDraftRevisionConflict
+        | InvalidMessageDraft(_)
+        | MediaReferenceStaleEpoch { .. }
+        | MediaReferenceEpochUnsettled { .. } => SubmitFailure::ProvenNonAdmission,
+        _ => SubmitFailure::Ambiguous,
+    }
+}
+
+fn failed_submit_decision(class: SubmitFailure, status_present: Option<bool>) -> FailedSubmit {
+    match (class, status_present) {
+        (_, Some(true)) => FailedSubmit::ProjectExisting,
+        (SubmitFailure::ProvenNonAdmission, Some(false)) => FailedSubmit::Resubmit,
+        _ => FailedSubmit::KeepUnknown,
     }
 }
 
@@ -1182,6 +1393,7 @@ fn journal_identity_matches(
     value: &Value,
     project: &str,
     account: &str,
+    recipient: &str,
     group: &str,
     payload: &str,
 ) -> bool {
@@ -1190,27 +1402,48 @@ fn journal_identity_matches(
             return false;
         }
     }
+    if let Some(kind) = value.get("operation_type").and_then(Value::as_str) {
+        if kind != "application_message" {
+            return false;
+        }
+    }
     match (
         value.get("account").and_then(Value::as_str),
+        value.get("recipient").and_then(Value::as_str),
         value.get("group").and_then(Value::as_str),
         value.get("payload_sha256").and_then(Value::as_str),
     ) {
-        (None, None, None) => true,
-        (Some(stored_account), Some(stored_group), Some(stored_payload)) => {
+        (
+            Some(stored_account),
+            Some(stored_recipient),
+            Some(stored_group),
+            Some(stored_payload),
+        ) => {
             stored_account.eq_ignore_ascii_case(account)
+                && stored_recipient.eq_ignore_ascii_case(recipient)
                 && stored_group.eq_ignore_ascii_case(group)
                 && stored_payload == payload
         }
+        // A legacy row with no recipient is not bound to whoever is configured now.
         _ => false,
     }
 }
 
-fn unknown_value(alert_id: &str, project: &str, account: &str, group: &str, payload: &str) -> Value {
+fn unknown_value(
+    alert_id: &str,
+    project: &str,
+    account: &str,
+    recipient: &str,
+    group: &str,
+    payload: &str,
+) -> Value {
     json!({
         "operation_id": alert_id,
         "project": project,
         "account": account,
+        "recipient": recipient,
         "group": group,
+        "operation_type": "application_message",
         "payload_sha256": payload,
         "disposition": "completion_unknown",
         "message_phase": "completion_unknown",
@@ -1386,5 +1619,130 @@ fn exclusive_lock(file: &File) -> bool {
     {
         let _ = file;
         true
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{
+        classify_submit_error, failed_submit_decision, journal_identity_matches, FailedSubmit,
+        SubmitFailure,
+    };
+    use marmot_app::AppError;
+    use serde_json::json;
+
+    fn bound(recipient: &str, payload: &str) -> serde_json::Value {
+        json!({
+            "project": "smartflowsocial",
+            "account": "aa",
+            "recipient": recipient,
+            "group": "bb",
+            "operation_type": "application_message",
+            "payload_sha256": payload,
+            "disposition": "published"
+        })
+    }
+
+    #[test]
+    fn only_a_pre_admission_validation_error_may_be_submitted_again() {
+        let validation = AppError::InvalidAppMessagePayload("empty text".into());
+        let timeout = AppError::AccountWorkerResponseTimedOut;
+        let panicked = AppError::BlockingTask("admission task panicked".into());
+        let disk = AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "no space left on device",
+        ));
+        assert_eq!(
+            classify_submit_error(&validation),
+            SubmitFailure::ProvenNonAdmission
+        );
+        assert_eq!(classify_submit_error(&timeout), SubmitFailure::Ambiguous);
+        assert_eq!(classify_submit_error(&panicked), SubmitFailure::Ambiguous);
+        assert_eq!(classify_submit_error(&disk), SubmitFailure::Ambiguous);
+        assert_eq!(
+            failed_submit_decision(SubmitFailure::ProvenNonAdmission, Some(false)),
+            FailedSubmit::Resubmit
+        );
+        assert_eq!(
+            failed_submit_decision(SubmitFailure::Ambiguous, Some(false)),
+            FailedSubmit::KeepUnknown
+        );
+        assert_eq!(
+            failed_submit_decision(SubmitFailure::Ambiguous, None),
+            FailedSubmit::KeepUnknown
+        );
+        assert_eq!(
+            failed_submit_decision(SubmitFailure::ProvenNonAdmission, Some(true)),
+            FailedSubmit::ProjectExisting
+        );
+        assert_eq!(
+            failed_submit_decision(SubmitFailure::Ambiguous, Some(true)),
+            FailedSubmit::ProjectExisting
+        );
+    }
+
+    #[test]
+    fn a_different_recipient_does_not_reuse_a_released_operation() {
+        let mut released = bound("cc", "payload");
+        released["disposition"] = json!("released");
+        assert!(journal_identity_matches(
+            &released,
+            "smartflowsocial",
+            "aa",
+            "cc",
+            "bb",
+            "payload"
+        ));
+        assert!(!journal_identity_matches(
+            &released,
+            "smartflowsocial",
+            "aa",
+            "dd",
+            "bb",
+            "payload"
+        ));
+        assert!(!journal_identity_matches(
+            &bound("cc", "payload"),
+            "smartflowsocial",
+            "ff",
+            "cc",
+            "bb",
+            "payload"
+        ));
+        assert!(!journal_identity_matches(
+            &bound("cc", "payload"),
+            "smartflowsocial",
+            "aa",
+            "cc",
+            "ee",
+            "payload"
+        ));
+        assert!(!journal_identity_matches(
+            &bound("cc", "payload"),
+            "smartflowsocial",
+            "aa",
+            "cc",
+            "bb",
+            "other"
+        ));
+        assert!(!journal_identity_matches(
+            &bound("cc", "payload"),
+            "nostrmash",
+            "aa",
+            "cc",
+            "bb",
+            "payload"
+        ));
+        let legacy = json!({
+            "project": "smartflowsocial",
+            "account": "aa",
+            "group": "bb",
+            "payload_sha256": "payload",
+            "disposition": "published"
+        });
+        assert!(
+            !journal_identity_matches(&legacy, "smartflowsocial", "aa", "cc", "bb", "payload"),
+            "a legacy row was bound to a newly configured recipient"
+        );
     }
 }
