@@ -29,7 +29,7 @@ Building the helper requires the Odin compiler `dev-2026-10` (`84bc3fc`) because
 
 ## Cloudflare
 
-`workers-rs` 0.9 is the SDK used by `watchdog-worker`. The scheduled handler runs the shared check cycle, and the fetch handler serves the operator routes, when a D1 binding named `DB` is present. Marmot delivery in the Worker returns unavailable. No Durable Object is constructed. NIP-17 from the Worker goes to the first configured bootstrap relay and is not saved before publication.
+`workers-rs` 0.9 is the SDK used by `watchdog-worker`. The scheduled handler runs the shared check cycle and then notification dispatch, and the fetch handler serves the operator routes, when a D1 binding named `DB` is present and the schema ledger matches `0008_commit_token`. Runtime requests do not apply DDL. Marmot delivery in the Worker returns unavailable. No Durable Object is constructed. NIP-17 publication uses the shared delivery path: gift wraps go only to validated recipient inbox relays, and the signed event is stored before the first publish. The linked wasm bundle has been loaded by local workerd. `GET /healthz` returned the live JSON body and `GET /readyz` returned ready after Wrangler applied migrations `0001` through `0008` to a local D1 database. `GET /v1/status` reached the shared engine and returned `not_configured` because that local config has no reader token. Scheduled monitoring, gift-wrap publication, and Durable Object MLS were not executed in that process.
 
 The production D1 database is not named in `wrangler.staging.toml`.
 

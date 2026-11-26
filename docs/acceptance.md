@@ -2,27 +2,70 @@
 
 This procedure is for a person with a test phone. It is not something CI can pass. Do not run it against the production sender keys or the operator's existing WhiteNoise account. Automated tests in this repository do not prove that an iPhone displayed a notification.
 
-Status: pending. No attempt has been made from this Rust code.
+Status: the native helper can prepare an official MDK message. A physical device test has not been performed. The helper binary was not rebuilt in this environment because `marmot-markdown` requires the Odin compiler `dev-2026-10` revision `84bc3fc`.
 
-## Before any message is sent
+## Build
 
-1. Create a new Nostr keypair for the watchdog test sender. Do not reuse `SFS_BOT_NSEC` or `NOSTRMASH_BOT_NSEC` from production.
-2. Install WhiteNoise on a device you control and create or use a test account that is not the daily driver.
-3. Confirm the Rust process is the native binary, `ENABLE_MARMOT` is still false, and the diagnostic says the engine is unavailable.
+The helper is a second executable. It links official `marmot-app` at `ca52a04718628f08ed76b777df9c444594074182`. The watchdog operational database stays plaintext SQLite in a different process.
 
-Stop here with the current build. The steps below are the acceptance script for the day an official MDK storage adapter is linked. Running them now cannot succeed, because the process will not publish a Marmot message.
+```bash
+# Odin dev-2026-10, revision 84bc3fc, on PATH or in $ODIN
+cargo build --manifest-path crates/watchdog-marmot/Cargo.toml --release
+cargo build --release -p watchdog-native
+```
 
-## When an adapter exists
+Expected: `target/release/watchdog-marmot` and `target/release/nostr-watchdog`.
 
-1. Publish the test sender's key package and add the test WhiteNoise account as the only member.
-2. Reject a second member. The diagnostic must not show that member as joined.
-3. Send one test alert with `POST /v1/diagnostics/test-alert` and `"projectId": "smartflowsocial"` while selecting the Marmot transport. Confirm the alert text is visible in WhiteNoise while the app is open.
-4. Repeat with the app backgrounded, then with the phone locked, then after force-quitting the app. Record wall-clock time from the relay `OK` for the group message to the notification. Those are three different results. Relay `OK` alone is not a pass.
-5. Restart the watchdog process and send another alert. The same conversation must continue without creating a second group.
-6. Leave the process idle past the sync interval, then send again.
-7. Rotate the test device's push token, or reinstall WhiteNoise, and send again.
-8. Block the relays, confirm the outbox stays retrying, restore the relays, and confirm the stored event is the one that is published.
-9. With Telegram configured for critical alerts, create a critical incident and confirm Telegram still arrives when the Marmot publish fails, and that a Marmot failure does not cancel Telegram.
+## Identities
+
+Use a new sender and a WhiteNoise account that is not a daily driver. Do not reuse production `SFS_BOT_NSEC` or `NOSTRMASH_BOT_NSEC`.
+
+```bash
+export MARMOT_ROOT="$PWD/data/marmot-test"
+export MARMOT_SOCKET="$MARMOT_ROOT/watchdog.sock"
+export MARMOT_HELPER="$PWD/target/release/watchdog-marmot"
+export ENABLE_MARMOT=true
+export ENABLE_NIP17=false
+export ALERTS_ENABLED=true
+export WATCHDOG_ENABLED=true
+export SFS_BOT_NSEC="<test sender nsec>"
+export ADMIN_NPUB="<test recipient hex or npub>"
+export BOOTSTRAP_RELAYS="wss://relay.example"
+mkdir -p "$MARMOT_ROOT"
+chmod 700 "$MARMOT_ROOT"
+./target/release/nostr-watchdog
+```
+
+The watchdog starts the helper, clears the helper environment, and checks health with an IPC ping. A socket file left behind by an exited helper is not treated as healthy.
+
+## Onboarding and one message
+
+1. The first Marmot alert imports the project sender and publishes its key package through official account setup.
+2. Group creation asks MDK for an existing reusable direct conversation before creating one, and stores the group id in the helper journal.
+3. Send one test alert:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8787/v1/diagnostics/test-alert \
+  -H "authorization: Bearer $OPERATOR_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"projectId":"smartflowsocial","transport":"marmot"}'
+```
+
+Expected queue state after dispatch is `relay_accepted` only when a relay accepted the group message. `accepted_pending` means MDK still owns publication. `completion_unknown` means the helper must not encrypt that alert id again. None of those states means the phone displayed a notification.
+
+4. Open WhiteNoise and confirm the ciphertext is in the test conversation.
+5. Lock the iPhone, send a second alert, and record whether a push appears. This step is pending until the device owner runs it.
+6. Restart both processes and send again. The stored group id must be reused. A second conversation is a failure.
+
+## Troubleshooting
+
+- `marmot_helper_unavailable`: the helper did not answer a ping. Check `MARMOT_HELPER`, `MARMOT_ROOT` mode `0700`, and that Odin was present at build time.
+- `recipient_absent` or `sender_absent`: the group does not contain both configured accounts. Do not send.
+- `membership_rejected`: an account other than the sender and recipient is in the group.
+- `recipient_push_token_unavailable`: MDK has no active push-token record for a current member. The group message can still be accepted. Push was not attempted.
+- `push_disposition_unknown`: a token record exists. This build does not treat message publication as evidence that a push trigger was accepted.
+- `DirectConversationIndexNotReady`: MDK has not finished its conversation index. Retry after the helper stays up; do not create a second group by hand.
+- Relay `AUTH` that the sender cannot satisfy is an error, not an empty inbox.
 
 ## Targets, not guarantees
 
@@ -35,4 +78,4 @@ These are the bars for calling the transport ready. They are not a claim about t
 - No MLS state that fails to open after a restart.
 - No manual repair between the sends after the initial join.
 
-A pass still does not mean v1.0.0 until the staging deploy and the migration notes have been reviewed.
+Foreground, background, locked-screen, and force-quit are four different results. Relay `OK` alone is not a pass. A pass still does not mean v1.0.0.

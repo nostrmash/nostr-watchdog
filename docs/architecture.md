@@ -45,6 +45,6 @@ The native process wakes about once a minute, runs due monitors with the configu
 
 ## Cloudflare
 
-The Worker scheduled handler calls the same check and update functions, with D1 as the store. Fetch serves the operator routes. Marmot state is not a Durable Object yet: `storage-sqlite` does not build for `wasm32-unknown-unknown`. See [mdk-compatibility.md](mdk-compatibility.md). The Worker has been type-checked for wasm and has not been run under `workerd` in this pass.
+The Worker scheduled handler calls the same check and update functions, then dispatches notifications after the monitoring lease is released. Fetch serves the operator routes. Marmot state is not a Durable Object yet: `storage-sqlite` does not build for `wasm32-unknown-unknown`, and OpenMLS group operations have not been executed inside workerd. See [mdk-compatibility.md](mdk-compatibility.md). The Worker bundle has been loaded under local workerd. Health and readiness succeeded against a local D1 database. Scheduled monitoring and Durable Object MLS have not been executed there.
 
 The staging Worker name is `nostr-watchdog-rust-staging`. It must not be given the production D1 id.

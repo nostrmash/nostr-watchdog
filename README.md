@@ -20,7 +20,7 @@ The native binary (`nostr-watchdog`) runs the shared monitoring core:
 
 Marmot delivery on the native process goes through `watchdog-marmot`, a separate executable that links official `marmot-app` at MDK `ca52a04`. It is a separate process because that crate's SQLCipher build and the operational SQLite database both export `links = "sqlite3"`, and Cargo can link only one of them. The helper is not used on Cloudflare. A relay acknowledgement from that helper is not phone delivery. No WhiteNoise device test has been run from this branch.
 
-The Cloudflare crate compiles the shared monitoring engine against a D1 store. `cargo check --target wasm32-unknown-unknown` succeeds. It has not been executed inside `workerd` in this pass, and its Marmot path still fails closed. It does not use the production D1 database. See [docs/mdk-compatibility.md](docs/mdk-compatibility.md).
+The Cloudflare crate compiles the shared monitoring engine against a D1 store and links a wasm bundle. A local workerd process served `GET /healthz` and `GET /readyz` against a Wrangler-applied D1 schema through `0008_commit_token`. Marmot on the Worker still fails closed. It does not use the production D1 database. See [docs/mdk-compatibility.md](docs/mdk-compatibility.md).
 
 ## Requirements
 
