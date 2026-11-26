@@ -16,8 +16,8 @@ const CLOSED_INCIDENT_RETENTION_MS: i64 = 90 * 86_400_000;
 const UPSTREAM_RETENTION_MS: i64 = 7 * 86_400_000;
 
 use crate::model::{
-    CommitOutcome, FailedAlert, HeartbeatStored, LoadedMemory, MarmotProjectRow, OutboxRow,
-    StoreError, UpstreamRow, VersionRow,
+    ClaimOwnership, CommitOutcome, FailedAlert, HeartbeatStored, HeartbeatWrite, LoadedMemory,
+    MarmotProjectRow, OnboardReceipt, OutboxRow, RetryMode, StoreError, UpstreamRow, VersionRow,
 };
 use crate::OperationalStore;
 
@@ -104,6 +104,7 @@ impl SqliteStore {
             }
             tx.commit()?;
         }
+        validate_open_schema(&conn)?;
         Ok(())
     }
 
@@ -159,7 +160,7 @@ impl SqliteStore {
         memory.unknown_since = unknown_since;
         memory.last_unknown_reason = unknown_reason;
         let mut stmt = conn.prepare(
-            "SELECT id, kind, severity, opened_at, reminder_count, last_reminder_at, silenced_until, acked_at FROM incidents WHERE monitor_id = ?1 AND status = 'open'",
+            "SELECT id, kind, severity, opened_at, reminder_count, last_reminder_at, silenced_until, acked_at, decision_generation FROM incidents WHERE monitor_id = ?1 AND status = 'open'",
         )?;
         let rows = stmt.query_map(params![monitor_id], |row| {
             Ok(OpenIncident {
@@ -172,6 +173,7 @@ impl SqliteStore {
                 last_reminder_at: row.get(5)?,
                 silenced_until: row.get(6)?,
                 acked_at: row.get(7)?,
+                decision_generation: row.get(8)?,
             })
         })?;
         for incident in rows {
@@ -299,20 +301,53 @@ impl SqliteStore {
                     tx.execute(
                         "UPDATE incidents SET reminder_count = reminder_count + 1, last_reminder_at = ?1, updated_at = ?1
                          WHERE id = ?2 AND status = 'open'
-                           AND EXISTS (SELECT 1 FROM monitor_state WHERE monitor_id = ?3 AND generation = ?4 AND commit_token = ?5)",
-                        params![now, item.incident_id, monitor_id, next_generation, commit_token],
+                           AND decision_generation = ?3 AND reminder_count = ?4
+                           AND acked_at IS NULL
+                           AND (silenced_until IS NULL OR silenced_until <= ?5)
+                           AND EXISTS (SELECT 1 FROM monitor_state WHERE monitor_id = ?6 AND generation = ?7 AND commit_token = ?8)",
+                        params![
+                            now,
+                            item.incident_id,
+                            item.decision_generation,
+                            item.reminder_count,
+                            now,
+                            monitor_id,
+                            next_generation,
+                            commit_token,
+                        ],
                     )?;
                 }
             }
         }
         for alert in alerts {
+            let remind = notices.iter().find(|notice| {
+                notice.event == NoticeEvent::Remind
+                    && alert.incident_id.as_deref() == Some(notice.incident_id.as_str())
+                    && alert.alert_class == AlertClass::Reminder
+            });
+            let (is_reminder, decision, count_after, incident_id) = match remind {
+                Some(notice) => (
+                    1_i64,
+                    notice.decision_generation,
+                    notice.reminder_count + 1,
+                    notice.incident_id.as_str(),
+                ),
+                None => (0, 0, 0, ""),
+            };
             tx.execute(
                 "INSERT OR IGNORE INTO alert_outbox (
                     id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
-                    state, payload_text, attempt_count, next_attempt_at, created_at, updated_at
+                    state, payload_text, attempt_count, next_attempt_at, created_at, updated_at, logical_id
                 )
-                SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10
-                FROM monitor_state WHERE monitor_id = ?4 AND generation = ?11 AND commit_token = ?12",
+                SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10, ?11
+                FROM monitor_state WHERE monitor_id = ?4 AND generation = ?12 AND commit_token = ?13
+                  AND (
+                    ?14 = 0 OR EXISTS (
+                      SELECT 1 FROM incidents WHERE id = ?15 AND status = 'open'
+                        AND decision_generation = ?16 AND reminder_count = ?17
+                        AND last_reminder_at = ?10 AND acked_at IS NULL
+                    )
+                  )",
                 params![
                     alert.id,
                     alert.alert_class.as_str(),
@@ -324,8 +359,13 @@ impl SqliteStore {
                     alert.severity.as_str(),
                     alert.text,
                     now,
+                    logical_notification_id(&alert.dedupe_key),
                     next_generation,
                     commit_token,
+                    is_reminder,
+                    incident_id,
+                    decision,
+                    count_after,
                 ],
             )?;
         }
@@ -358,23 +398,52 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn renew_lease(
+        &self,
+        name: &str,
+        owner: &str,
+        until: i64,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let changed = self.lock()?.execute(
+            "UPDATE scheduler_leases
+             SET lease_until = CASE WHEN ?1 > lease_until THEN ?1 ELSE lease_until END
+             WHERE job_name = ?2 AND owner = ?3 AND lease_until >= ?4",
+            params![until, name, owner, now],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn mark_run(
         &self,
         name: &str,
+        owner: &str,
         started_at: Option<i64>,
         finished_at: Option<i64>,
         error: Option<&str>,
         success_at: Option<i64>,
     ) -> Result<(), StoreError> {
         self.lock()?.execute(
-            "INSERT INTO scheduler_runs (job_name, last_started_at, last_finished_at, last_error, last_success_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO scheduler_runs (
+                job_name, last_started_at, last_finished_at, last_error, last_success_at, run_owner
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(job_name) DO UPDATE SET
-               last_started_at = COALESCE(excluded.last_started_at, scheduler_runs.last_started_at),
-               last_finished_at = COALESCE(excluded.last_finished_at, scheduler_runs.last_finished_at),
+               last_started_at = excluded.last_started_at,
+               last_finished_at = excluded.last_finished_at,
                last_error = excluded.last_error,
-               last_success_at = COALESCE(excluded.last_success_at, scheduler_runs.last_success_at)",
-            params![name, started_at, finished_at, error, success_at],
+               last_success_at = CASE
+                 WHEN excluded.last_error IS NULL THEN excluded.last_success_at
+                 ELSE scheduler_runs.last_success_at
+               END,
+               run_owner = excluded.run_owner
+             WHERE scheduler_runs.last_started_at IS NULL
+                OR excluded.last_started_at > scheduler_runs.last_started_at
+                OR (
+                  excluded.last_started_at = scheduler_runs.last_started_at
+                  AND excluded.run_owner = scheduler_runs.run_owner
+                  AND COALESCE(excluded.last_finished_at, 0) >= COALESCE(scheduler_runs.last_finished_at, 0)
+                )",
+            params![name, started_at, finished_at, error, success_at, owner],
         )?;
         Ok(())
     }
@@ -418,7 +487,7 @@ impl SqliteStore {
         progress: Option<&str>,
         idle: bool,
         loop_at: Option<i64>,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<HeartbeatWrite, StoreError> {
         let conn = self.lock()?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -432,12 +501,12 @@ impl SqliteStore {
         if let Err(error) = inserted {
             tx.rollback()?;
             return if is_constraint(&error) {
-                Ok(false)
+                Ok(HeartbeatWrite::Replay)
             } else {
                 Err(error.into())
             };
         }
-        tx.execute(
+        let changed = tx.execute(
             "INSERT INTO heartbeats (
                 monitor_id, project_id, received_at, reported_at, progress_token, progress_changed_at, idle, loop_at, summary
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
@@ -450,7 +519,8 @@ impl SqliteStore {
                     ELSE excluded.received_at
                 END,
                 idle = excluded.idle,
-                loop_at = excluded.loop_at",
+                loop_at = excluded.loop_at
+            WHERE excluded.reported_at > heartbeats.reported_at",
             params![
                 monitor_id,
                 project_id,
@@ -463,15 +533,19 @@ impl SqliteStore {
             ],
         )?;
         tx.commit()?;
-        Ok(true)
+        Ok(if changed == 0 {
+            HeartbeatWrite::Stale
+        } else {
+            HeartbeatWrite::Stored
+        })
     }
 
     pub fn insert_alert(&self, alert: &AlertDraft, now: i64) -> Result<(), StoreError> {
         self.lock()?.execute(
             "INSERT OR IGNORE INTO alert_outbox (
                 id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
-                state, payload_text, attempt_count, next_attempt_at, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10)",
+                state, payload_text, attempt_count, next_attempt_at, created_at, updated_at, logical_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10, ?11)",
             params![
                 alert.id,
                 alert.alert_class.as_str(),
@@ -483,6 +557,7 @@ impl SqliteStore {
                 alert.severity.as_str(),
                 alert.text,
                 now,
+                logical_notification_id(&alert.dedupe_key),
             ],
         )?;
         Ok(())
@@ -501,9 +576,9 @@ impl SqliteStore {
         let changed = conn.execute(
             "INSERT INTO alert_outbox (
                 id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
-                state, payload_text, attempt_count, next_attempt_at, created_at, updated_at
+                state, payload_text, attempt_count, next_attempt_at, created_at, updated_at, logical_id
             )
-            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10, ?14
             WHERE (
                 SELECT COUNT(*) FROM alert_outbox WHERE dedupe_key LIKE ?11 AND created_at >= ?12
             ) < ?13",
@@ -521,6 +596,7 @@ impl SqliteStore {
                 pattern,
                 since,
                 limit,
+                logical_notification_id(&alert.dedupe_key),
             ],
         )?;
         Ok(changed > 0)
@@ -542,6 +618,8 @@ impl SqliteStore {
         claim_until: i64,
         destination: Option<&str>,
         limit: i64,
+        kind: &str,
+        oldest: i64,
     ) -> Result<Vec<OutboxRow>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -549,11 +627,29 @@ impl SqliteStore {
              WHERE state IN ('queued', 'retrying') AND next_attempt_at <= ?1
                AND (claim_until IS NULL OR claim_until < ?1)
                AND (?2 IS NULL OR destination = ?2)
+               AND (
+                 ((?3 = 'delivery' OR ?3 = 'delivery-critical' OR ?3 = 'delivery-other')
+                    AND NOT (
+                      destination = 'marmot'
+                      AND COALESCE(message_state, '') IN ('accepted', 'accepted_pending')
+                      AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', '')
+                    )
+                    AND (?3 != 'delivery-critical' OR severity = 'critical')
+                    AND (?3 != 'delivery-other' OR severity != 'critical'))
+                 OR (?3 = 'push'
+                    AND destination = 'marmot'
+                    AND COALESCE(message_state, '') IN ('accepted', 'accepted_pending')
+                    AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', '')
+                    AND COALESCE(push_attempts, 0) < 8
+                    AND updated_at >= ?4)
+               )
              ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, created_at
-             LIMIT ?3",
+             LIMIT ?5",
         )?;
         let ids: Vec<String> = stmt
-            .query_map(params![now, destination, limit], |row| row.get(0))?
+            .query_map(params![now, destination, kind, oldest, limit], |row| {
+                row.get(0)
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         let mut claimed = Vec::new();
@@ -601,7 +697,8 @@ impl SqliteStore {
         let changed = self.lock()?.execute(
             "UPDATE alert_outbox SET claim_until = ?1
              WHERE id = ?2 AND claim_token = ?3 AND state = 'retrying'
-               AND claim_until IS NOT NULL AND claim_until >= ?4",
+               AND claim_until IS NOT NULL AND claim_until >= ?4
+               AND ?1 > ?4 AND ?1 <= ?4 + 300000",
             params![claim_until, id, token, now],
         )?;
         Ok(changed > 0)
@@ -628,7 +725,8 @@ impl SqliteStore {
         let conn = self.lock()?;
         let changed = conn.execute(
             "UPDATE alert_outbox SET envelope_json = ?1, updated_at = ?2
-             WHERE id = ?3 AND claim_token = ?4 AND envelope_json IS NULL",
+             WHERE id = ?3 AND claim_token = ?4 AND envelope_json IS NULL
+               AND claim_until IS NOT NULL AND claim_until >= ?2",
             params![envelope, now, id, token],
         )?;
         if changed > 0 {
@@ -682,7 +780,25 @@ impl SqliteStore {
                  accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL,
                  message_phase = COALESCE(?7, message_phase), push_phase = COALESCE(?8, push_phase),
                  message_event_id = COALESCE(?9, message_event_id),
-                 push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11
+                 push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11,
+                 message_state = CASE
+                   WHEN ?7 IS NULL THEN message_state
+                   WHEN ?7 IN ('relay_accepted', 'message_accepted') THEN 'accepted'
+                   WHEN ?7 IN ('accepted_pending', 'completion_unknown') THEN 'accepted_pending'
+                   WHEN ?7 = 'message_prepared' THEN 'prepared'
+                   ELSE 'failed' END,
+                 push_state = CASE
+                   WHEN ?8 IS NULL THEN push_state
+                   WHEN ?8 = 'push_trigger_accepted' THEN 'accepted'
+                   WHEN ?8 IN ('push_token_unavailable', 'push_unobservable', 'completion_unknown') THEN 'unobservable'
+                   WHEN ?8 = 'push_trigger_prepared' THEN 'pending'
+                   WHEN ?8 = 'push_expired' THEN 'expired'
+                   ELSE 'rejected' END,
+                 message_attempts = message_attempts + CASE WHEN ?7 IS NOT NULL THEN 1 ELSE 0 END,
+                 push_attempts = push_attempts + CASE WHEN ?8 IS NOT NULL THEN 1 ELSE 0 END,
+                 message_updated_at = CASE WHEN ?7 IS NOT NULL THEN ?11 ELSE message_updated_at END,
+                 push_updated_at = CASE WHEN ?8 IS NOT NULL THEN ?11 ELSE push_updated_at END,
+                 terminal_reason = COALESCE(?4, terminal_reason)
              WHERE id = ?12 AND claim_token = ?13 AND claim_until IS NOT NULL AND claim_until >= ?11",
             params![
                 state.as_str(),
@@ -703,20 +819,41 @@ impl SqliteStore {
         Ok(changed > 0)
     }
 
-    pub fn retry_dead_letter(&self, id: &str, now: i64) -> Result<bool, StoreError> {
-        let changed = self.lock()?.execute(
+    pub fn retry_dead_letter(&self, id: &str, now: i64) -> Result<RetryMode, StoreError> {
+        let conn = self.lock()?;
+        let existing: Option<(Option<String>,)> = conn
+            .query_row(
+                "SELECT envelope_json FROM alert_outbox WHERE id = ?1 AND state = 'failed'",
+                params![id],
+                |row| Ok((row.get(0)?,)),
+            )
+            .optional()?;
+        let Some((envelope,)) = existing else {
+            return Ok(RetryMode::Missing);
+        };
+        let mode = if envelope.is_some() {
+            RetryMode::SameOperation
+        } else {
+            RetryMode::NewSubmission
+        };
+        conn.execute(
             "UPDATE alert_outbox
-             SET state = 'queued', attempt_count = 0, next_attempt_at = ?1, claim_until = NULL,
-                 claim_token = NULL, last_error = NULL, updated_at = ?1
+             SET state = 'queued', next_attempt_at = ?1, claim_until = NULL, claim_token = NULL,
+                 last_error = NULL, updated_at = ?1,
+                 attempt_count = CASE WHEN envelope_json IS NULL THEN 0 ELSE attempt_count END,
+                 submission_generation = CASE
+                   WHEN envelope_json IS NULL THEN submission_generation + 1
+                   ELSE submission_generation END
              WHERE id = ?2 AND state = 'failed'",
             params![now, id],
         )?;
-        Ok(changed > 0)
+        Ok(mode)
     }
 
     pub fn ack_incident(&self, id: &str, now: i64) -> Result<bool, StoreError> {
         let changed = self.lock()?.execute(
-            "UPDATE incidents SET acked_at = ?1, updated_at = ?1 WHERE id = ?2 AND status = 'open'",
+            "UPDATE incidents SET acked_at = ?1, updated_at = ?1, decision_generation = decision_generation + 1
+             WHERE id = ?2 AND status = 'open' AND acked_at IS NULL",
             params![now, id],
         )?;
         Ok(changed > 0)
@@ -724,7 +861,8 @@ impl SqliteStore {
 
     pub fn silence_incident(&self, id: &str, until: i64, now: i64) -> Result<bool, StoreError> {
         let changed = self.lock()?.execute(
-            "UPDATE incidents SET silenced_until = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'open'",
+            "UPDATE incidents SET silenced_until = ?1, updated_at = ?2, decision_generation = decision_generation + 1
+             WHERE id = ?3 AND status = 'open' AND (silenced_until IS NULL OR silenced_until < ?1)",
             params![until, now, id],
         )?;
         Ok(changed > 0)
@@ -948,6 +1086,7 @@ impl SqliteStore {
                 consecutive_failures: row.get(13)?,
                 releases_failures: row.get(14)?,
                 advisories_failures: row.get(15)?,
+                generation: 0,
             })
         })? {
             vendor_checks.push(row?);
@@ -1042,7 +1181,7 @@ impl SqliteStore {
     pub fn read_version(&self, monitor_id: &str) -> Result<Option<VersionRow>, StoreError> {
         self.lock()?
             .query_row(
-                "SELECT installed_version, latest_version, latest_url, security_status, advisory_fingerprint, notice_fingerprint, security_reminded_at FROM observed_versions WHERE monitor_id = ?1",
+                "SELECT installed_version, latest_version, latest_url, security_status, advisory_fingerprint, notice_fingerprint, security_reminded_at, generation FROM observed_versions WHERE monitor_id = ?1",
                 params![monitor_id],
                 |row| {
                     Ok(VersionRow {
@@ -1053,6 +1192,7 @@ impl SqliteStore {
                         advisory_fingerprint: row.get(4)?,
                         notice_fingerprint: row.get(5)?,
                         security_reminded_at: row.get(6)?,
+                        generation: row.get(7)?,
                     })
                 },
             )
@@ -1132,7 +1272,7 @@ impl SqliteStore {
             .query_row(
                 "SELECT monitor_id, vendor, attempted_at, succeeded_at, partial_succeeded_at, releases_checked_at,
                         advisories_checked_at, releases_stale, advisories_stale, releases_state, advisories_state,
-                        coverage, error_code, consecutive_failures, releases_failures, advisories_failures
+                        coverage, error_code, consecutive_failures, releases_failures, advisories_failures, generation
                  FROM vendor_checks WHERE monitor_id = ?1",
                 params![monitor_id],
                 |row| {
@@ -1153,6 +1293,7 @@ impl SqliteStore {
                         consecutive_failures: row.get(13)?,
                         releases_failures: row.get(14)?,
                         advisories_failures: row.get(15)?,
+                        generation: row.get(16)?,
                     })
                 },
             )
@@ -1206,6 +1347,336 @@ impl SqliteStore {
         )?;
         Ok(())
     }
+
+    pub fn finish_with_fallback(
+        &self,
+        id: &str,
+        token: &str,
+        state: DeliveryState,
+        attempt_count: i64,
+        next_attempt_at: i64,
+        error: Option<&str>,
+        accepted_relays: Option<&str>,
+        failed_relays: Option<&str>,
+        message_phase: Option<&str>,
+        push_phase: Option<&str>,
+        message_event_id: Option<&str>,
+        push_envelope: Option<&str>,
+        logical_id: Option<&str>,
+        fallback: Option<&AlertDraft>,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE alert_outbox
+             SET state = ?1, attempt_count = ?2, next_attempt_at = ?3, last_error = ?4,
+                 accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL,
+                 message_phase = COALESCE(?7, message_phase), push_phase = COALESCE(?8, push_phase),
+                 message_event_id = COALESCE(?9, message_event_id),
+                 push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11,
+                 logical_id = COALESCE(logical_id, ?12),
+                 message_state = CASE
+                   WHEN ?7 IS NULL THEN message_state
+                   WHEN ?7 IN ('relay_accepted', 'message_accepted') THEN 'accepted'
+                   WHEN ?7 IN ('accepted_pending', 'completion_unknown') THEN 'accepted_pending'
+                   WHEN ?7 = 'message_prepared' THEN 'prepared'
+                   ELSE 'failed' END,
+                 push_state = CASE
+                   WHEN ?8 IS NULL THEN push_state
+                   WHEN ?8 = 'push_trigger_accepted' THEN 'accepted'
+                   WHEN ?8 IN ('push_token_unavailable', 'push_unobservable', 'completion_unknown') THEN 'unobservable'
+                   WHEN ?8 = 'push_trigger_prepared' THEN 'pending'
+                   WHEN ?8 = 'push_expired' THEN 'expired'
+                   ELSE 'rejected' END,
+                 message_attempts = message_attempts + CASE WHEN ?7 IS NOT NULL THEN 1 ELSE 0 END,
+                 push_attempts = push_attempts + CASE WHEN ?8 IS NOT NULL THEN 1 ELSE 0 END,
+                 message_updated_at = CASE WHEN ?7 IS NOT NULL THEN ?11 ELSE message_updated_at END,
+                 push_updated_at = CASE WHEN ?8 IS NOT NULL THEN ?11 ELSE push_updated_at END,
+                 terminal_reason = COALESCE(?4, terminal_reason)
+             WHERE id = ?13 AND claim_token = ?14 AND claim_until IS NOT NULL AND claim_until >= ?11",
+            params![
+                state.as_str(),
+                attempt_count,
+                next_attempt_at,
+                error,
+                accepted_relays,
+                failed_relays,
+                message_phase,
+                push_phase,
+                message_event_id,
+                push_envelope,
+                now,
+                logical_id,
+                id,
+                token,
+            ],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        if let Some(alert) = fallback {
+            tx.execute(
+                "INSERT OR IGNORE INTO alert_outbox (
+                    id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
+                    state, payload_text, attempt_count, next_attempt_at, created_at, updated_at, logical_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10, ?11)",
+                params![
+                    alert.id,
+                    alert.alert_class.as_str(),
+                    alert.incident_id,
+                    alert.monitor_id,
+                    alert.project_id,
+                    alert.dedupe_key,
+                    alert.destination.as_str(),
+                    alert.severity.as_str(),
+                    alert.text,
+                    now,
+                    logical_notification_id(&alert.dedupe_key),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn claim_ownership(
+        &self,
+        id: &str,
+        token: &str,
+        now: i64,
+    ) -> Result<ClaimOwnership, StoreError> {
+        let row = self.lock()?.query_row(
+            "SELECT claim_token, claim_until FROM alert_outbox WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                ))
+            },
+        );
+        match row {
+            Ok((Some(stored), Some(until))) if stored == token && until >= now => {
+                Ok(ClaimOwnership::Active { until })
+            }
+            Ok((Some(stored), _)) if stored == token => Ok(ClaimOwnership::Expired),
+            Ok((None, _)) => Ok(ClaimOwnership::Lost),
+            Ok(_) => Ok(ClaimOwnership::Lost),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(ClaimOwnership::Missing),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn release_open_claims(&self, now: i64) -> Result<usize, StoreError> {
+        Ok(self.lock()?.execute(
+            "UPDATE alert_outbox
+             SET claim_until = NULL, claim_token = NULL, state = 'retrying', updated_at = ?1
+             WHERE state = 'retrying' AND claim_token IS NOT NULL",
+            params![now],
+        )?)
+    }
+
+    pub fn expedite_destination(&self, destination: &str, now: i64) -> Result<usize, StoreError> {
+        Ok(self.lock()?.execute(
+            "UPDATE alert_outbox SET next_attempt_at = ?1, updated_at = ?1
+             WHERE destination = ?2 AND state IN ('queued', 'retrying')
+               AND (claim_until IS NULL OR claim_until < ?1)
+               AND next_attempt_at > ?1",
+            params![now, destination],
+        )?)
+    }
+
+    pub fn acknowledge_alert(&self, id: &str, now: i64) -> Result<bool, StoreError> {
+        Ok(self.lock()?.execute(
+            "UPDATE alert_outbox SET operator_ack_at = ?1, updated_at = ?1
+             WHERE id = ?2 AND operator_ack_at IS NULL",
+            params![now, id],
+        )? > 0)
+    }
+
+    pub fn count_delivery_pressure(&self, now: i64) -> Result<(i64, i64), StoreError> {
+        let pending = self.lock()?.query_row(
+            "SELECT COUNT(*) FROM alert_outbox WHERE state = 'retrying' AND next_attempt_at <= ?1",
+            params![now],
+            |row| row.get(0),
+        )?;
+        let recent = self.lock()?.query_row(
+            "SELECT COUNT(*) FROM alert_outbox WHERE state = 'retrying' AND updated_at >= ?1",
+            params![now - 86_400_000],
+            |row| row.get(0),
+        )?;
+        Ok((pending, recent))
+    }
+
+    pub fn record_onboarding(
+        &self,
+        project_id: &str,
+        idempotency_key: &str,
+        now: i64,
+    ) -> Result<Option<OnboardReceipt>, StoreError> {
+        self.lock()?.execute(
+            "INSERT INTO marmot_projects (
+                project_id, engine_status, updated_at, onboard_idempotency_key, onboard_requested_at
+             ) VALUES (?1, 'onboard_requested', ?2, ?3, ?2)
+             ON CONFLICT(project_id) DO UPDATE SET
+               onboard_idempotency_key = excluded.onboard_idempotency_key,
+               onboard_requested_at = excluded.onboard_requested_at,
+               updated_at = excluded.updated_at
+             WHERE marmot_projects.onboard_idempotency_key IS NULL
+                OR marmot_projects.onboard_idempotency_key = excluded.onboard_idempotency_key",
+            params![project_id, now, idempotency_key],
+        )?;
+        self.lock()?
+            .query_row(
+                "SELECT engine_status, onboard_idempotency_key FROM marmot_projects WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(OnboardReceipt {
+                        engine_status: row.get(0)?,
+                        idempotency_key: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn commit_vendor_cycle(
+        &self,
+        monitor_id: &str,
+        version_generation: Option<i64>,
+        version: Option<&VersionRow>,
+        vendor_generation: i64,
+        vendor: &VendorView,
+        alerts: &[AlertDraft],
+        now: i64,
+    ) -> Result<CommitOutcome, StoreError> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        let token = uuid::Uuid::new_v4().to_string();
+        if let (Some(generation), Some(version)) = (version_generation, version) {
+            let changed = tx.execute(
+                "INSERT INTO observed_versions (
+                    monitor_id, installed_version, latest_version, latest_url, security_status,
+                    advisory_fingerprint, notice_fingerprint, updated_at, security_reminded_at,
+                    generation, commit_token
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(monitor_id) DO UPDATE SET
+                    installed_version = excluded.installed_version,
+                    latest_version = excluded.latest_version,
+                    latest_url = excluded.latest_url,
+                    security_status = excluded.security_status,
+                    advisory_fingerprint = excluded.advisory_fingerprint,
+                    notice_fingerprint = excluded.notice_fingerprint,
+                    updated_at = excluded.updated_at,
+                    security_reminded_at = excluded.security_reminded_at,
+                    generation = excluded.generation,
+                    commit_token = excluded.commit_token
+                 WHERE observed_versions.generation = ?12",
+                params![
+                    monitor_id,
+                    version.installed,
+                    version.latest,
+                    version.latest_url,
+                    version.security_status,
+                    version.advisory_fingerprint,
+                    version.notice_fingerprint,
+                    now,
+                    version.security_reminded_at,
+                    generation + 1,
+                    token,
+                    generation,
+                ],
+            )?;
+            if changed == 0 {
+                tx.rollback()?;
+                return Ok(CommitOutcome { committed: false });
+            }
+        }
+        let vendor_changed = tx.execute(
+            "INSERT INTO vendor_checks (
+                monitor_id, vendor, attempted_at, succeeded_at, partial_succeeded_at, releases_checked_at,
+                advisories_checked_at, releases_stale, advisories_stale, releases_state, advisories_state,
+                coverage, error_code, consecutive_failures, releases_failures, advisories_failures, updated_at,
+                generation, commit_token
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+             ON CONFLICT(monitor_id) DO UPDATE SET
+                vendor = excluded.vendor,
+                attempted_at = COALESCE(excluded.attempted_at, vendor_checks.attempted_at),
+                succeeded_at = COALESCE(excluded.succeeded_at, vendor_checks.succeeded_at),
+                partial_succeeded_at = COALESCE(excluded.partial_succeeded_at, vendor_checks.partial_succeeded_at),
+                releases_checked_at = COALESCE(excluded.releases_checked_at, vendor_checks.releases_checked_at),
+                advisories_checked_at = COALESCE(excluded.advisories_checked_at, vendor_checks.advisories_checked_at),
+                releases_stale = excluded.releases_stale,
+                advisories_stale = excluded.advisories_stale,
+                releases_state = excluded.releases_state,
+                advisories_state = excluded.advisories_state,
+                coverage = excluded.coverage,
+                error_code = excluded.error_code,
+                consecutive_failures = excluded.consecutive_failures,
+                releases_failures = excluded.releases_failures,
+                advisories_failures = excluded.advisories_failures,
+                updated_at = excluded.updated_at,
+                generation = excluded.generation,
+                commit_token = excluded.commit_token
+             WHERE vendor_checks.generation = ?20",
+            params![
+                vendor.monitor_id,
+                vendor.vendor,
+                vendor.attempted_at,
+                vendor.succeeded_at,
+                vendor.partial_succeeded_at,
+                vendor.releases_checked_at,
+                vendor.advisories_checked_at,
+                i64::from(vendor.releases_stale),
+                i64::from(vendor.advisories_stale),
+                vendor.releases_state,
+                vendor.advisories_state,
+                vendor.coverage,
+                vendor.error_code,
+                vendor.consecutive_failures,
+                vendor.releases_failures,
+                vendor.advisories_failures,
+                now,
+                vendor_generation + 1,
+                token,
+                vendor_generation,
+            ],
+        )?;
+        if vendor_changed == 0 {
+            tx.rollback()?;
+            return Ok(CommitOutcome { committed: false });
+        }
+        for alert in alerts {
+            tx.execute(
+                "INSERT OR IGNORE INTO alert_outbox (
+                    id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
+                    state, payload_text, attempt_count, next_attempt_at, created_at, updated_at, logical_id
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10, ?11
+                 FROM vendor_checks WHERE monitor_id = ?4 AND generation = ?12 AND commit_token = ?13",
+                params![
+                    alert.id,
+                    alert.alert_class.as_str(),
+                    alert.incident_id,
+                    alert.monitor_id,
+                    alert.project_id,
+                    alert.dedupe_key,
+                    alert.destination.as_str(),
+                    alert.severity.as_str(),
+                    alert.text,
+                    now,
+                    logical_notification_id(&alert.dedupe_key),
+                    vendor_generation + 1,
+                    token,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(CommitOutcome { committed: true })
+    }
 }
 
 fn read_outbox(conn: &Connection, id: &str) -> Result<Option<OutboxRow>, StoreError> {
@@ -1213,7 +1684,9 @@ fn read_outbox(conn: &Connection, id: &str) -> Result<Option<OutboxRow>, StoreEr
         "SELECT id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity, state,
                 payload_text, envelope_json, attempt_count, next_attempt_at, claim_until, claim_token,
                 accepted_relays, failed_relays, last_error, created_at, updated_at,
-                message_phase, push_phase, push_envelope_json, message_event_id
+                message_phase, push_phase, push_envelope_json, message_event_id,
+                message_state, push_state, message_attempts, push_attempts, message_updated_at,
+                push_updated_at, terminal_reason, operator_ack_at, logical_id, submission_generation
          FROM alert_outbox WHERE id = ?1",
         params![id],
         |row| {
@@ -1242,6 +1715,16 @@ fn read_outbox(conn: &Connection, id: &str) -> Result<Option<OutboxRow>, StoreEr
                 push_phase: row.get(21)?,
                 push_envelope_json: row.get(22)?,
                 message_event_id: row.get(23)?,
+                message_state: row.get(24)?,
+                push_state: row.get(25)?,
+                message_attempts: row.get(26)?,
+                push_attempts: row.get(27)?,
+                message_updated_at: row.get(28)?,
+                push_updated_at: row.get(29)?,
+                terminal_reason: row.get(30)?,
+                operator_ack_at: row.get(31)?,
+                logical_id: row.get(32)?,
+                submission_generation: row.get(33)?,
             })
         },
     )
@@ -1293,15 +1776,33 @@ impl OperationalStore for SqliteStore {
     async fn release_lease(&self, name: &str, owner: &str, now: i64) -> Result<(), StoreError> {
         SqliteStore::release_lease(self, name, owner, now)
     }
+    async fn renew_lease(
+        &self,
+        name: &str,
+        owner: &str,
+        until: i64,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        SqliteStore::renew_lease(self, name, owner, until, now)
+    }
     async fn mark_run(
         &self,
         name: &str,
+        owner: &str,
         started_at: Option<i64>,
         finished_at: Option<i64>,
         error: Option<&str>,
         success_at: Option<i64>,
     ) -> Result<(), StoreError> {
-        SqliteStore::mark_run(self, name, started_at, finished_at, error, success_at)
+        SqliteStore::mark_run(
+            self,
+            name,
+            owner,
+            started_at,
+            finished_at,
+            error,
+            success_at,
+        )
     }
     async fn last_checks(&self) -> Result<Vec<(String, Option<i64>)>, StoreError> {
         SqliteStore::last_checks(self)
@@ -1323,7 +1824,7 @@ impl OperationalStore for SqliteStore {
         progress: Option<&str>,
         idle: bool,
         loop_at: Option<i64>,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<HeartbeatWrite, StoreError> {
         SqliteStore::store_heartbeat(
             self,
             monitor_id,
@@ -1363,8 +1864,18 @@ impl OperationalStore for SqliteStore {
         claim_until: i64,
         destination: Option<&str>,
         limit: i64,
+        kind: &str,
+        oldest: i64,
     ) -> Result<Vec<OutboxRow>, StoreError> {
-        SqliteStore::claim_outbox(self, now, claim_until, destination, limit)
+        SqliteStore::claim_outbox(self, now, claim_until, destination, limit, kind, oldest)
+    }
+    async fn claim_ownership(
+        &self,
+        id: &str,
+        token: &str,
+        now: i64,
+    ) -> Result<ClaimOwnership, StoreError> {
+        SqliteStore::claim_ownership(self, id, token, now)
     }
     async fn extend_claim(
         &self,
@@ -1423,7 +1934,44 @@ impl OperationalStore for SqliteStore {
             now,
         )
     }
-    async fn retry_dead_letter(&self, id: &str, now: i64) -> Result<bool, StoreError> {
+    async fn finish_with_fallback(
+        &self,
+        id: &str,
+        token: &str,
+        state: watchdog_core::domain::DeliveryState,
+        attempt_count: i64,
+        next_attempt_at: i64,
+        error: Option<&str>,
+        accepted_relays: Option<&str>,
+        failed_relays: Option<&str>,
+        message_phase: Option<&str>,
+        push_phase: Option<&str>,
+        message_event_id: Option<&str>,
+        push_envelope: Option<&str>,
+        logical_id: Option<&str>,
+        fallback: Option<&watchdog_core::domain::AlertDraft>,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        SqliteStore::finish_with_fallback(
+            self,
+            id,
+            token,
+            state,
+            attempt_count,
+            next_attempt_at,
+            error,
+            accepted_relays,
+            failed_relays,
+            message_phase,
+            push_phase,
+            message_event_id,
+            push_envelope,
+            logical_id,
+            fallback,
+            now,
+        )
+    }
+    async fn retry_dead_letter(&self, id: &str, now: i64) -> Result<RetryMode, StoreError> {
         SqliteStore::retry_dead_letter(self, id, now)
     }
     async fn ack_incident(&self, id: &str, now: i64) -> Result<bool, StoreError> {
@@ -1510,6 +2058,99 @@ impl OperationalStore for SqliteStore {
     ) -> Result<(), StoreError> {
         SqliteStore::write_vendor(self, row, now)
     }
+    async fn commit_vendor_cycle(
+        &self,
+        monitor_id: &str,
+        version_generation: Option<i64>,
+        version: Option<&VersionRow>,
+        vendor_generation: i64,
+        vendor: &watchdog_core::status::VendorView,
+        alerts: &[watchdog_core::domain::AlertDraft],
+        now: i64,
+    ) -> Result<CommitOutcome, StoreError> {
+        SqliteStore::commit_vendor_cycle(
+            self,
+            monitor_id,
+            version_generation,
+            version,
+            vendor_generation,
+            vendor,
+            alerts,
+            now,
+        )
+    }
+    async fn read_alert(&self, id: &str) -> Result<Option<OutboxRow>, StoreError> {
+        SqliteStore::read_outbox_row(self, id)
+    }
+    async fn acknowledge_alert(&self, id: &str, now: i64) -> Result<bool, StoreError> {
+        SqliteStore::acknowledge_alert(self, id, now)
+    }
+    async fn release_open_claims(&self, now: i64) -> Result<usize, StoreError> {
+        SqliteStore::release_open_claims(self, now)
+    }
+    async fn expedite_destination(&self, destination: &str, now: i64) -> Result<usize, StoreError> {
+        SqliteStore::expedite_destination(self, destination, now)
+    }
+    async fn record_onboarding(
+        &self,
+        project_id: &str,
+        idempotency_key: &str,
+        now: i64,
+    ) -> Result<Option<OnboardReceipt>, StoreError> {
+        SqliteStore::record_onboarding(self, project_id, idempotency_key, now)
+    }
+    async fn count_delivery_pressure(&self, now: i64) -> Result<(i64, i64), StoreError> {
+        SqliteStore::count_delivery_pressure(self, now)
+    }
+}
+
+fn logical_notification_id(dedupe_key: &str) -> String {
+    watchdog_core::settings::logical_notification_key(dedupe_key).to_string()
+}
+
+fn validate_open_schema(conn: &Connection) -> Result<(), StoreError> {
+    let mut missing = Vec::new();
+    for table in crate::schema::REQUIRED_TABLES {
+        let present: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !present {
+            missing.push((*table).to_string());
+        }
+    }
+    for (table, column) in crate::schema::REQUIRED_COLUMNS {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !names.iter().any(|name| name == column) {
+            missing.push(format!("{table}.{column}"));
+        }
+    }
+    for index in crate::schema::REQUIRED_INDEXES {
+        let present: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                params![index],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !present {
+            missing.push(format!("index:{index}"));
+        }
+    }
+    let mut stmt = conn.prepare("SELECT id FROM schema_migrations")?;
+    let applied = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::schema::schema_status(&applied, &missing)
+        .map_err(|error| StoreError::Database(error.to_string()))
 }
 
 fn is_constraint(error: &rusqlite::Error) -> bool {
@@ -1618,7 +2259,7 @@ mod tests {
                 10,
             )
             .unwrap();
-        let claimed = store.claim_outbox(10, 100, None, 4).unwrap();
+        let claimed = store.claim_outbox(10, 100, None, 4, "delivery", 0).unwrap();
         assert_eq!(claimed.len(), 1);
         let token = claimed[0].claim_token.clone().unwrap();
         assert!(!store.extend_claim("alt_1", "other", 200, 10).unwrap());
@@ -1658,32 +2299,38 @@ mod tests {
                 30,
             )
             .unwrap());
-        assert!(store
-            .store_heartbeat(
-                "sfs-worker",
-                "smartflowsocial",
-                50,
-                50,
-                "nonce-value-123456",
-                80,
-                Some("cursor"),
-                false,
-                Some(50)
-            )
-            .unwrap());
-        assert!(!store
-            .store_heartbeat(
-                "sfs-worker",
-                "smartflowsocial",
-                51,
-                51,
-                "nonce-value-123456",
-                80,
-                Some("cursor"),
-                false,
-                Some(51)
-            )
-            .unwrap());
+        assert_eq!(
+            store
+                .store_heartbeat(
+                    "sfs-worker",
+                    "smartflowsocial",
+                    50,
+                    50,
+                    "nonce-value-123456",
+                    80,
+                    Some("cursor"),
+                    false,
+                    Some(50)
+                )
+                .unwrap(),
+            HeartbeatWrite::Stored
+        );
+        assert_eq!(
+            store
+                .store_heartbeat(
+                    "sfs-worker",
+                    "smartflowsocial",
+                    51,
+                    51,
+                    "nonce-value-123456",
+                    80,
+                    Some("cursor"),
+                    false,
+                    Some(51)
+                )
+                .unwrap(),
+            HeartbeatWrite::Replay
+        );
     }
 
     fn migrated() -> Connection {
@@ -1805,5 +2452,108 @@ mod tests {
         assert_eq!(status, "open");
         assert_eq!(alerts, 0);
         assert_eq!(token, "winner");
+    }
+
+    #[test]
+    fn older_heartbeats_do_not_regress_progress_and_replays_stay_distinct() {
+        let store = SqliteStore::memory().unwrap();
+        let stored = store
+            .store_heartbeat(
+                "sfs-web",
+                "smartflowsocial",
+                2_000,
+                1_500,
+                "nonce-new",
+                9_000,
+                Some("token-b"),
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(stored, HeartbeatWrite::Stored);
+        let older = store
+            .store_heartbeat(
+                "sfs-web",
+                "smartflowsocial",
+                2_100,
+                1_000,
+                "nonce-old",
+                9_000,
+                Some("token-a"),
+                true,
+                None,
+            )
+            .unwrap();
+        assert_eq!(older, HeartbeatWrite::Stale);
+        let equal = store
+            .store_heartbeat(
+                "sfs-web",
+                "smartflowsocial",
+                2_200,
+                1_500,
+                "nonce-equal",
+                9_000,
+                Some("token-c"),
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(equal, HeartbeatWrite::Stale);
+        let replay = store
+            .store_heartbeat(
+                "sfs-web",
+                "smartflowsocial",
+                2_300,
+                1_800,
+                "nonce-new",
+                9_000,
+                Some("token-d"),
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(replay, HeartbeatWrite::Replay);
+        let token: String = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT progress_token FROM heartbeats WHERE monitor_id = 'sfs-web'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(token, "token-b");
+    }
+
+    #[test]
+    fn an_expired_claim_cannot_be_renewed_by_the_same_token() {
+        let store = SqliteStore::memory().unwrap();
+        store
+            .insert_alert(
+                &AlertDraft {
+                    id: "alt_claim".to_string(),
+                    alert_class: AlertClass::Outage,
+                    incident_id: None,
+                    monitor_id: "sfs-web".to_string(),
+                    project_id: "smartflowsocial".to_string(),
+                    dedupe_key: "claim".to_string(),
+                    destination: Destination::Nostr,
+                    severity: Severity::Critical,
+                    text: "down".to_string(),
+                },
+                1_000,
+            )
+            .unwrap();
+        let claimed = store
+            .claim_outbox(1_000, 1_500, Some("nostr"), 1, "delivery", 0)
+            .unwrap();
+        let token = claimed[0].claim_token.clone().unwrap();
+        assert!(!store
+            .extend_claim("alt_claim", &token, 2_200, 2_000)
+            .unwrap());
+        assert!(matches!(
+            store.claim_ownership("alt_claim", &token, 2_000).unwrap(),
+            ClaimOwnership::Expired
+        ));
     }
 }

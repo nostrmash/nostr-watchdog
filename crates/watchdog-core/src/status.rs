@@ -79,6 +79,8 @@ pub struct VendorView {
     pub consecutive_failures: i64,
     pub releases_failures: i64,
     pub advisories_failures: i64,
+    /// Conditional-commit fence. Zero means the row has not been written.
+    pub generation: i64,
 }
 
 #[derive(Clone, Debug)]

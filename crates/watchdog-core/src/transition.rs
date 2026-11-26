@@ -82,6 +82,7 @@ pub fn transition(input: TransitionInput<'_>) -> TransitionResult {
             last_reminder_at: None,
             silenced_until: None,
             acked_at: None,
+            decision_generation: 0,
         });
         notices.push(notice(
             NoticeEvent::Open,
@@ -103,10 +104,12 @@ pub fn transition(input: TransitionInput<'_>) -> TransitionResult {
             && input.now - open.last_reminder_at.unwrap_or(open.opened_at)
                 >= input.reminder_seconds.saturating_mul(1000)
         {
+            let decision_generation = open.decision_generation;
+            let reminder_count = open.reminder_count;
             open.reminder_count += 1;
             open.last_reminder_at = Some(input.now);
             let id = open.id.clone();
-            notices.push(notice(
+            let mut item = notice(
                 NoticeEvent::Remind,
                 id,
                 IncidentKind::Outage,
@@ -114,7 +117,10 @@ pub fn transition(input: TransitionInput<'_>) -> TransitionResult {
                 input.result.summary.clone(),
                 input.now,
                 input.result.status,
-            ));
+            );
+            item.decision_generation = decision_generation;
+            item.reminder_count = reminder_count;
+            notices.push(item);
         }
     }
     done(memory, notices)
@@ -145,6 +151,7 @@ fn apply_unknown(memory: &mut MonitorMemory, input: &TransitionInput<'_>) -> Tra
             last_reminder_at: None,
             silenced_until: None,
             acked_at: None,
+            decision_generation: 0,
         });
         let opened = notice(
             NoticeEvent::Open,
@@ -237,6 +244,8 @@ fn notice(
         reason,
         occurred_at,
         monitor_status,
+        decision_generation: 0,
+        reminder_count: 0,
     }
 }
 

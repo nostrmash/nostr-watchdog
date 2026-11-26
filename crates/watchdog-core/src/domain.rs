@@ -341,6 +341,9 @@ pub struct OpenIncident {
     pub last_reminder_at: Option<i64>,
     pub silenced_until: Option<i64>,
     pub acked_at: Option<i64>,
+    /// Advances on acknowledgement and silence. A reminder commit must match
+    /// the value observed before the probe.
+    pub decision_generation: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -400,6 +403,10 @@ pub struct Notice {
     pub reason: String,
     pub occurred_at: i64,
     pub monitor_status: MonitorStatus,
+    /// Incident decision generation observed before this notice was computed.
+    pub decision_generation: i64,
+    /// Reminder count observed before this notice incremented it.
+    pub reminder_count: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

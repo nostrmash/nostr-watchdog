@@ -8,8 +8,8 @@ use watchdog_core::domain::{AlertDraft, CheckResult, DeliveryState, MonitorMemor
 use watchdog_core::status::{StatusSnapshot, VendorView};
 
 use crate::model::{
-    CommitOutcome, FailedAlert, HeartbeatStored, LoadedMemory, MarmotProjectRow, OutboxRow,
-    StoreError, UpstreamRow, VersionRow,
+    ClaimOwnership, CommitOutcome, FailedAlert, HeartbeatStored, HeartbeatWrite, LoadedMemory,
+    MarmotProjectRow, OnboardReceipt, OutboxRow, RetryMode, StoreError, UpstreamRow, VersionRow,
 };
 
 pub trait OperationalStore {
@@ -33,9 +33,17 @@ pub trait OperationalStore {
         now: i64,
     ) -> Result<bool, StoreError>;
     async fn release_lease(&self, name: &str, owner: &str, now: i64) -> Result<(), StoreError>;
+    async fn renew_lease(
+        &self,
+        name: &str,
+        owner: &str,
+        until: i64,
+        now: i64,
+    ) -> Result<bool, StoreError>;
     async fn mark_run(
         &self,
         name: &str,
+        owner: &str,
         started_at: Option<i64>,
         finished_at: Option<i64>,
         error: Option<&str>,
@@ -55,7 +63,7 @@ pub trait OperationalStore {
         progress: Option<&str>,
         idle: bool,
         loop_at: Option<i64>,
-    ) -> Result<bool, StoreError>;
+    ) -> Result<HeartbeatWrite, StoreError>;
     async fn insert_alert(&self, alert: &AlertDraft, now: i64) -> Result<(), StoreError>;
     async fn insert_alert_if_allowed(
         &self,
@@ -72,6 +80,8 @@ pub trait OperationalStore {
         claim_until: i64,
         destination: Option<&str>,
         limit: i64,
+        kind: &str,
+        oldest: i64,
     ) -> Result<Vec<OutboxRow>, StoreError>;
     async fn extend_claim(
         &self,
@@ -80,6 +90,12 @@ pub trait OperationalStore {
         claim_until: i64,
         now: i64,
     ) -> Result<bool, StoreError>;
+    async fn claim_ownership(
+        &self,
+        id: &str,
+        token: &str,
+        now: i64,
+    ) -> Result<ClaimOwnership, StoreError>;
     async fn outbox_state(&self, id: &str) -> Result<Option<String>, StoreError>;
     async fn save_envelope(
         &self,
@@ -105,7 +121,25 @@ pub trait OperationalStore {
         push_envelope: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError>;
-    async fn retry_dead_letter(&self, id: &str, now: i64) -> Result<bool, StoreError>;
+    async fn finish_with_fallback(
+        &self,
+        id: &str,
+        token: &str,
+        state: DeliveryState,
+        attempt_count: i64,
+        next_attempt_at: i64,
+        error: Option<&str>,
+        accepted_relays: Option<&str>,
+        failed_relays: Option<&str>,
+        message_phase: Option<&str>,
+        push_phase: Option<&str>,
+        message_event_id: Option<&str>,
+        push_envelope: Option<&str>,
+        logical_id: Option<&str>,
+        fallback: Option<&AlertDraft>,
+        now: i64,
+    ) -> Result<bool, StoreError>;
+    async fn retry_dead_letter(&self, id: &str, now: i64) -> Result<RetryMode, StoreError>;
     async fn ack_incident(&self, id: &str, now: i64) -> Result<bool, StoreError>;
     async fn silence_incident(&self, id: &str, until: i64, now: i64) -> Result<bool, StoreError>;
     async fn open_incident_status(&self, id: &str) -> Result<Option<(String, String)>, StoreError>;
@@ -147,4 +181,25 @@ pub trait OperationalStore {
     async fn write_upstream(&self, key: &str, row: &UpstreamRow) -> Result<(), StoreError>;
     async fn read_vendor(&self, monitor_id: &str) -> Result<Option<VendorView>, StoreError>;
     async fn write_vendor(&self, row: &VendorView, now: i64) -> Result<(), StoreError>;
+    async fn commit_vendor_cycle(
+        &self,
+        monitor_id: &str,
+        version_generation: Option<i64>,
+        version: Option<&VersionRow>,
+        vendor_generation: i64,
+        vendor: &VendorView,
+        alerts: &[AlertDraft],
+        now: i64,
+    ) -> Result<CommitOutcome, StoreError>;
+    async fn read_alert(&self, id: &str) -> Result<Option<OutboxRow>, StoreError>;
+    async fn acknowledge_alert(&self, id: &str, now: i64) -> Result<bool, StoreError>;
+    async fn release_open_claims(&self, now: i64) -> Result<usize, StoreError>;
+    async fn expedite_destination(&self, destination: &str, now: i64) -> Result<usize, StoreError>;
+    async fn record_onboarding(
+        &self,
+        project_id: &str,
+        idempotency_key: &str,
+        now: i64,
+    ) -> Result<Option<OnboardReceipt>, StoreError>;
+    async fn count_delivery_pressure(&self, now: i64) -> Result<(i64, i64), StoreError>;
 }

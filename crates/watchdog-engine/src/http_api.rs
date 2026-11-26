@@ -13,7 +13,7 @@ use watchdog_core::status::{derive_operational_status, DestinationFlags};
 use watchdog_notify::marmot_blocker;
 use watchdog_store::OperationalStore;
 
-use crate::cycle::{dispatch_due, Notifier};
+use crate::cycle::{dispatch_transport, Notifier};
 
 #[derive(Clone, Debug)]
 pub enum ApiRequest {
@@ -54,6 +54,25 @@ pub enum ApiRequest {
         id: String,
         action: String,
         body: Vec<u8>,
+    },
+    Alert {
+        authorization: Option<String>,
+        id: String,
+    },
+    AcknowledgeAlert {
+        authorization: Option<String>,
+        id: String,
+    },
+    Onboard {
+        authorization: Option<String>,
+        body: Vec<u8>,
+    },
+    Ready {
+        marmot_supported: bool,
+    },
+    Rejected {
+        status: u16,
+        error: &'static str,
     },
     NotFound,
 }
@@ -171,6 +190,20 @@ pub async fn handle<S: OperationalStore, N: Notifier, C: Clock>(
             )
             .await
         }
+        ApiRequest::Alert { authorization, id } => {
+            alert_status(store, get, authorization.as_deref(), &id).await
+        }
+        ApiRequest::AcknowledgeAlert { authorization, id } => {
+            acknowledge_alert(store, get, authorization.as_deref(), &id, now).await
+        }
+        ApiRequest::Onboard {
+            authorization,
+            body,
+        } => onboard(store, get, authorization.as_deref(), &body, now).await,
+        ApiRequest::Ready { marmot_supported } => {
+            ready(store, settings, get, marmot_supported, now).await
+        }
+        ApiRequest::Rejected { status, error } => json_response(status, json!({"error": error})),
         ApiRequest::NotFound => json_response(404, json!({"error": "not_found"})),
     }
 }
@@ -294,8 +327,15 @@ async fn heartbeat<S: OperationalStore>(
         )
         .await
     {
-        Ok(true) => json_response(200, json!({"status": "ok"})),
-        Ok(false) => json_response(401, json!({"error": "replay"})),
+        Ok(watchdog_store::HeartbeatWrite::Stored) => {
+            json_response(200, json!({"status": "ok", "applied": true}))
+        }
+        Ok(watchdog_store::HeartbeatWrite::Replay) => {
+            json_response(401, json!({"error": "replay"}))
+        }
+        Ok(watchdog_store::HeartbeatWrite::Stale) => {
+            json_response(409, json!({"error": "stale_observation", "applied": false}))
+        }
         Err(_) => json_response(500, json!({"error": "internal_error"})),
     }
 }
@@ -367,7 +407,20 @@ async fn test_alert<S: OperationalStore, N: Notifier, C: Clock>(
         Err(_) => return json_response(500, json!({"error": "internal_error"})),
         Ok(true) => {}
     }
-    let _ = dispatch_due(store, settings, get, notifier, clock).await;
+    let destination = alert.destination.as_str();
+    let _ = dispatch_transport(
+        store,
+        settings,
+        get,
+        notifier,
+        clock,
+        destination,
+        1,
+        1,
+        now.saturating_add(4_000),
+        "delivery",
+    )
+    .await;
     let delivery = store
         .outbox_state(&alert.id)
         .await
@@ -414,9 +467,167 @@ async fn marmot_diagnostic<S: OperationalStore>(
             "peer": row.as_ref().and_then(|item| item.peer_pubkey.clone()),
             "lastSyncAt": row.as_ref().and_then(|item| item.last_sync_at).map(watchdog_core::format::format_unix_ms),
             "lastSyncError": row.as_ref().and_then(|item| item.last_sync_error.clone()),
+            "accountInitialized": if row.as_ref().and_then(|item| item.pubkey.as_ref()).is_some() { "present" } else { "unknown" },
+            "senderBound": if row.as_ref().and_then(|item| item.pubkey.as_ref()).is_some() { "present" } else { "unknown" },
+            "recipientBound": if row.as_ref().and_then(|item| item.peer_pubkey.as_ref()).is_some() { "present" } else { "unknown" },
+            "authorizedGroup": if row.as_ref().and_then(|item| item.group_id_hex.as_ref()).is_some() { "present" } else { "unknown" },
+            "canonicalConvergence": "unknown",
+            "lastSuccessfulSync": row.as_ref().and_then(|item| item.last_sync_at).filter(|_| row.as_ref().and_then(|item| item.last_sync_error.as_ref()).is_none()).map(watchdog_core::format::format_unix_ms),
+            "keyPackageReadiness": if row.as_ref().and_then(|item| item.key_package_published_at).is_some() { "published" } else { "unknown" },
+            "recipientTokenReadiness": "unknown",
+            "pendingMessageOperations": "unknown",
+            "pendingPushOperations": "unknown",
             "pushTokenAvailable": "unknown",
             "blocker": marmot_blocker(),
-            "note": "Relay acceptance is not phone delivery. This endpoint does not read MDK token storage, so push readiness is unknown rather than false. Push tokens are not returned.",
+            "dependency": "Marmot synchronization, key-package publication, and push-token readiness are supplied by the native helper or the Worker Durable Object. Missing values stay unknown.",
+            "note": "Relay acceptance is not phone delivery. This endpoint does not read MDK token storage or private keys.",
+        }),
+    )
+}
+
+async fn ready<S: OperationalStore>(
+    store: &S,
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    marmot_supported: bool,
+    now: i64,
+) -> ApiResponse {
+    let snapshot = store.snapshot().await.ok();
+    let age = snapshot.as_ref().and_then(|item| {
+        item.runs
+            .iter()
+            .find(|run| run.name == "checks")
+            .and_then(|run| run.finished_at.or(run.success_at))
+            .map(|finished| now.saturating_sub(finished))
+    });
+    let (pending, recent) = store.count_delivery_pressure(now).await.unwrap_or((0, 0));
+    let marmot_state = if !settings.marmot_enabled {
+        "disabled"
+    } else if !marmot_supported {
+        "unavailable"
+    } else {
+        "unknown"
+    };
+    let input = watchdog_core::readiness::ReadinessInput {
+        database_ok: snapshot.is_some(),
+        schema_ok: snapshot.is_some(),
+        configuration_ok: settings.enabled || !get("OPERATOR_TOKEN").is_empty(),
+        monitors_enabled: settings.enabled,
+        scheduler_age_ms: age,
+        scheduler_stale_after_ms: 180_000,
+        nip17_enabled: settings.nip17_enabled,
+        nip17_ready: !settings.bootstrap.is_empty() && !settings.emergency_disable_nip17,
+        telegram_enabled: !get("TELEGRAM_BOT_TOKEN").is_empty(),
+        telegram_ready: !settings.emergency_disable_telegram,
+        marmot_enabled: settings.marmot_enabled,
+        marmot_state,
+        push_tokens: if settings.marmot_enabled {
+            "unknown"
+        } else {
+            "disabled"
+        },
+        projects_ready: true,
+        pending_recovery: pending,
+        recent_retrying: recent,
+    };
+    let (ok, body) = watchdog_core::readiness::evaluate_readiness(&input);
+    json_response(if ok { 200 } else { 503 }, body)
+}
+
+async fn alert_status<S: OperationalStore>(
+    store: &S,
+    get: &impl Fn(&str) -> String,
+    authorization: Option<&str>,
+    id: &str,
+) -> ApiResponse {
+    if let Some(response) = authorize(get, authorization, false) {
+        return response;
+    }
+    let Ok(Some(row)) = store.read_alert(id).await else {
+        return json_response(404, json!({"error": "not_found"}));
+    };
+    json_response(
+        200,
+        json!({
+            "id": row.id,
+            "projectId": row.project_id,
+            "transport": row.destination,
+            "status": row.state,
+            "messageState": row.message_state,
+            "pushState": row.push_state,
+            "attempts": row.attempt_count,
+            "messageAttempts": row.message_attempts,
+            "reconciliationAttempts": row.push_attempts,
+            "updatedAt": row.updated_at,
+            "messageUpdatedAt": row.message_updated_at,
+            "pushUpdatedAt": row.push_updated_at,
+            "nextAttemptAt": row.next_attempt_at,
+            "error": row.last_error,
+            "terminalReason": row.terminal_reason,
+            "eventId": row.message_event_id,
+            "logicalId": row.logical_id,
+            "operatorAcknowledgedAt": row.operator_ack_at,
+        }),
+    )
+}
+
+async fn acknowledge_alert<S: OperationalStore>(
+    store: &S,
+    get: &impl Fn(&str) -> String,
+    authorization: Option<&str>,
+    id: &str,
+    now: i64,
+) -> ApiResponse {
+    if let Some(response) = authorize(get, authorization, false) {
+        return response;
+    }
+    match store.acknowledge_alert(id, now).await {
+        Ok(true) => json_response(200, json!({"id": id, "acknowledged": true})),
+        Ok(false) => json_response(404, json!({"error": "not_found"})),
+        Err(_) => json_response(500, json!({"error": "internal_error"})),
+    }
+}
+
+async fn onboard<S: OperationalStore>(
+    store: &S,
+    get: &impl Fn(&str) -> String,
+    authorization: Option<&str>,
+    body: &[u8],
+    now: i64,
+) -> ApiResponse {
+    if let Some(response) = authorize(get, authorization, false) {
+        return response;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return json_response(400, json!({"error": "bad_request"}));
+    };
+    let Some(project_id) = value.get("projectId").and_then(Value::as_str) else {
+        return json_response(400, json!({"error": "bad_request"}));
+    };
+    let Some(key) = value.get("idempotencyKey").and_then(Value::as_str) else {
+        return json_response(400, json!({"error": "bad_request"}));
+    };
+    if !known_project(project_id) || key.trim().is_empty() || key.len() > 128 {
+        return json_response(400, json!({"error": "bad_request"}));
+    }
+    let Ok(Some(row)) = store.record_onboarding(project_id, key, now).await else {
+        return json_response(
+            503,
+            json!({"error": "unavailable", "dependency": "watchdog-marmot helper onboard operation"}),
+        );
+    };
+    if row.idempotency_key != key {
+        return json_response(409, json!({"error": "idempotency_conflict"}));
+    }
+    json_response(
+        202,
+        json!({
+            "projectId": project_id,
+            "idempotencyKey": key,
+            "status": "unavailable",
+            "engineStatus": row.engine_status,
+            "dependency": "watchdog-marmot helper onboard operation",
+            "note": "The idempotency key is stored. Group creation is performed by the Marmot helper and is not invented here.",
         }),
     )
 }
@@ -454,8 +665,15 @@ async fn retry<S: OperationalStore>(
         return response;
     }
     match store.retry_dead_letter(id, now).await {
-        Ok(true) => json_response(200, json!({"id": id, "status": "queued"})),
-        Ok(false) => json_response(404, json!({"error": "not_found"})),
+        Ok(watchdog_store::RetryMode::SameOperation) => json_response(
+            200,
+            json!({"id": id, "status": "queued", "mode": "same_operation"}),
+        ),
+        Ok(watchdog_store::RetryMode::NewSubmission) => json_response(
+            200,
+            json!({"id": id, "status": "queued", "mode": "new_submission"}),
+        ),
+        Ok(watchdog_store::RetryMode::Missing) => json_response(404, json!({"error": "not_found"})),
         Err(_) => json_response(500, json!({"error": "internal_error"})),
     }
 }

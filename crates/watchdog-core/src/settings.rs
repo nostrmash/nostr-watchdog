@@ -32,6 +32,10 @@ pub struct Settings {
     pub marmot_enabled: bool,
     pub nip17_enabled: bool,
     pub sync_interval_seconds: i64,
+    /// Emergency stops. These override project and severity routing.
+    pub emergency_disable_nip17: bool,
+    pub emergency_disable_marmot: bool,
+    pub emergency_disable_telegram: bool,
 }
 
 pub fn load_settings(get: impl Fn(&str) -> String) -> Settings {
@@ -110,7 +114,17 @@ pub fn load_settings(get: impl Fn(&str) -> String) -> Settings {
         marmot_enabled: get("ENABLE_MARMOT") == "true",
         nip17_enabled: get("ENABLE_NIP17") != "false",
         sync_interval_seconds: clamp_i64(read_int(&get, "MARMOT_SYNC_SECONDS", 60), 30, 3600),
+        emergency_disable_nip17: truthy(&get("EMERGENCY_DISABLE_NIP17")),
+        emergency_disable_marmot: truthy(&get("EMERGENCY_DISABLE_MARMOT")),
+        emergency_disable_telegram: truthy(&get("EMERGENCY_DISABLE_TELEGRAM")),
     }
+}
+
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
 }
 
 fn read_int(get: &impl Fn(&str) -> String, key: &str, fallback: i64) -> i64 {
@@ -139,11 +153,12 @@ pub struct TransportRoute {
     pub telegram: bool,
 }
 
-/// Severity routing. Global flags are the default. `NOTIFY_<PROJECT>_<TRANSPORT>`
-/// overrides one project. An empty override keeps the global rule. `false`
+/// Severity routing. Global flags are defaults. `NOTIFY_<PROJECT>_<TRANSPORT>`
+/// overrides one project. An empty override keeps the global default. `false`
 /// disables that transport. `true` allows every severity. A comma-separated
-/// list allows only those severities. Queued alerts keep the destination they
-/// were created with; changing configuration does not rewrite the outbox.
+/// list allows only those severities. `EMERGENCY_DISABLE_*` stops a transport
+/// even when a project override asks for it. Queued rows are finalized on the
+/// next dispatch instead of being retried forever.
 /// Configuration names read by the engine, the catalog, and the runtimes.
 /// Both the Worker and the native process load this list. Production names
 /// stay as they are on the TypeScript Worker. The two historical Worker typos
@@ -174,6 +189,9 @@ pub const CONFIG_KEYS: &[&str] = &[
     "RUNBOOK_BASE_URL",
     "ENVIRONMENT",
     "MARMOT_SYNC_SECONDS",
+    "EMERGENCY_DISABLE_NIP17",
+    "EMERGENCY_DISABLE_MARMOT",
+    "EMERGENCY_DISABLE_TELEGRAM",
     "PROJECT_RECIPIENTS",
     "ADMIN_NPUB",
     "SFS_BOT_NSEC",
@@ -317,6 +335,152 @@ fn transport_choice(
         "true" | "all" => true,
         list => list.split(',').any(|item| item.trim() == severity.as_str()),
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportAvailability {
+    Ready,
+    TemporarilyUnavailable,
+    NotConfigured,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuedTransport {
+    Deliver,
+    Suppress,
+    SuppressWithFallback,
+    Defer,
+}
+
+/// One policy for every queued notification. Test alerts never create a
+/// fallback incident or a second transport. Critical NIP-17 and Marmot rows
+/// create one Telegram fallback only in `nostr_fallback` mode.
+pub fn queued_transport(
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    project_id: &str,
+    destination: &str,
+    severity: crate::domain::Severity,
+    alert_class: &str,
+    availability: TransportAvailability,
+) -> QueuedTransport {
+    let emergency = match destination {
+        "nostr" => settings.emergency_disable_nip17,
+        "marmot" => settings.emergency_disable_marmot,
+        "telegram" => settings.emergency_disable_telegram,
+        _ => true,
+    };
+    if alert_class == "test" {
+        if emergency || explicitly_disabled(get, project_id, destination) {
+            return QueuedTransport::Suppress;
+        }
+        let configured = match destination {
+            "nostr" => settings.nip17_enabled,
+            "marmot" => settings.marmot_enabled,
+            "telegram" => availability != TransportAvailability::NotConfigured,
+            _ => false,
+        };
+        if !configured || availability == TransportAvailability::NotConfigured {
+            return QueuedTransport::Suppress;
+        }
+        if availability == TransportAvailability::TemporarilyUnavailable {
+            return QueuedTransport::Defer;
+        }
+        return QueuedTransport::Deliver;
+    }
+    if emergency || availability == TransportAvailability::NotConfigured {
+        return if fallback_wanted(
+            settings,
+            get,
+            project_id,
+            destination,
+            severity,
+            alert_class,
+        ) {
+            QueuedTransport::SuppressWithFallback
+        } else {
+            QueuedTransport::Suppress
+        };
+    }
+    let allowed = match destination {
+        "nostr" => route_for(settings, get, project_id, severity).nip17,
+        "marmot" => route_for(settings, get, project_id, severity).marmot,
+        "telegram" => route_for(settings, get, project_id, severity).telegram,
+        _ => false,
+    };
+    if !allowed {
+        return if fallback_wanted(
+            settings,
+            get,
+            project_id,
+            destination,
+            severity,
+            alert_class,
+        ) {
+            QueuedTransport::SuppressWithFallback
+        } else {
+            QueuedTransport::Suppress
+        };
+    }
+    if availability == TransportAvailability::TemporarilyUnavailable {
+        QueuedTransport::Defer
+    } else {
+        QueuedTransport::Deliver
+    }
+}
+
+fn explicitly_disabled(get: &impl Fn(&str) -> String, project_id: &str, destination: &str) -> bool {
+    let transport = match destination {
+        "nostr" => "NIP17",
+        "marmot" => "MARMOT",
+        "telegram" => "TELEGRAM",
+        _ => return true,
+    };
+    let project = project_id.to_ascii_uppercase().replace('-', "_");
+    matches!(
+        get(&format!("NOTIFY_{project}_{transport}"))
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "false" | "off" | "disabled"
+    )
+}
+
+fn fallback_wanted(
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    project_id: &str,
+    destination: &str,
+    severity: crate::domain::Severity,
+    alert_class: &str,
+) -> bool {
+    alert_class != "test"
+        && matches!(destination, "nostr" | "marmot")
+        && severity == crate::domain::Severity::Critical
+        && settings.telegram_mode == TelegramMode::NostrFallback
+        && !settings.emergency_disable_telegram
+        && route_for(settings, get, project_id, severity).telegram
+}
+
+pub fn fallback_required(
+    outcome_accepted: bool,
+    hold_attempt: bool,
+    message_state: Option<&str>,
+    push_state: Option<&str>,
+    destination: &str,
+    severity: crate::domain::Severity,
+) -> bool {
+    if destination == "telegram" || severity != crate::domain::Severity::Critical {
+        return false;
+    }
+    let pending = matches!(message_state, Some("accepted_pending"));
+    let push_unknown = destination == "marmot"
+        && matches!(
+            push_state,
+            None | Some("unknown") | Some("unobservable") | Some("pending") | Some("expired")
+        )
+        && matches!(message_state, Some("accepted" | "accepted_pending"));
+    !outcome_accepted || pending || (hold_attempt && pending) || push_unknown
 }
 
 #[cfg(test)]

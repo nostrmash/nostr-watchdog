@@ -16,6 +16,7 @@ pub mod heartbeat;
 pub mod http_judge;
 pub mod json_pointer;
 pub mod marmot_recovery;
+pub mod readiness;
 pub mod redact;
 pub mod security_feed;
 pub mod semver;

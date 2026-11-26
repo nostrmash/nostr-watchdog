@@ -1,5 +1,12 @@
 use crate::domain::{check_result, CheckResult, MonitorStatus};
 
+/// When two valid heartbeats report the same timestamp, the first committed
+/// row wins. The later arrival consumes its nonce and does not change stored
+/// progress, idle, or loop time. A strictly older `reported_at` is rejected
+/// the same way. A strictly newer `reported_at` replaces the row. Progress
+/// change time stays put when the progress token is unchanged and becomes the
+/// receive time when the token changes.
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeartbeatRow {
     pub received_at: i64,

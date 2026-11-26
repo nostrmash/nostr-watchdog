@@ -24,6 +24,34 @@ pub struct CommitOutcome {
     pub committed: bool,
 }
 
+/// Result of one heartbeat write. Database failures stay on [`StoreError`].
+/// Replay and a stale observation are successful classifications, not failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeartbeatWrite {
+    Stored,
+    Replay,
+    /// `reported_at` is older than, or equal to, the stored observation.
+    /// The nonce is consumed. Stored progress is unchanged.
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryMode {
+    Missing,
+    /// The prepared envelope is still stored. This is the same submission.
+    SameOperation,
+    /// No envelope exists, so a later delivery may build a new event.
+    NewSubmission,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimOwnership {
+    Active { until: i64 },
+    Expired,
+    Lost,
+    Missing,
+}
+
 #[derive(Clone, Debug)]
 pub struct FailedAlert {
     pub id: String,
@@ -58,6 +86,16 @@ pub struct OutboxRow {
     pub push_phase: Option<String>,
     pub push_envelope_json: Option<String>,
     pub message_event_id: Option<String>,
+    pub message_state: Option<String>,
+    pub push_state: Option<String>,
+    pub message_attempts: i64,
+    pub push_attempts: i64,
+    pub message_updated_at: Option<i64>,
+    pub push_updated_at: Option<i64>,
+    pub terminal_reason: Option<String>,
+    pub operator_ack_at: Option<i64>,
+    pub logical_id: Option<String>,
+    pub submission_generation: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +116,7 @@ pub struct VersionRow {
     pub advisory_fingerprint: Option<String>,
     pub notice_fingerprint: Option<String>,
     pub security_reminded_at: Option<i64>,
+    pub generation: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -99,4 +138,26 @@ pub struct MarmotProjectRow {
     pub last_sync_error: Option<String>,
     pub key_package_published_at: Option<i64>,
     pub engine_status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnboardReceipt {
+    pub engine_status: String,
+    pub idempotency_key: String,
+}
+
+/// Sanitized Marmot readiness projection. Missing values are unknown, not false.
+#[derive(Clone, Debug, Default)]
+pub struct MarmotDiagnostics {
+    pub project_id: String,
+    pub engine_status: Option<String>,
+    pub last_sync_at: Option<i64>,
+    pub last_sync_error: Option<String>,
+    pub onboard_idempotency_key: Option<String>,
+    pub onboard_requested_at: Option<i64>,
+    pub canonical_converged: Option<bool>,
+    pub key_package_ready: Option<bool>,
+    pub recipient_token_ready: Option<bool>,
+    pub pending_messages: i64,
+    pub pending_pushes: i64,
 }
