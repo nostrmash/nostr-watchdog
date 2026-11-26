@@ -128,7 +128,10 @@ pub fn reconcile_conversation(saved: Option<&str>, lookup: ConversationLookup) -
 pub enum ConversationRecord {
     Absent,
     /// A create was started. `empty_lookups` counts ready index misses.
-    Intending { empty_lookups: i64, age_ms: i64 },
+    Intending {
+        empty_lookups: i64,
+        age_ms: i64,
+    },
     Established,
 }
 
@@ -267,13 +270,14 @@ pub fn advance_phase(
     if attempts.started_at_ms == 0 {
         attempts.started_at_ms = now_ms;
     }
-    let settled = |push_phase: &'static str, preserve_message: bool, terminal: bool| PhaseDecision {
-        push_phase,
-        hold: false,
-        delay_ms: 0,
-        preserve_message,
-        terminal,
-    };
+    let settled =
+        |push_phase: &'static str, preserve_message: bool, terminal: bool| PhaseDecision {
+            push_phase,
+            hold: false,
+            delay_ms: 0,
+            preserve_message,
+            terminal,
+        };
     let hold = |push_phase: &'static str, attempt: i64| PhaseDecision {
         push_phase,
         hold: true,
@@ -581,7 +585,9 @@ mod tests {
             SendStep::ProjectUpstream
         );
         assert!(!dead_letter_may_resubmit(Some(StoredSend::Published)));
-        assert!(!dead_letter_may_resubmit(Some(StoredSend::CompletionUnknown)));
+        assert!(!dead_letter_may_resubmit(Some(
+            StoredSend::CompletionUnknown
+        )));
         assert!(dead_letter_may_resubmit(None));
     }
 
@@ -632,7 +638,10 @@ mod tests {
             ConversationStep::Create
         );
         assert_eq!(
-            reconcile_conversation_record(ConversationRecord::Established, ConversationLookup::None),
+            reconcile_conversation_record(
+                ConversationRecord::Established,
+                ConversationLookup::None
+            ),
             ConversationStep::UseSaved
         );
     }
@@ -643,18 +652,15 @@ mod tests {
             started_at_ms: 1_000,
             ..PhaseAttempts::default()
         };
-        let (attempts, pending) = advance_phase("accepted_pending", "not_attempted", started, 2_000);
+        let (attempts, pending) =
+            advance_phase("accepted_pending", "not_attempted", started, 2_000);
         assert!(pending.hold);
         assert!(pending.preserve_message);
         assert_eq!(attempts.message, 1);
         assert_eq!(attempts.unobservable, 0);
 
-        let (attempts, first) = advance_phase(
-            "relay_accepted",
-            "publication_attempted",
-            started,
-            2_000,
-        );
+        let (attempts, first) =
+            advance_phase("relay_accepted", "publication_attempted", started, 2_000);
         assert!(!first.hold);
         assert_eq!(first.push_phase, "unobservable");
         assert!(first.preserve_message);
@@ -688,10 +694,7 @@ mod tests {
             classify_push(true, 0),
             ("token_unavailable", "token_availability_only")
         );
-        assert_eq!(
-            classify_push(true, -1),
-            ("unknown", "token_lookup_failed")
-        );
+        assert_eq!(classify_push(true, -1), ("unknown", "token_lookup_failed"));
         assert_eq!(
             classify_push(true, 2),
             ("unobservable", "no_correlated_push_evidence")

@@ -251,14 +251,11 @@ pub async fn deliver_nip17<S: OperationalStore, R: RelayIo, C: Clock>(
         },
         accepted_relays: accepted,
         failed_relays: failed,
-        message_phase: Some(if published {
-            "message_accepted".to_string()
-        } else {
-            "relay_rejected".to_string()
-        }),
+        message_phase: published.then(|| "message_accepted".to_string()),
         push_phase: None,
         message_event_id: Some(event_id),
         push_envelope: None,
+        operation: None,
     }
 }
 
@@ -274,6 +271,7 @@ fn terminal(error: &str) -> DeliveryOutcome {
         push_phase: None,
         message_event_id: None,
         push_envelope: None,
+        operation: None,
     }
 }
 
@@ -289,6 +287,7 @@ fn retry(error: &str) -> DeliveryOutcome {
         push_phase: None,
         message_event_id: None,
         push_envelope: None,
+        operation: None,
     }
 }
 

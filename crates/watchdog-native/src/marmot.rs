@@ -473,7 +473,8 @@ fn onboard_request(
     if let Some(operation_id) = nonempty(&get("MARMOT_ONBOARD_OPERATION")) {
         return Some(OnboardRequest {
             operation_id,
-            replace: get("MARMOT_ONBOARD_REPLACE") == "true" || get("MARMOT_REONBOARD") == project_id,
+            replace: get("MARMOT_ONBOARD_REPLACE") == "true"
+                || get("MARMOT_REONBOARD") == project_id,
         });
     }
     if get("MARMOT_REONBOARD") == project_id {
@@ -641,7 +642,10 @@ fn outcome_from_send(sent: &Value, message_id: Option<String>) -> DeliveryOutcom
         .get("preserve_message")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let terminal = sent.get("terminal").and_then(Value::as_bool).unwrap_or(false);
+    let terminal = sent
+        .get("terminal")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let detail = sent.get("status_detail").and_then(Value::as_str);
     let accepted = message == "relay_accepted" && preserve && !hold;
     let error = if accepted {
@@ -680,6 +684,10 @@ fn outcome_from_send(sent: &Value, message_id: Option<String>) -> DeliveryOutcom
                 .map(str::to_string)
         }),
         push_envelope: None,
+        operation: Some(watchdog_core::delivery::operation_from_transport(
+            sent,
+            watchdog_core::delivery::TransportOrigin::NativeHelper,
+        )),
     }
 }
 
@@ -789,7 +797,7 @@ fn error_code(value: &Value) -> Option<&str> {
 }
 
 fn pending(error: &str) -> DeliveryOutcome {
-    pending_phase(error, "not_published", "not_attempted")
+    pending_phase(error, "not_submitted", "not_attempted")
 }
 
 fn pending_phase(error: &str, message: &str, push: &str) -> DeliveryOutcome {
@@ -804,6 +812,7 @@ fn pending_phase(error: &str, message: &str, push: &str) -> DeliveryOutcome {
         push_phase: Some(push.to_string()),
         message_event_id: None,
         push_envelope: None,
+        operation: None,
     }
 }
 
@@ -815,10 +824,11 @@ fn failed(error: &str) -> DeliveryOutcome {
         error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),
-        message_phase: Some("not_published".to_string()),
+        message_phase: Some("not_submitted".to_string()),
         push_phase: Some("not_attempted".to_string()),
         message_event_id: None,
         push_envelope: None,
+        operation: None,
     }
 }
 
@@ -922,12 +932,14 @@ mod tests {
         assert!(store
             .extend_claim("alt_claim", &token, now + 120_000, now)
             .expect("renew"));
-        assert!(store
-            .extend_claim("alt_claim", &token, now - 1, now)
-            .expect("expire"));
+        // Production hardening refuses a deadline that is not strictly in the
+        // future and inside five minutes. A rejected write leaves the live claim.
         assert!(!store
-            .extend_claim("alt_claim", &token, now + 60_000, now)
-            .expect("expired"));
+            .extend_claim("alt_claim", &token, now - 1, now)
+            .expect("past"));
+        assert!(store
+            .extend_claim("alt_claim", &token, now + 180_000, now)
+            .expect("still live"));
         assert!(!store
             .extend_claim("alt_claim", "different-token", now + 60_000, now)
             .expect("foreign"));

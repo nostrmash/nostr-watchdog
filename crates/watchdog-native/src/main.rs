@@ -858,6 +858,7 @@ async fn deliver_telegram(
             push_phase: None,
             message_event_id: None,
             push_envelope: None,
+            operation: None,
         }
     } else {
         retry_error("telegram_failed")
@@ -876,6 +877,7 @@ fn terminal(error: &str) -> DeliveryOutcome {
         push_phase: None,
         message_event_id: None,
         push_envelope: None,
+        operation: None,
     }
 }
 
@@ -923,6 +925,7 @@ fn retry_error(error: &str) -> DeliveryOutcome {
         push_phase: None,
         message_event_id: None,
         push_envelope: None,
+        operation: None,
     }
 }
 

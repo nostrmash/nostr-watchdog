@@ -1070,6 +1070,7 @@ mod tests {
             push_phase: None,
             message_event_id: None,
             push_envelope: None,
+            operation: None,
         }
     }
 

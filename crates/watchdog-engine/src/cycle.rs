@@ -35,6 +35,7 @@ pub struct DeliveryOutcome {
     pub push_phase: Option<String>,
     pub message_event_id: Option<String>,
     pub push_envelope: Option<String>,
+    pub operation: Option<watchdog_core::delivery::OperationResult>,
 }
 
 pub trait Notifier {
@@ -481,19 +482,53 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
             push_phase: None,
             message_event_id: None,
             push_envelope: None,
+            operation: None,
         },
     };
     let finished = clock.unix_ms();
-    let started_at = row.operation_started_at.unwrap_or(row.created_at);
+    let started_at = outcome
+        .operation
+        .as_ref()
+        .and_then(|operation| operation.started_at_ms)
+        .or(row.operation_started_at)
+        .unwrap_or(row.created_at);
+    let counters = outcome
+        .operation
+        .as_ref()
+        .map(|operation| operation.counters)
+        .unwrap_or_else(watchdog_core::delivery::AuthoritativeCounters::unknown);
+    let message_phase = outcome.operation.as_ref().and_then(|operation| {
+        operation
+            .message
+            .map(watchdog_core::delivery::MessageState::as_str)
+    });
+    let push_phase = outcome.operation.as_ref().and_then(|operation| {
+        operation
+            .push
+            .map(watchdog_core::delivery::PushState::as_str)
+    });
     let report = watchdog_core::delivery::interpret(watchdog_core::delivery::LifecycleInput {
         destination: &row.destination,
-        message_phase: outcome.message_phase.as_deref(),
-        push_phase: outcome.push_phase.as_deref(),
-        counters: watchdog_core::delivery::AuthoritativeCounters::unknown(),
+        message_phase: message_phase.or(outcome.message_phase.as_deref()),
+        push_phase: push_phase.or(outcome.push_phase.as_deref()),
+        counters,
         age_ms: finished.saturating_sub(started_at),
         hold: outcome.hold_attempt,
         terminal: outcome.terminal,
         accepted: outcome.accepted,
+        ordinary_attempts: row.attempt_count,
+        disposition: outcome
+            .operation
+            .as_ref()
+            .map(|operation| operation.disposition),
+        retry_after_ms: outcome
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.retry_after_ms),
+        permanent_push_uncertainty: outcome
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.permanent_push_uncertainty),
     });
     let reconciling = matches!(
         report.decision,
@@ -505,7 +540,8 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
         row.attempt_count.saturating_add(1)
     };
     let state = match report.decision {
-        watchdog_core::delivery::LifecycleDecision::Reconcile { .. } => DeliveryState::Retrying,
+        watchdog_core::delivery::LifecycleDecision::Reconcile { .. }
+        | watchdog_core::delivery::LifecycleDecision::Retry { .. } => DeliveryState::Retrying,
         watchdog_core::delivery::LifecycleDecision::Accept => DeliveryState::RelayAccepted,
         watchdog_core::delivery::LifecycleDecision::Fail => DeliveryState::Failed,
     };
@@ -521,7 +557,8 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
         outcome.error.clone()
     };
     let next_attempt = match report.decision {
-        watchdog_core::delivery::LifecycleDecision::Reconcile { retry_ms } => finished + retry_ms,
+        watchdog_core::delivery::LifecycleDecision::Reconcile { retry_ms }
+        | watchdog_core::delivery::LifecycleDecision::Retry { retry_ms } => finished + retry_ms,
         _ => finished,
     };
     let message_phase = if report.incompatible {
@@ -536,7 +573,12 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
     } else {
         report.push.map(watchdog_core::delivery::PushState::as_str)
     };
-    let needs_fallback = !reconciling
+    let still_open = matches!(
+        report.decision,
+        watchdog_core::delivery::LifecycleDecision::Reconcile { .. }
+            | watchdog_core::delivery::LifecycleDecision::Retry { .. }
+    );
+    let needs_fallback = !still_open
         && watchdog_core::settings::fallback_wanted(
             settings,
             get,

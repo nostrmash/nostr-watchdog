@@ -18,8 +18,8 @@ use watchdog_notify::{
 };
 use watchdog_store::{OperationalStore, OutboxRow};
 use worker::{
-    console_log, AbortController, D1Database, Delay, Env, Fetch, Headers, Method, Request,
-    RequestInit, RequestRedirect, Response, Result, ScheduledEvent, WebSocket,
+    console_log, AbortController, D1Database, Delay, Env, Fetch, Headers, Method, ObjectNamespace,
+    Request, RequestInit, RequestRedirect, Response, Result, ScheduledEvent, WebSocket,
 };
 
 use crate::d1_store::{self, D1Store};
@@ -50,10 +50,13 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
     let vars = read_config(&env);
     let settings = load_settings(|key| vars.get(key).cloned().unwrap_or_default());
     let store = D1Store::new(&db);
+    let marmot = env.durable_object("MARMOT_SENDER").ok();
+    let marmot_supported = marmot.is_some() && settings.marmot_enabled;
     let notifier = WorkerNotifier {
         db: env.d1("DB")?,
         vars: vars.clone(),
         timeout_ms: settings.timeout_ms.clamp(1_000, 15_000) as u64,
+        marmot,
     };
     let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
     if req.method() == Method::Post && path == "/v1/diagnostics/runtime-fence" {
@@ -73,7 +76,7 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
             &get,
             &notifier,
             ApiRequest::Ready {
-                marmot_supported: false,
+                marmot_supported,
                 startup_grace: false,
             },
             now_ms(),
@@ -111,6 +114,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
         db: env.d1("DB")?,
         vars: vars.clone(),
         timeout_ms: settings.timeout_ms.clamp(1_000, 15_000) as u64,
+        marmot: env.durable_object("MARMOT_SENDER").ok(),
     };
     let http = WorkerHttp;
     let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
@@ -222,6 +226,7 @@ struct WorkerNotifier {
     db: D1Database,
     vars: HashMap<String, String>,
     timeout_ms: u64,
+    marmot: Option<ObjectNamespace>,
 }
 
 impl Notifier for WorkerNotifier {
@@ -298,27 +303,125 @@ impl Notifier for WorkerNotifier {
                 push_phase: None,
                 message_event_id: None,
                 push_envelope: None,
+                operation: None,
             }
         } else {
             retry("telegram_failed")
         }
     }
 
-    async fn deliver_marmot(&self, _row: &OutboxRow, _claim: &str) -> DeliveryOutcome {
+    async fn deliver_marmot(&self, row: &OutboxRow, _claim: &str) -> DeliveryOutcome {
         let _ = self.db;
         let _ = MARMOT_ENGINE_STATUS;
-        DeliveryOutcome {
-            accepted: false,
-            terminal: false,
-            hold_attempt: false,
-            error: Some("marmot_engine_unavailable".to_string()),
-            accepted_relays: Vec::new(),
-            failed_relays: Vec::new(),
-            message_phase: None,
-            push_phase: Some("push_token_unavailable".to_string()),
-            message_event_id: None,
-            push_envelope: None,
+        let Some(namespace) = &self.marmot else {
+            return marmot_unavailable();
+        };
+        let Ok(id) = namespace.id_from_name(&row.project_id) else {
+            return marmot_unavailable();
+        };
+        let Ok(stub) = id.get_stub() else {
+            return marmot_hold("marmot_object_unavailable");
+        };
+        let headers = Headers::new();
+        if let Some(token) = self
+            .vars
+            .get("MARMOT_OPERATOR_TOKEN")
+            .filter(|token| !token.is_empty())
+        {
+            if headers
+                .set("authorization", &format!("Bearer {token}"))
+                .is_err()
+            {
+                return marmot_hold("marmot_object_unavailable");
+            }
         }
+        let _ = headers.set("content-type", "application/json");
+        let body = serde_json::json!({
+            "op": "send",
+            "operationId": row.id,
+            "projectId": row.project_id,
+            "text": row.payload_text,
+            "publish": true
+        })
+        .to_string();
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(wasm_bindgen::JsValue::from_str(&body)));
+        let Ok(request) = Request::new_with_init("https://marmot-sender.internal/marmot", &init)
+        else {
+            return marmot_hold("marmot_object_unavailable");
+        };
+        let Ok(mut response) = stub.fetch_with_request(request).await else {
+            return marmot_hold("marmot_object_unavailable");
+        };
+        let Ok(text) = response.text().await else {
+            return marmot_hold("marmot_response_invalid");
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            return marmot_hold("marmot_response_invalid");
+        };
+        cloudflare_outcome(&value)
+    }
+}
+
+fn marmot_unavailable() -> DeliveryOutcome {
+    DeliveryOutcome {
+        accepted: false,
+        terminal: true,
+        hold_attempt: false,
+        error: Some("marmot_engine_unavailable".to_string()),
+        accepted_relays: Vec::new(),
+        failed_relays: Vec::new(),
+        message_phase: None,
+        push_phase: None,
+        message_event_id: None,
+        push_envelope: None,
+        operation: None,
+    }
+}
+
+fn marmot_hold(error: &str) -> DeliveryOutcome {
+    DeliveryOutcome {
+        accepted: false,
+        terminal: false,
+        hold_attempt: true,
+        error: Some(error.to_string()),
+        accepted_relays: Vec::new(),
+        failed_relays: Vec::new(),
+        message_phase: Some("not_submitted".to_string()),
+        push_phase: Some("not_attempted".to_string()),
+        message_event_id: None,
+        push_envelope: None,
+        operation: None,
+    }
+}
+
+fn cloudflare_outcome(value: &Value) -> DeliveryOutcome {
+    let operation = watchdog_core::delivery::operation_from_transport(
+        value,
+        watchdog_core::delivery::TransportOrigin::CloudflareObject,
+    );
+    let accepted = operation.message == Some(watchdog_core::delivery::MessageState::RelayAccepted);
+    let settled = operation.disposition == watchdog_core::delivery::OperationDisposition::Settled;
+    DeliveryOutcome {
+        accepted,
+        terminal: settled && !accepted,
+        hold_attempt: !settled,
+        error: operation.error.clone(),
+        accepted_relays: Vec::new(),
+        failed_relays: Vec::new(),
+        message_phase: operation
+            .message
+            .map(watchdog_core::delivery::MessageState::as_str)
+            .map(str::to_string),
+        push_phase: operation
+            .push
+            .map(watchdog_core::delivery::PushState::as_str)
+            .map(str::to_string),
+        message_event_id: operation.message_event_id.clone(),
+        push_envelope: None,
+        operation: Some(operation),
     }
 }
 
@@ -940,6 +1043,7 @@ fn terminal(error: &str) -> DeliveryOutcome {
         push_phase: None,
         message_event_id: None,
         push_envelope: None,
+        operation: None,
     }
 }
 
@@ -955,5 +1059,6 @@ fn retry(error: &str) -> DeliveryOutcome {
         push_phase: None,
         message_event_id: None,
         push_envelope: None,
+        operation: None,
     }
 }

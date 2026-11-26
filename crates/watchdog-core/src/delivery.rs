@@ -121,6 +121,24 @@ impl EvidenceClass {
             Self::NotObserved => "not_observed",
         }
     }
+
+    /// Unknown evidence labels stay `not_observed`. They do not change the
+    /// message or push state.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "none" => Self::None,
+            "relay_acknowledgement" | "publication_recorded" | "stored_publication" => {
+                Self::RelayAcknowledgement
+            }
+            "helper_journal" => Self::HelperJournal,
+            "token_availability_only" | "token_lookup_failed" => Self::TokenAvailabilityOnly,
+            "publish_error_observed" => Self::PublishErrorObserved,
+            "mdk_discards_publish_result" | "no_correlated_push_evidence" => {
+                Self::MdkDiscardsPublishResult
+            }
+            _ => Self::NotObserved,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,9 +241,54 @@ impl AuthoritativeCounters {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleDecision {
-    Reconcile { retry_ms: i64 },
+    /// Marmot cryptographic poll. Does not consume an ordinary delivery attempt.
+    Reconcile {
+        retry_ms: i64,
+    },
+    /// NIP-17 or Telegram attempt. Consumes one of the eight ordinary attempts.
+    Retry {
+        retry_ms: i64,
+    },
     Accept,
     Fail,
+}
+
+/// The original TypeScript dispatcher failed a NIP-17 or Telegram row after
+/// eight attempts. Backoff is `min(1h, 30s * 2^(attempt-1))`.
+pub const ORDINARY_ATTEMPT_BUDGET: i64 = 8;
+
+pub fn ordinary_backoff_ms(attempt: i64) -> i64 {
+    let shift = attempt.saturating_sub(1).clamp(0, 16) as u32;
+    30_000_i64
+        .saturating_mul(1_i64.checked_shl(shift).unwrap_or(i64::MAX))
+        .min(3_600_000)
+}
+
+/// Sanitized projection copied from a native helper or Durable Object response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperationResult {
+    pub project_id: String,
+    pub operation_id: String,
+    pub message: Option<MessageState>,
+    pub message_event_id: Option<String>,
+    pub push: Option<PushState>,
+    pub push_event_id: Option<String>,
+    pub evidence: EvidenceClass,
+    pub error: Option<String>,
+    pub disposition: OperationDisposition,
+    /// Native MDK cannot correlate a push publication. Further polls will not
+    /// produce that evidence. A Cloudflare relay timeout leaves this false.
+    pub permanent_push_uncertainty: bool,
+    pub started_at_ms: Option<i64>,
+    pub updated_at_ms: Option<i64>,
+    pub retry_after_ms: Option<i64>,
+    pub counters: AuthoritativeCounters,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportOrigin {
+    NativeHelper,
+    CloudflareObject,
 }
 
 pub struct LifecycleInput<'a> {
@@ -237,6 +300,10 @@ pub struct LifecycleInput<'a> {
     pub hold: bool,
     pub terminal: bool,
     pub accepted: bool,
+    pub ordinary_attempts: i64,
+    pub disposition: Option<OperationDisposition>,
+    pub retry_after_ms: Option<i64>,
+    pub permanent_push_uncertainty: bool,
 }
 
 pub struct InterpretedTransport {
@@ -267,15 +334,7 @@ pub fn interpret(input: LifecycleInput<'_>) -> InterpretedTransport {
     }
     let message = input.message_phase.and_then(MessageState::parse);
     let push = input.push_phase.and_then(PushState::parse);
-    let decision = decide_lifecycle(
-        input.destination,
-        message,
-        push,
-        input.counters,
-        input.age_ms,
-        input.accepted,
-        input.terminal,
-    );
+    let decision = decide_lifecycle(&input, message, push);
     InterpretedTransport {
         message,
         push,
@@ -286,58 +345,73 @@ pub fn interpret(input: LifecycleInput<'_>) -> InterpretedTransport {
 }
 
 fn decide_lifecycle(
-    destination: &str,
+    input: &LifecycleInput<'_>,
     message: Option<MessageState>,
     push: Option<PushState>,
-    counters: AuthoritativeCounters,
-    age_ms: i64,
-    accepted: bool,
-    terminal: bool,
 ) -> LifecycleDecision {
     let retry = |attempt: i64| LifecycleDecision::Reconcile {
-        retry_ms: bounded_retry_ms(None, attempt).unwrap_or(15_000),
+        retry_ms: bounded_retry_ms(input.retry_after_ms, attempt).unwrap_or(15_000),
     };
-    if age_ms >= 86_400_000 {
+    if input.age_ms >= 86_400_000 {
         return if message == Some(MessageState::RelayAccepted) {
             LifecycleDecision::Accept
         } else {
             LifecycleDecision::Fail
         };
     }
-    if destination != "marmot" {
-        if accepted {
+    if input.destination != "marmot" {
+        if input.accepted {
             return LifecycleDecision::Accept;
         }
-        if terminal {
+        if input.terminal {
             return LifecycleDecision::Fail;
         }
-        return retry(0);
+        let next = input.ordinary_attempts.saturating_add(1);
+        if next >= ORDINARY_ATTEMPT_BUDGET {
+            return LifecycleDecision::Fail;
+        }
+        return LifecycleDecision::Retry {
+            retry_ms: ordinary_backoff_ms(next),
+        };
+    }
+    if input.disposition == Some(OperationDisposition::Settled) {
+        return if message == Some(MessageState::RelayAccepted) {
+            LifecycleDecision::Accept
+        } else {
+            LifecycleDecision::Fail
+        };
+    }
+    if input.permanent_push_uncertainty && message == Some(MessageState::RelayAccepted) {
+        return LifecycleDecision::Accept;
     }
     match message {
         Some(MessageState::Rejected) => return LifecycleDecision::Fail,
         Some(MessageState::CompletionUnknown) => {
-            let attempts = counters.ambiguous_reconciles;
-            if attempts.is_some_and(|count| count >= 4) || age_ms >= 900_000 {
+            let attempts = input.counters.ambiguous_reconciles;
+            if attempts.is_some_and(|count| count >= 4) || input.age_ms >= 900_000 {
                 return LifecycleDecision::Fail;
             }
             return retry(attempts.unwrap_or(0));
         }
         Some(MessageState::AcceptedPending) | Some(MessageState::Prepared) => {
-            let attempts = counters.message_reconciles.or(counters.message_submissions);
-            if attempts.is_some_and(|count| count >= 8) || age_ms >= 900_000 {
+            let attempts = input
+                .counters
+                .message_reconciles
+                .or(input.counters.message_submissions);
+            if attempts.is_some_and(|count| count >= 8) || input.age_ms >= 900_000 {
                 return LifecycleDecision::Fail;
             }
             return retry(attempts.unwrap_or(0));
         }
         Some(MessageState::RelayAccepted) => {}
         _ => {
-            if terminal {
+            if input.terminal {
                 return LifecycleDecision::Fail;
             }
-            if accepted {
+            if input.accepted {
                 return LifecycleDecision::Accept;
             }
-            return retry(counters.message_submissions.unwrap_or(0));
+            return retry(input.counters.message_submissions.unwrap_or(0));
         }
     }
     match push {
@@ -345,10 +419,23 @@ fn decide_lifecycle(
             LifecycleDecision::Accept
         }
         Some(PushState::NotRequired | PushState::RelayAccepted) => LifecycleDecision::Accept,
-        Some(PushState::Unobservable) => LifecycleDecision::Accept,
+        Some(PushState::Unobservable) if input.permanent_push_uncertainty => {
+            LifecycleDecision::Accept
+        }
+        Some(PushState::Unobservable) => {
+            let attempts = input
+                .counters
+                .push_reconciles
+                .or(input.counters.push_publications);
+            if attempts.is_some_and(|count| count >= 2) || input.age_ms >= 900_000 {
+                LifecycleDecision::Accept
+            } else {
+                retry(attempts.unwrap_or(0))
+            }
+        }
         Some(PushState::TokenUnavailable) => {
-            let waits = counters.token_waits;
-            if waits.is_some_and(|count| count >= 2) || age_ms >= 900_000 {
+            let waits = input.counters.token_waits;
+            if waits.is_some_and(|count| count >= 2) || input.age_ms >= 900_000 {
                 LifecycleDecision::Accept
             } else {
                 retry(waits.unwrap_or(0))
@@ -362,13 +449,155 @@ fn decide_lifecycle(
             | PushState::Unknown,
         )
         | None => {
-            let attempts = counters.push_publications.or(counters.push_reconciles);
-            if attempts.is_some_and(|count| count >= 2) || age_ms >= 900_000 {
+            let attempts = input
+                .counters
+                .push_publications
+                .or(input.counters.push_reconciles);
+            if attempts.is_some_and(|count| count >= 2) || input.age_ms >= 900_000 {
                 LifecycleDecision::Accept
             } else {
                 retry(attempts.unwrap_or(0))
             }
         }
+    }
+}
+
+fn json_i64(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        let item = value.get(*key)?;
+        if item.is_null() {
+            return None;
+        }
+        item.as_i64()
+            .or_else(|| item.as_u64().map(|number| number as i64))
+    })
+}
+
+fn json_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+}
+
+/// A helper delay is a small relative number. A Unix millisecond timestamp is
+/// not a delay and is ignored.
+fn relative_delay(value: &Value) -> Option<i64> {
+    let nested = value.get("operation").unwrap_or(&Value::Null);
+    for source in [value, nested] {
+        for key in [
+            "retry_after_ms",
+            "retryAfterMs",
+            "reconcileAfterMs",
+            "retryAtMs",
+        ] {
+            if let Some(millis) = json_i64(source, &[key]) {
+                if (1..=300_000).contains(&millis) {
+                    return Some(millis);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn disposition_of(value: &Value) -> OperationDisposition {
+    let nested = value.get("operation").unwrap_or(&Value::Null);
+    if value.get("settled").and_then(Value::as_bool) == Some(true) {
+        return OperationDisposition::Settled;
+    }
+    let label = json_str(value, &["disposition"]).or_else(|| json_str(nested, &["disposition"]));
+    match label {
+        Some("settled") => OperationDisposition::Settled,
+        Some("reconcile") => OperationDisposition::Reconcile,
+        _ if value.get("terminal").and_then(Value::as_bool) == Some(true)
+            && value.get("hold").and_then(Value::as_bool) != Some(true) =>
+        {
+            OperationDisposition::Settled
+        }
+        _ => OperationDisposition::Reconcile,
+    }
+}
+
+fn counters_from(value: &Value, origin: TransportOrigin) -> AuthoritativeCounters {
+    let nested = value.get("operation").unwrap_or(&Value::Null);
+    let pick = |top: &[&str], camel: &[&str]| {
+        json_i64(nested, camel).or_else(|| json_i64(value, top).or_else(|| json_i64(value, camel)))
+    };
+    match origin {
+        TransportOrigin::NativeHelper => AuthoritativeCounters {
+            message_submissions: pick(&["message_attempts"], &["messageAttempts"]),
+            message_publications: None,
+            message_reconciles: None,
+            ambiguous_reconciles: pick(&["unknown_attempts"], &["unknownAttempts"]),
+            token_waits: pick(&["token_wait_attempts"], &["tokenWaitAttempts"]),
+            push_publications: pick(&["push_attempts"], &["pushPublicationAttempts"]),
+            push_reconciles: pick(&["unobservable_attempts"], &["unobservableAttempts"]),
+        },
+        TransportOrigin::CloudflareObject => AuthoritativeCounters {
+            message_submissions: pick(&[], &["messageAttempts"]),
+            message_publications: None,
+            message_reconciles: None,
+            ambiguous_reconciles: None,
+            token_waits: None,
+            push_publications: pick(&[], &["pushAttempts"]),
+            push_reconciles: None,
+        },
+    }
+}
+
+/// One parser for both Marmot transports. Missing counters stay missing.
+/// Unknown message or push names stay unknown.
+pub fn operation_from_transport(value: &Value, origin: TransportOrigin) -> OperationResult {
+    let nested = value.get("operation").unwrap_or(&Value::Null);
+    let message_name = json_str(
+        value,
+        &[
+            "message_state",
+            "message_phase",
+            "messageState",
+            "messagePhase",
+        ],
+    )
+    .or_else(|| json_str(nested, &["messageState", "messagePhase"]));
+    let push_name = json_str(
+        value,
+        &["push_state", "push", "push_phase", "pushState", "pushPhase"],
+    )
+    .or_else(|| json_str(nested, &["pushState", "pushPhase"]));
+    let message = message_name.and_then(MessageState::parse);
+    let push = push_name.and_then(PushState::parse);
+    let disposition = disposition_of(value);
+    let evidence_name = json_str(value, &["push_evidence", "evidence"])
+        .or_else(|| json_str(nested, &["evidence"]))
+        .unwrap_or("not_observed");
+    OperationResult {
+        project_id: json_str(value, &["project", "projectId"])
+            .or_else(|| json_str(nested, &["projectId"]))
+            .unwrap_or_default()
+            .to_string(),
+        operation_id: json_str(value, &["operation_id", "operationId"])
+            .or_else(|| json_str(nested, &["operationId"]))
+            .unwrap_or_default()
+            .to_string(),
+        message,
+        message_event_id: json_str(value, &["message_event_id", "messageEventId"])
+            .or_else(|| json_str(nested, &["messageEventId"]))
+            .map(str::to_string),
+        push,
+        push_event_id: json_str(value, &["push_event_id", "pushEventId"])
+            .or_else(|| json_str(nested, &["pushEventId"]))
+            .map(str::to_string),
+        evidence: EvidenceClass::parse(evidence_name),
+        error: json_str(value, &["error", "push_error"]).map(str::to_string),
+        disposition,
+        permanent_push_uncertainty: origin == TransportOrigin::NativeHelper
+            && push == Some(PushState::Unobservable)
+            && disposition == OperationDisposition::Settled,
+        started_at_ms: json_i64(value, &["started_at_ms", "startedAtMs"])
+            .or_else(|| json_i64(nested, &["startedAtMs"])),
+        updated_at_ms: json_i64(value, &["updated_at_ms", "updatedAtMs"]),
+        retry_after_ms: relative_delay(value),
+        counters: counters_from(value, origin),
     }
 }
 
@@ -469,6 +698,10 @@ mod tests {
             hold: true,
             terminal: false,
             accepted: false,
+            ordinary_attempts: 0,
+            disposition: None,
+            retry_after_ms: None,
+            permanent_push_uncertainty: false,
         });
         assert!(!young.incompatible);
         assert!(matches!(
@@ -484,6 +717,10 @@ mod tests {
             hold: true,
             terminal: false,
             accepted: false,
+            ordinary_attempts: 0,
+            disposition: None,
+            retry_after_ms: None,
+            permanent_push_uncertainty: false,
         });
         assert_eq!(aged.decision, LifecycleDecision::Fail);
         let unknown = interpret(LifecycleInput {
@@ -495,6 +732,10 @@ mod tests {
             hold: false,
             terminal: true,
             accepted: false,
+            ordinary_attempts: 0,
+            disposition: None,
+            retry_after_ms: None,
+            permanent_push_uncertainty: false,
         });
         assert!(unknown.incompatible);
         assert!(unknown.message.is_none());
@@ -517,6 +758,10 @@ mod tests {
             hold: true,
             terminal: false,
             accepted: true,
+            ordinary_attempts: 0,
+            disposition: None,
+            retry_after_ms: Some(15_000),
+            permanent_push_uncertainty: false,
         });
         assert_eq!(waiting.message, Some(MessageState::RelayAccepted));
         assert_eq!(waiting.push, Some(PushState::TokenUnavailable));
@@ -533,6 +778,10 @@ mod tests {
             hold: false,
             terminal: true,
             accepted: true,
+            ordinary_attempts: 0,
+            disposition: None,
+            retry_after_ms: None,
+            permanent_push_uncertainty: false,
         });
         assert_eq!(rejected.decision, LifecycleDecision::Accept);
         assert_eq!(rejected.message, Some(MessageState::RelayAccepted));
@@ -549,5 +798,151 @@ mod tests {
             Some(PushState::RelayAccepted)
         );
         assert_eq!(PushState::parse("push_expired"), Some(PushState::Expired));
+    }
+
+    fn marmot<'a>(
+        message: &'a str,
+        push: &'a str,
+        counters: AuthoritativeCounters,
+        disposition: Option<OperationDisposition>,
+        permanent: bool,
+    ) -> LifecycleInput<'a> {
+        LifecycleInput {
+            destination: "marmot",
+            message_phase: Some(message),
+            push_phase: Some(push),
+            counters,
+            age_ms: 1_000,
+            hold: disposition == Some(OperationDisposition::Reconcile),
+            terminal: disposition == Some(OperationDisposition::Settled),
+            accepted: message == "relay_accepted",
+            ordinary_attempts: 0,
+            disposition,
+            retry_after_ms: Some(15_000),
+            permanent_push_uncertainty: permanent,
+        }
+    }
+
+    #[test]
+    fn native_permanent_uncertainty_settles_and_cloudflare_uncertainty_reconciles() {
+        let mut native_counters = AuthoritativeCounters::unknown();
+        native_counters.message_submissions = Some(1);
+        native_counters.push_publications = None;
+        let native = interpret(marmot(
+            "relay_accepted",
+            "unobservable",
+            native_counters,
+            Some(OperationDisposition::Settled),
+            true,
+        ));
+        assert_eq!(native.decision, LifecycleDecision::Accept);
+        assert_eq!(native.message, Some(MessageState::RelayAccepted));
+        assert!(native.counters.push_publications.is_none());
+
+        let mut cloud = AuthoritativeCounters::unknown();
+        cloud.message_submissions = Some(1);
+        cloud.push_publications = Some(1);
+        let temporary = interpret(marmot(
+            "relay_accepted",
+            "unobservable",
+            cloud,
+            Some(OperationDisposition::Reconcile),
+            false,
+        ));
+        assert!(matches!(
+            temporary.decision,
+            LifecycleDecision::Reconcile { retry_ms: 15_000 }
+        ));
+        assert_eq!(temporary.message, Some(MessageState::RelayAccepted));
+    }
+
+    #[test]
+    fn ordinary_delivery_stops_at_eight_attempts() {
+        let young = interpret(LifecycleInput {
+            destination: "nostr",
+            message_phase: None,
+            push_phase: None,
+            counters: AuthoritativeCounters::unknown(),
+            age_ms: 1_000,
+            hold: false,
+            terminal: false,
+            accepted: false,
+            ordinary_attempts: 0,
+            disposition: None,
+            retry_after_ms: None,
+            permanent_push_uncertainty: false,
+        });
+        assert_eq!(
+            young.decision,
+            LifecycleDecision::Retry { retry_ms: 30_000 }
+        );
+        let last = interpret(LifecycleInput {
+            destination: "telegram",
+            message_phase: None,
+            push_phase: None,
+            counters: AuthoritativeCounters::unknown(),
+            age_ms: 1_000,
+            hold: false,
+            terminal: false,
+            accepted: false,
+            ordinary_attempts: 7,
+            disposition: None,
+            retry_after_ms: None,
+            permanent_push_uncertainty: false,
+        });
+        assert_eq!(last.decision, LifecycleDecision::Fail);
+    }
+
+    #[test]
+    fn a_delay_is_not_read_as_a_unix_timestamp_and_missing_counters_stay_missing() {
+        let native = operation_from_transport(
+            &json!({
+                "operation_id": "alt_1",
+                "project": "smartflowsocial",
+                "message_state": "relay_accepted",
+                "message_event_id": "abc",
+                "push": "unobservable",
+                "push_attempts": null,
+                "message_attempts": 1,
+                "unknown_attempts": 0,
+                "settled": true,
+                "retryAtMs": 15_000,
+                "operation": {
+                    "retryAtMs": 1_700_000_000_000_i64,
+                    "pushPublicationAttempts": null
+                }
+            }),
+            TransportOrigin::NativeHelper,
+        );
+        assert_eq!(native.retry_after_ms, Some(15_000));
+        assert!(native.permanent_push_uncertainty);
+        assert_eq!(native.counters.message_submissions, Some(1));
+        assert!(native.counters.push_publications.is_none());
+        assert_eq!(native.disposition, OperationDisposition::Settled);
+
+        let cloud = operation_from_transport(
+            &json!({
+                "operationId": "alt_1",
+                "messagePhase": "relay_accepted",
+                "pushPhase": "unobservable",
+                "settled": false,
+                "reconcileAfterMs": 15_000,
+                "messageAttempts": 1,
+                "pushAttempts": 1
+            }),
+            TransportOrigin::CloudflareObject,
+        );
+        assert!(!cloud.permanent_push_uncertainty);
+        assert_eq!(cloud.disposition, OperationDisposition::Reconcile);
+        assert_eq!(cloud.counters.push_publications, Some(1));
+        assert!(cloud.counters.token_waits.is_none());
+        assert_eq!(
+            operation_from_transport(
+                &json!({"messagePhase": "not-a-state", "pushPhase": "rejected"}),
+                TransportOrigin::CloudflareObject,
+            )
+            .message,
+            None
+        );
     }
 }
