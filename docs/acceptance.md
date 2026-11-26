@@ -2,19 +2,25 @@
 
 This procedure is for a person with a test phone. It is not something CI can pass. Do not run it against the production sender keys or the operator's existing WhiteNoise account. Automated tests in this repository do not prove that an iPhone displayed a notification.
 
-Status: the native helper can prepare an official MDK message. A physical device test has not been performed. The helper binary was not rebuilt in this environment because `marmot-markdown` requires the Odin compiler `dev-2026-10` revision `84bc3fc`.
+Status: the helper has been built and has exchanged one encrypted alert with an official `MarmotApp` runtime on a loopback relay. A physical device test has not been performed. Do not mark that test passed from the fixture result.
 
 ## Build
 
-The helper is a second executable. It links official `marmot-app` at `ca52a04718628f08ed76b777df9c444594074182`. The watchdog operational database stays plaintext SQLite in a different process.
+The helper is a second executable with its own Cargo workspace. It links official `marmot-app` at `ca52a04718628f08ed76b777df9c444594074182`. The watchdog operational database stays plaintext SQLite in a different process. `marmot-markdown` is a hard dependency of `marmot-app`. Its build script requires Odin `dev-2026-10` revision `84bc3fc`.
 
 ```bash
-# Odin dev-2026-10, revision 84bc3fc, on PATH or in $ODIN
+export ODIN="$HOME/.local/odin-dev-2026-10/odin"
+"$ODIN" version
 cargo build --manifest-path crates/watchdog-marmot/Cargo.toml --release
 cargo build --release -p watchdog-native
 ```
 
-Expected: `target/release/watchdog-marmot` and `target/release/nostr-watchdog`.
+Expected binaries:
+
+- `crates/watchdog-marmot/target/release/watchdog-marmot`
+- `target/release/nostr-watchdog`
+
+The helper process uses an 8 MiB Tokio worker stack. MDK futures overflow the default 2 MiB worker stack.
 
 ## Identities
 
@@ -23,7 +29,7 @@ Use a new sender and a WhiteNoise account that is not a daily driver. Do not reu
 ```bash
 export MARMOT_ROOT="$PWD/data/marmot-test"
 export MARMOT_SOCKET="$MARMOT_ROOT/watchdog.sock"
-export MARMOT_HELPER="$PWD/target/release/watchdog-marmot"
+export MARMOT_HELPER="$PWD/crates/watchdog-marmot/target/release/watchdog-marmot"
 export ENABLE_MARMOT=true
 export ENABLE_NIP17=false
 export ALERTS_ENABLED=true
@@ -60,6 +66,8 @@ Expected queue state after dispatch is `relay_accepted` only when a relay accept
 ## Troubleshooting
 
 - `marmot_helper_unavailable`: the helper did not answer a ping. Check `MARMOT_HELPER`, `MARMOT_ROOT` mode `0700`, and that Odin was present at build time.
+- `marmot_helper_busy`: the helper process is alive and a command is in progress. That is not a dead process. Do not start a second helper against the same root.
+- `--allow-loopback` exists only for a loopback fixture relay. The watchdog does not pass it. WhiteNoise onboarding uses public `wss` relays.
 - `recipient_absent` or `sender_absent`: the group does not contain both configured accounts. Do not send.
 - `membership_rejected`: an account other than the sender and recipient is in the group.
 - `recipient_push_token_unavailable`: MDK has no active push-token record for a current member. The group message can still be accepted. Push was not attempted.

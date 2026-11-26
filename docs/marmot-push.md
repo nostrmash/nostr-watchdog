@@ -16,7 +16,7 @@ From that MDK tree at the pinned revision, the push path uses:
 - Encrypted token records of 1084 bytes over a 1024-byte plaintext.
 - HKDF salt `marmot-push-token-encryption` material as implemented in that file, not a scheme invented here.
 
-`watchdog-marmot` does not implement those events itself. `MarmotAppRuntime::send_message` is the official sender, and that function publishes the notification trigger after the application message. The helper reports `trigger_attempted` only when MDK's accept disposition is `published`. It does not report phone delivery. The Worker does not call this path. Neither process returns token bytes.
+`watchdog-marmot` does not implement those events itself. Chat alerts go through `MarmotAppRuntime::submit_text` with the alert id as the client token. The pinned runtime does not return a push-trigger publication result. After a message disposition of `published`, the helper reports `push_disposition_unknown` when the recipient has an active token, and `recipient_push_token_unavailable` when it does not. It does not report `trigger_attempted` or phone delivery. The Worker does not call this path. Neither process returns token bytes.
 
 ## Identity
 
@@ -24,8 +24,8 @@ Each project keeps its own sender. SmartFlowSocial uses `SFS_BOT_NSEC`. NostrMas
 
 ## Ordering
 
-The helper writes a started marker for the alert id before `send_message`. A later call with the same id returns the stored result, or `completion_unknown` if the process died after the marker. It does not ask MDK to encrypt that alert again. `published` is recorded as relay acceptance. `accepted_pending` and `completion_unknown` stay retryable at the outbox layer and still do not create a second ciphertext. None of these states means the phone displayed a notification.
+Before `submit_text`, the helper records the account, group, and payload hash. A later call with the same alert id reads `local_send_status` first. A stored `accepted_pending` result is not treated as final. `published` and `rejected` are the terminal dispositions. If MDK has no record after a submission was recorded, the helper reports `completion_unknown` and does not encrypt that alert again. None of these states means the phone displayed a notification.
 
 Group creation uses the official runtime, which publishes the creator's key package when account import asks for it. Before a send, the helper reads `group_members` and rejects the send when any member is not the local account or the configured recipient. Extra devices of an allowed account share that account id and stay allowed. An unexpected account fails closed.
 
-Welcome processing, epoch repair, and token gossip stay inside `marmot-app` catch-up. This branch has not observed those steps against a second client. `/v1/diagnostics/marmot?project=smartflowsocial` requires `OPERATOR_TOKEN`.
+Welcome processing stays inside `marmot-app` catch-up. On 2026-11-26 a helper sender and a separate official `MarmotApp` runtime, both using loopback with `--allow-loopback`, exchanged one kind-9 alert through `scripts/fixture-relay.mjs`. The recipient decrypted the plaintext, and a helper restart reused the same message id. That fixture does not speak to WhiteNoise or to APNs. `/v1/diagnostics/marmot?project=smartflowsocial` requires `OPERATOR_TOKEN`.
