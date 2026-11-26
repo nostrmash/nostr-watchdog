@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use serde_json::Value;
 use watchdog_core::classify::{
     classify_alby, classify_btcpay, parse_alarms, parse_alby_info, parse_node_ready,
@@ -17,9 +16,11 @@ use watchdog_core::redact::safe_version;
 use watchdog_core::url_policy::{assert_probe_url, UrlPolicy};
 use watchdog_store::HeartbeatStored;
 
-#[async_trait]
-pub trait HttpClient: Send + Sync {
-    async fn send(&self, request: ProbeRequest) -> Result<ProbeResponse, String>;
+pub trait HttpClient {
+    fn send(
+        &self,
+        request: ProbeRequest,
+    ) -> impl std::future::Future<Output = Result<ProbeResponse, String>>;
 }
 
 #[derive(Clone, Debug)]
@@ -42,7 +43,7 @@ pub struct ProbeResponse {
     pub too_large: bool,
 }
 
-pub async fn probe_monitor(
+pub async fn probe_monitor<H: HttpClient>(
     monitor: &MonitorDefinition,
     get: &impl Fn(&str) -> String,
     private_network: bool,
@@ -51,7 +52,7 @@ pub async fn probe_monitor(
     stale_seconds: i64,
     progress_seconds: i64,
     heartbeat: Option<&HeartbeatStored>,
-    http: &dyn HttpClient,
+    http: &H,
 ) -> CheckResult {
     match monitor.kind {
         watchdog_core::CheckKind::HttpJson => {
@@ -113,13 +114,13 @@ pub async fn probe_monitor(
     }
 }
 
-async fn run_http(
+async fn run_http<H: HttpClient>(
     spec: &HttpCheckSpec,
     url: &str,
     private_network: bool,
     timeout_ms: i64,
     get: &impl Fn(&str) -> String,
-    http: &dyn HttpClient,
+    http: &H,
 ) -> CheckResult {
     if url.is_empty() {
         return misconfigured("The readiness URL is not configured.", None);
@@ -147,13 +148,13 @@ async fn run_http(
     fetch_checked(spec, target, private_network, timeout_ms, &bearer, http, 0).await
 }
 
-async fn fetch_checked(
+async fn fetch_checked<H: HttpClient>(
     spec: &HttpCheckSpec,
     target: url::Url,
     private_network: bool,
     timeout_ms: i64,
     bearer: &str,
-    http: &dyn HttpClient,
+    http: &H,
     hop: u8,
 ) -> CheckResult {
     let started = std::time::Instant::now();
@@ -261,7 +262,7 @@ async fn fetch_checked(
     )
 }
 
-async fn run_alby(
+async fn run_alby<H: HttpClient>(
     base_url: &str,
     routing_profile: &str,
     hub_name: &str,
@@ -269,7 +270,7 @@ async fn run_alby(
     token: &str,
     private_network: bool,
     timeout_ms: i64,
-    http: &dyn HttpClient,
+    http: &H,
 ) -> CheckResult {
     if base_url.is_empty() {
         return misconfigured("The Alby Hub base URL is not configured.", None);
@@ -434,12 +435,12 @@ async fn run_alby(
     classify_alby(&parsed_info, &alarms, node_ready, done)
 }
 
-async fn run_btcpay(
+async fn run_btcpay<H: HttpClient>(
     base_url: &str,
     api_key: &str,
     private_network: bool,
     timeout_ms: i64,
-    http: &dyn HttpClient,
+    http: &H,
 ) -> CheckResult {
     if base_url.is_empty() {
         return misconfigured("The BTCPay base URL is not configured.", None);
@@ -581,8 +582,8 @@ fn json_headers(extra: Option<(&str, String)>) -> HashMap<String, String> {
     headers
 }
 
-async fn vendor_get(
-    http: &dyn HttpClient,
+async fn vendor_get<H: HttpClient>(
+    http: &H,
     url: &str,
     headers: HashMap<String, String>,
     timeout_ms: i64,

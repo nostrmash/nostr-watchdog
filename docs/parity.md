@@ -12,7 +12,7 @@ Status values remain `healthy`, `degraded`, `down`, `unknown`, and `misconfigure
 | Outbox claim, extend, same envelope, stale token rejected | `src/cycles/dispatch.ts` | store + engine dispatch | store test | |
 | NIP-17 gift wrap and kind 10050 inbox selection | `src/alerts/nip17.ts`, `relay.ts` | `watchdog-notify` | gift-wrap round trip, inbox selection | Same `nostr` revision MDK pins (`4904ffb`). |
 | Telegram dual and nostr fallback | `src/alerts/telegram.ts` | engine cycle + native | not separately tested | Critical only. |
-| Marmot message and WhiteNoise push | not in the TypeScript app | metadata tables and an explicit unavailable error | diagnostic JSON only | Not a working transport. |
+| Marmot message and WhiteNoise push | not in the TypeScript app | native helper calls `marmot-app`; Worker still unavailable | helper process starts; no relay or phone test | Not accepted as delivery. |
 | HTTP JSON, redirects, size limit | `src/checks/http-json.ts` | engine probes | URL policy tests | Authenticated probes do not follow redirects. |
 | Signed heartbeat and nonce replay | `src/checks/heartbeat.ts` | core + store | store replay test | HMAC over `timestamp\nnonce\nMETHOD\npath\nsha256(body)`. |
 | Alby Hub and BTCPay classification | `src/checks/alby-hub.ts`, `btcpay.ts` | `watchdog-core` classify + probes | policy test for BTCPay 2.4.1 | |
@@ -21,17 +21,17 @@ Status values remain `healthy`, `degraded`, `down`, `unknown`, and `misconfigure
 | Operator auth | `src/http/app.ts` | engine `http_api` | not a route test | Missing token is 503. Bad token is 401. |
 | Vendor feeds, retention of previous findings | `src/cycles/updates.ts` | engine `updates` | missing version is not "secure" | Empty advisories are not a clean bill of health. |
 | Ack, silence, dead letter, test alert | `src/http/app.ts` | engine `http_api` | not a route test | Test alerts stay rate limited at 3 per project per hour. |
-| Cloudflare cron and D1 | `wrangler.jsonc` | staging config only | Worker wasm check | Production database is not referenced by the staging config. |
+| Cloudflare cron and D1 | `wrangler.jsonc` | Worker scheduled handler and `D1Store` | wasm compile only | Not run in `workerd`. Production database is not referenced. |
 | Relay fixture and local dev vars | `src/http/relay-fixture.ts` | not ported | | Use real `wss` relays on port 443, or skip NIP-17. |
 
 ## Deliberate differences
 
 - Marmot is a new destination. It is off unless `ENABLE_MARMOT=true`.
 - NIP-17 can be turned off with `ENABLE_NIP17=false`. The TypeScript Worker always attempted it when alerts were on.
-- The native process is the supported runtime. The Worker does not execute checks.
+- The native process is the runtime that has executed tests. The Worker calls the same engine and has not been executed in `workerd`.
 - Query strings still 404 on operator routes except `project` on `/v1/diagnostics/marmot`.
 - The TypeScript `/v1/diagnostics/relays` route is not ported. Inbox selection still happens inside NIP-17 delivery.
 
 ## Not silently removed
 
-Security-update monitoring, both projects, Blossom, Blastr, optional gateways, heartbeat signing, Telegram fallback, and the outbox fence are still in the Rust core. The gap is execution on Cloudflare and Marmot cryptography, both documented as blocked rather than replaced with a weaker protocol.
+Security-update monitoring, both projects, Blossom, Blastr, optional gateways, heartbeat signing, Telegram fallback, and the outbox fence are in the Rust core. Native Marmot uses official `marmot-app` in a side process. Cloudflare execution under `workerd`, Worker NIP-17 inbox discovery, and a physical WhiteNoise notification are still open.

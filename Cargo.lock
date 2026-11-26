@@ -2332,7 +2332,18 @@ dependencies = [
 name = "watchdog-worker"
 version = "1.0.0-dev"
 dependencies = [
+ "async-trait",
+ "futures-util",
+ "getrandom 0.4.3",
+ "js-sys",
+ "serde",
  "serde_json",
+ "uuid",
+ "wasm-bindgen",
+ "watchdog-core",
+ "watchdog-engine",
+ "watchdog-notify",
+ "watchdog-store",
  "worker",
 ]
 

@@ -62,11 +62,11 @@ pub struct ApiResponse {
 
 pub struct ApiError;
 
-pub async fn handle<S: OperationalStore>(
+pub async fn handle<S: OperationalStore, N: Notifier>(
     store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
-    notifier: &dyn Notifier,
+    notifier: &N,
     request: ApiRequest,
     now: i64,
 ) -> ApiResponse {
@@ -279,11 +279,11 @@ async fn heartbeat<S: OperationalStore>(
     }
 }
 
-async fn test_alert<S: OperationalStore>(
+async fn test_alert<S: OperationalStore, N: Notifier>(
     store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
-    notifier: &dyn Notifier,
+    notifier: &N,
     authorization: Option<&str>,
     body: &[u8],
     transport: Option<&str>,

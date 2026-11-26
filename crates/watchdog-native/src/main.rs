@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -26,11 +25,11 @@ use watchdog_engine::{
     ProbeRequest, ProbeResponse,
 };
 use watchdog_notify::{
-    build_gift_wrap, event_json, parse_event, recipient_pubkey, verify_inbox_event,
+    build_gift_wrap, event_json, parse_event, recipient_pubkey, select_inbox, verify_inbox_event,
 };
-use watchdog_notify::{select_inbox, MARMOT_ENGINE_STATUS};
 use watchdog_store::{OutboxRow, SqliteStore};
 
+mod marmot;
 mod net;
 mod relay;
 
@@ -42,7 +41,6 @@ struct AppState {
 
 struct ReqwestClient;
 
-#[async_trait]
 impl HttpClient for ReqwestClient {
     async fn send(&self, request: ProbeRequest) -> Result<ProbeResponse, String> {
         let url = reqwest::Url::parse(&request.url).map_err(|_| "probe_url_invalid".to_string())?;
@@ -124,7 +122,6 @@ struct NativeNotifier {
     timeout_ms: i64,
 }
 
-#[async_trait]
 impl Notifier for NativeNotifier {
     async fn deliver_nostr(&self, row: &OutboxRow, claim: &str) -> DeliveryOutcome {
         deliver_nostr(&self.store, &self.vars, row, claim, self.timeout_ms).await
@@ -132,32 +129,8 @@ impl Notifier for NativeNotifier {
     async fn deliver_telegram(&self, row: &OutboxRow) -> DeliveryOutcome {
         deliver_telegram(&self.vars, row, self.timeout_ms).await
     }
-    async fn deliver_marmot(&self, row: &OutboxRow, _claim: &str) -> DeliveryOutcome {
-        let _ = self.store.upsert_marmot_project(
-            &watchdog_store::MarmotProjectRow {
-                project_id: row.project_id.clone(),
-                pubkey: None,
-                conversation_id: None,
-                group_id_hex: None,
-                peer_pubkey: None,
-                last_sync_at: None,
-                last_sync_error: Some("marmot_engine_unavailable".to_string()),
-                key_package_published_at: None,
-                engine_status: MARMOT_ENGINE_STATUS.to_string(),
-            },
-            row.updated_at,
-        );
-        DeliveryOutcome {
-            accepted: false,
-            terminal: false,
-            error: Some("marmot_engine_unavailable".to_string()),
-            accepted_relays: Vec::new(),
-            failed_relays: Vec::new(),
-            message_phase: None,
-            push_phase: Some("push_token_unavailable".to_string()),
-            message_event_id: None,
-            push_envelope: None,
-        }
+    async fn deliver_marmot(&self, row: &OutboxRow, claim: &str) -> DeliveryOutcome {
+        marmot::deliver(&self.store, &self.vars, row, claim).await
     }
 }
 
@@ -202,6 +175,7 @@ async fn main() {
     let scheduler_stop = stop.clone();
     let scheduler_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        let mut last_marmot_sync = 0i64;
         loop {
             if scheduler_stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
@@ -238,6 +212,15 @@ async fn main() {
                 .and_then(|snapshot| snapshot.runs.into_iter().find(|run| run.name == "updates"))
                 .and_then(|run| run.started_at)
                 .is_none_or(|started| now - started >= 3_600_000);
+            if settings.marmot_enabled
+                && now.saturating_sub(last_marmot_sync)
+                    >= settings.sync_interval_seconds.saturating_mul(1000)
+            {
+                if let Err(error) = marmot::sync(&scheduler.vars).await {
+                    tracing::warn!(%error, "marmot sync failed");
+                }
+                last_marmot_sync = now;
+            }
             if updates_due {
                 if let Err(error) = run_update_cycle(
                     &scheduler.store,

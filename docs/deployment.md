@@ -76,7 +76,7 @@ Put the new database id into `wrangler.staging.toml`. Leave the production id al
 npx wrangler deploy --config wrangler.staging.toml
 ```
 
-That deploy is manual. GitHub Actions on this branch does not publish a Worker. The staging Worker does not send alerts. Do not bind production secrets to it.
+That deploy is manual. GitHub Actions on this branch does not publish a Worker. The staging Worker code can run checks when D1 and the monitor variables are bound. This branch has not deployed it and has not executed it in `workerd`. Do not bind production secrets to it.
 
 Building the Worker requires the `wasm32-unknown-unknown` target and `worker-build` 0.9. Wrangler is a Node tool used only at deploy time.
 
@@ -84,4 +84,4 @@ Building the Worker requires the `wasm32-unknown-unknown` target and `worker-bui
 
 No production traffic was measured. The native check loop is one process, one SQLite file, and one HTTP client. It does not keep relay sockets open between alerts. Vendor checks run hourly and store the GitHub JSON they parsed, bounded by the existing 7-day upstream retention.
 
-The Worker stub does not run probes, so it does not show the CPU cost of gift wrap or MLS on Workers. The TypeScript notes still apply to `main`: paid-plan cron CPU is required for gift-wrap work, and the free plan's 10 ms budget is not enough. MLS state would add Durable Object storage and a sync tick. That cost is not measured here because the engine is not linked.
+No Worker CPU sample exists. The crate type-checks for wasm and has not been timed inside `workerd`. The TypeScript notes still apply to `main`: paid-plan cron CPU is required for gift-wrap work, and the free plan's 10 ms budget is not enough. MLS on the Worker is not linked, so there is no Durable Object cost to report. The native helper debug binary was about 222 MB; that is an unoptimized debug build, not a release size.

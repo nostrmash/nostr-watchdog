@@ -21,3 +21,4 @@ watchdog-store = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+watchdog-store = { workspace = true, features = ["sqlite"] }

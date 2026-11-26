@@ -8,7 +8,8 @@ Checked against the public repositories on 2026-11-26.
 | Crate version at that rev | unpublished `0.20.0-dev` (`publish = false`). This is not crates.io `mdk-core` 0.8.0. |
 | OpenMLS | `https://github.com/openmls/openmls` rev `6100df3fb1d8c3eeab53e349fcbd621f98c44fe2`, via the MDK pin |
 | nostr | `https://github.com/nostrdevkit/nostr` rev `4904ffb85f60178375a1dda659a61793f36f03b8` (`nostr` 0.45.7) |
-| Linked into the watchdog | `nostr` only, for NIP-17. `cgka-engine` is compiled by `probes/mdk-engine` and is not a workspace dependency. |
+| Linked into `nostr-watchdog` | `nostr`, for NIP-17. Not MDK. |
+| Linked into `watchdog-marmot` | `marmot-app` and its MDK crates, in a separate Cargo workspace. |
 
 `mdk-core` 0.8.0 on crates.io is an older API. WhiteNoise current code follows the unpublished MDK tree. Nightly MarmotKit builds are deleted after about 30 days, so the git revision above is the pin, not a crates.io version.
 
@@ -20,11 +21,15 @@ Checked against the public repositories on 2026-11-26.
 
 ## Decision
 
-This repository does not vendor a fork of MDK and does not reimplement MLS, NIP-44, or the push token format. The native binary could later link `cgka-engine` plus `storage-sqlite`. That link was not finished: it pulls SQLCipher and OpenSSL into the watchdog process, and it still would not run on Workers. Until that adapter exists, Marmot delivery returns `marmot_engine_unavailable` and no ciphertext is published.
+This repository does not vendor a fork of MDK and does not reimplement MLS, NIP-44, or the push token format. Native Marmot is `watchdog-marmot`, which calls `MarmotAppRuntime` (`create_or_import_account`, `create_group`, `group_members`, `send_message`, `catch_up_accounts`). `send_message` is the official path that also attempts a notification trigger. This branch does not claim that a phone displayed one.
+
+The helper is not linked into `nostr-watchdog`. MDK's `rusqlite` 0.40 SQLCipher build and the operational `rusqlite` 0.37 build both set `links = "sqlite3"`. Cargo rejects that combination in one binary. Putting SQLCipher under the operational database would also stop it from opening the existing plaintext SQLite file. The helper is a local process started with `MARMOT_HELPER`. It is not a hosted gateway and it is not the Cloudflare design.
+
+Building the helper requires the Odin compiler `dev-2026-10` (`84bc3fc`) because `marmot-app` depends on `marmot-markdown`. That is a build tool, not a runtime service.
 
 ## Cloudflare
 
-`workers-rs` 0.9 is the SDK used by `watchdog-worker`. The Worker exposes `GET /healthz` and `GET /v1/diagnostics/marmot` and a scheduled handler that logs and returns. It does not open D1, does not construct a Durable Object, and does not send alerts.
+`workers-rs` 0.9 is the SDK used by `watchdog-worker`. The scheduled handler runs the shared check cycle, and the fetch handler serves the operator routes, when a D1 binding named `DB` is present. Marmot delivery in the Worker returns unavailable. No Durable Object is constructed. NIP-17 from the Worker goes to the first configured bootstrap relay and is not saved before publication.
 
 The production D1 database is not named in `wrangler.staging.toml`.
 
@@ -34,9 +39,9 @@ A Durable Object per project sender is still the right place for MLS state if an
 
 On 2026-11-26, with rustc 1.100.0 on `aarch64-apple-darwin`:
 
-- `cargo check --manifest-path probes/mdk-engine/Cargo.toml` type-checked `cgka-engine` for the host. `Engine<S>` requires a `StorageProvider`. The probe only reads `DEFAULT_MAX_PAST_EPOCHS`. It does not create a group.
-- `cargo check --manifest-path probes/mdk-engine/Cargo.toml --target wasm32-unknown-unknown` finished successfully. The resolved crates included `openmls` 0.9.0 from git rev `6100df3`, `cgka-engine` 0.20.0-dev, and `nostr` 0.45.7. That is a wasm compile of the engine, not a running MLS group, key package, or push notification.
-- `cargo check -p watchdog-worker --target wasm32-unknown-unknown` finished successfully. The Worker is the health entrypoint described above. It was not executed inside `workerd` in this pass, so fetch behaviour on the Cloudflare runtime is compiled, not observed.
+- `cargo check --manifest-path crates/watchdog-marmot/Cargo.toml` type-checked `marmot-app` 0.20.0-dev. `cargo build` produced `watchdog-marmot`. A local run answered `{"op":"ping"}` with `{"ok":true,"pong":true}`. That shows the process and the linked runtime start. It does not show a group, a relay publish, or a phone notification.
+- `cargo check -p watchdog-worker --target wasm32-unknown-unknown` finished successfully after `getrandom` `wasm_js` and `uuid` `js`. The Worker was not executed inside `workerd`.
+- `probes/mdk-engine` still only reads `DEFAULT_MAX_PAST_EPOCHS`. It is not the integration.
 
 `storage-sqlite` and `marmot-app` were not compiled for wasm. Their Cargo manifests depend on SQLCipher, OpenSSL, and Tokio, which is why they were left out of the probe.
 

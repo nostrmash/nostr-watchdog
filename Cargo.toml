@@ -8,7 +8,7 @@ members = [
     "crates/watchdog-native",
     "crates/watchdog-worker",
 ]
-exclude = ["probes/mdk-engine"]
+exclude = ["probes/mdk-engine", "crates/watchdog-marmot"]
 # The MDK compile probe lives outside the workspace so `cargo test --workspace`
 # does not download OpenMLS. See probes/mdk-engine.
 

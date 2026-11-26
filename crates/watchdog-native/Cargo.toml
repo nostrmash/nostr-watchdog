@@ -27,4 +27,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 watchdog-core = { workspace = true }
 watchdog-engine = { workspace = true }
 watchdog-notify = { workspace = true }
-watchdog-store = { workspace = true }
+watchdog-store = { workspace = true, features = ["sqlite"] }

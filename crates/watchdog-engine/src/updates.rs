@@ -30,12 +30,12 @@ struct Feed<T> {
     error_code: Option<&'static str>,
 }
 
-pub async fn run_update_cycle<S: OperationalStore>(
+pub async fn run_update_cycle<S: OperationalStore, H: HttpClient, N: Notifier>(
     store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
-    http: &dyn HttpClient,
-    notifier: &dyn Notifier,
+    http: &H,
+    notifier: &N,
     now: i64,
 ) -> Result<(), watchdog_store::StoreError> {
     if !settings.enabled {
@@ -132,11 +132,11 @@ struct Outcome {
     checked_at: i64,
 }
 
-async fn check_vendor<S: OperationalStore>(
+async fn check_vendor<S: OperationalStore, H: HttpClient>(
     store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
-    http: &dyn HttpClient,
+    http: &H,
     monitor: &MonitorDefinition,
     vendor: VendorId,
     now: i64,
@@ -531,9 +531,9 @@ fn vendor_error<T, U>(
     None
 }
 
-async fn load_feed<T, S: OperationalStore>(
+async fn load_feed<T, S: OperationalStore, H: HttpClient>(
     store: &S,
-    http: &dyn HttpClient,
+    http: &H,
     settings: &Settings,
     key: &str,
     owner: &str,
@@ -639,13 +639,13 @@ enum Github {
     Unavailable,
 }
 
-async fn request_github(
+async fn request_github<H: HttpClient>(
     api_base: &str,
     path: &str,
     token: &str,
     etag: Option<&str>,
     timeout_ms: i64,
-    http: &dyn HttpClient,
+    http: &H,
 ) -> Github {
     let base = if api_base.ends_with('/') {
         api_base.to_string()
@@ -915,7 +915,6 @@ fn security_draft(
 mod tests {
     use std::collections::HashMap;
 
-    use async_trait::async_trait;
     use watchdog_core::settings::load_settings;
     use watchdog_store::{OutboxRow, SqliteStore};
 
@@ -925,7 +924,6 @@ mod tests {
 
     struct Scripted;
 
-    #[async_trait]
     impl HttpClient for Scripted {
         async fn send(&self, request: ProbeRequest) -> Result<ProbeResponse, String> {
             let body = if request.url.contains("security-advisories") {
@@ -960,7 +958,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Notifier for Silent {
         async fn deliver_nostr(&self, _row: &OutboxRow, _claim: &str) -> DeliveryOutcome {
             pending()

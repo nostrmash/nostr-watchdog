@@ -16,18 +16,16 @@ From that MDK tree at the pinned revision, the push path uses:
 - Encrypted token records of 1084 bytes over a 1024-byte plaintext.
 - HKDF salt `marmot-push-token-encryption` material as implemented in that file, not a scheme invented here.
 
-This watchdog does not generate those events. Copying the constants into a new encryptor would fork the protocol. The native and Worker diagnostics say the engine is unavailable and they do not return token bytes.
+`watchdog-marmot` does not implement those events itself. `MarmotAppRuntime::send_message` is the official sender, and that function publishes the notification trigger after the application message. The helper reports `trigger_attempted` only when MDK's accept disposition is `published`. It does not report phone delivery. The Worker does not call this path. Neither process returns token bytes.
 
 ## Identity
 
 Each project keeps its own sender. SmartFlowSocial uses `SFS_BOT_NSEC`. NostrMash uses `NOSTRMASH_BOT_NSEC`. The operator's personal key is not a sender. Development must use separate test keys and a test WhiteNoise account. Do not point staging at the production recipient.
 
-## Ordering, once an adapter exists
+## Ordering
 
-The encrypted group message has to be accepted by at least one group relay before a push trigger is published. Protocol maintenance must not create a user-visible alert. A relay `OK` is `message_accepted` or `push_trigger_accepted`. Neither state means the phone displayed a notification.
+The helper writes a started marker for the alert id before `send_message`. A later call with the same id returns the stored result, or `completion_unknown` if the process died after the marker. It does not ask MDK to encrypt that alert again. `published` is recorded as relay acceptance. `accepted_pending` and `completion_unknown` stay retryable at the outbox layer and still do not create a second ciphertext. None of these states means the phone displayed a notification.
 
-Retries must resend the stored publication, not a newly encrypted one, after the corresponding MLS state has been committed. If that state cannot be recovered, the conversation has to be re-onboarded. Restoring an older MLS snapshot is not a supported rollback.
+Group creation uses the official runtime, which publishes the creator's key package when account import asks for it. Before a send, the helper reads `group_members` and rejects the send when any member is not the local account or the configured recipient. Extra devices of an allowed account share that account id and stay allowed. An unexpected account fails closed.
 
-## Onboarding that is not implemented yet
-
-A working adapter would need key-package publication, welcome processing, membership checks that reject unexpected participants, epoch updates, and push-token gossip with owner-signature checks. None of those steps run in this build. `/v1/diagnostics/marmot?project=smartflowsocial` reports that explicitly and requires `OPERATOR_TOKEN`.
+Welcome processing, epoch repair, and token gossip stay inside `marmot-app` catch-up. This branch has not observed those steps against a second client. `/v1/diagnostics/marmot?project=smartflowsocial` requires `OPERATOR_TOKEN`.

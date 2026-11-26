@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use async_trait::async_trait;
 use futures_util::future::join_all;
 use uuid::Uuid;
 use watchdog_core::catalog::{project_by_id, telegram_chat, PROJECTS};
@@ -29,19 +28,29 @@ pub struct DeliveryOutcome {
     pub push_envelope: Option<String>,
 }
 
-#[async_trait]
-pub trait Notifier: Send + Sync {
-    async fn deliver_nostr(&self, row: &OutboxRow, claim: &str) -> DeliveryOutcome;
-    async fn deliver_telegram(&self, row: &OutboxRow) -> DeliveryOutcome;
-    async fn deliver_marmot(&self, row: &OutboxRow, claim: &str) -> DeliveryOutcome;
+pub trait Notifier {
+    fn deliver_nostr(
+        &self,
+        row: &OutboxRow,
+        claim: &str,
+    ) -> impl std::future::Future<Output = DeliveryOutcome>;
+    fn deliver_telegram(
+        &self,
+        row: &OutboxRow,
+    ) -> impl std::future::Future<Output = DeliveryOutcome>;
+    fn deliver_marmot(
+        &self,
+        row: &OutboxRow,
+        claim: &str,
+    ) -> impl std::future::Future<Output = DeliveryOutcome>;
 }
 
-pub async fn run_check_cycle<S: OperationalStore>(
+pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier>(
     store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
-    http: &dyn HttpClient,
-    notifier: &dyn Notifier,
+    http: &H,
+    notifier: &N,
     now: i64,
 ) -> Result<(), watchdog_store::StoreError> {
     if !settings.enabled {
@@ -117,11 +126,11 @@ pub async fn run_check_cycle<S: OperationalStore>(
     Ok(())
 }
 
-pub async fn dispatch_due<S: OperationalStore>(
+pub async fn dispatch_due<S: OperationalStore, N: Notifier>(
     store: &S,
     settings: &Settings,
     get: &impl Fn(&str) -> String,
-    notifier: &dyn Notifier,
+    notifier: &N,
     now: i64,
 ) -> Result<(), watchdog_store::StoreError> {
     let _ = now;

@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "watchdog-marmot"
+version = "1.0.0-dev"
+description = "Official MDK session for the native Nostr Watchdog."
+edition = "2021"
+license = "Unlicense"
+publish = false
+rust-version = "1.91"
+
+[[bin]]
+name = "watchdog-marmot"
+path = "src/main.rs"
+
+[dependencies]
+cgka-traits = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182" }
+hex = "0.4"
+marmot-app = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+zeroize = "1"

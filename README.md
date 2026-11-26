@@ -18,9 +18,9 @@ The native binary (`nostr-watchdog`) runs the shared monitoring core:
 - Hourly GitHub release and advisory checks for Alby Hub and BTCPay.
 - Operator routes for status, heartbeats, test alerts, failed outbox rows, and incident ack/silence.
 
-Marmot is the intended notification transport. It is not able to publish WhiteNoise-compatible messages from this build. The official Marmot session and push implementation depends on SQLCipher, OpenSSL, a filesystem, and Tokio. This repository does not substitute a private MLS or push implementation. A Marmot delivery is recorded as `marmot_engine_unavailable`. Relay acceptance is not phone delivery, including for NIP-17.
+Marmot delivery on the native process goes through `watchdog-marmot`, a separate executable that links official `marmot-app` at MDK `ca52a04`. It is a separate process because that crate's SQLCipher build and the operational SQLite database both export `links = "sqlite3"`, and Cargo can link only one of them. The helper is not used on Cloudflare. A relay acknowledgement from that helper is not phone delivery. No WhiteNoise device test has been run from this branch.
 
-The Cloudflare crate in this branch is a staging health entrypoint only. It does not run the monitoring engine and it does not use the production D1 database. See [docs/mdk-compatibility.md](docs/mdk-compatibility.md).
+The Cloudflare crate compiles the shared monitoring engine against a D1 store. `cargo check --target wasm32-unknown-unknown` succeeds. It has not been executed inside `workerd` in this pass, and its Marmot path still fails closed. It does not use the production D1 database. See [docs/mdk-compatibility.md](docs/mdk-compatibility.md).
 
 ## Requirements
 
@@ -47,9 +47,22 @@ Configuration is environment variables, with the same names as the TypeScript Wo
 | `DATABASE_PATH` | SQLite file. Default `data/watchdog.sqlite`. |
 | `LISTEN_ADDR` | Default `127.0.0.1:8787`. |
 | `WATCHDOG_CONFIG` | Optional TOML file whose `[vars]` table is loaded before the environment. Environment variables win. |
-| `ENABLE_MARMOT` | `true` queues Marmot alerts. Delivery still fails closed until an official engine adapter exists. |
+| `ENABLE_MARMOT` | `true` queues Marmot alerts. Delivery needs the helper below. |
 | `ENABLE_NIP17` | Set to `false` to stop NIP-17. Default is on. |
-| `MARMOT_SYNC_SECONDS` | Reserved sync interval, clamped to 30–3600. Default 60. The sync does not open an MLS session in this build. |
+| `MARMOT_ROOT` | Directory for the helper's SQLCipher state. Mode `0700`. |
+| `MARMOT_SOCKET` | Unix socket. Default `$MARMOT_ROOT/watchdog.sock`. |
+| `MARMOT_HELPER` | Path to `watchdog-marmot`. The native process spawns it when the socket is absent. |
+| `MARMOT_SYNC_SECONDS` | How often the native process asks the helper to catch up. Clamped to 30–3600. Default 60. |
+| `NOTIFY_<PROJECT>_<TRANSPORT>` | Optional per-project override. `false` disables that transport. `true` allows every severity. A comma list such as `warning,critical` filters. Empty inherits the global default. |
+
+Build the helper with the Odin compiler MDK pins (`dev-2026-10`, commit `84bc3fc`). The upstream installer is `scripts/install-odin.sh` in the MDK checkout:
+
+```bash
+export ODIN="$HOME/.local/share/mdk-odin/odin"
+cargo build --manifest-path crates/watchdog-marmot/Cargo.toml
+```
+
+`watchdog-marmot --root data/marmot --socket data/marmot/watchdog.sock --relay wss://relay.example` serves one JSON command per connection. The socket mode is `0600`. Commands are `import`, `create_group`, `members`, `send`, `sync`, and `ping`. `send` refuses a group whose members are not the sender plus the configured recipient, and it does not encrypt the same alert id twice.
 
 Every monitor stays off until its `ENABLE_*` flag is `true` and its URL or key is set. `OPERATOR_TOKEN` must be set before operator routes answer. A missing token is `503 not_configured`, not a successful anonymous read.
 
@@ -65,7 +78,9 @@ The Worker crate is excluded from host tests because its fetch handler is `wasm3
 
 `cargo check -p watchdog-worker --target wasm32-unknown-unknown`
 
-The MDK compile probe is outside the workspace so normal tests do not download OpenMLS:
+The MDK helper and the compile probe are outside the workspace. The helper needs `ODIN` pointing at `dev-2026-10`:
+
+`cargo check --manifest-path crates/watchdog-marmot/Cargo.toml`
 
 `cargo check --manifest-path probes/mdk-engine/Cargo.toml --target wasm32-unknown-unknown`
 
