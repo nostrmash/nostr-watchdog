@@ -91,6 +91,76 @@ pub fn reconcile_conversation(saved: Option<&str>, lookup: ConversationLookup) -
     }
 }
 
+/// How many times a nonterminal Marmot result may be reconciled before it
+/// becomes an explicit terminal outcome. This does not mean the message was
+/// unpublished, and it does not mean a phone displayed a notification.
+pub const RECONCILE_BUDGET: i64 = 8;
+
+pub fn reconcile_attempt(prior_attempts: i64) -> i64 {
+    prior_attempts.saturating_add(1)
+}
+
+pub fn reconcile_exhausted(hold: bool, attempt: i64) -> bool {
+    hold && attempt >= RECONCILE_BUDGET
+}
+
+/// Error code stored when reconciliation reaches [`RECONCILE_BUDGET`].
+pub fn exhausted_push_error(message_phase: Option<&str>, push_phase: Option<&str>) -> &'static str {
+    match message_phase {
+        Some("relay_accepted") => match push_phase {
+            Some("recipient_push_token_unavailable") => "recipient_push_token_unavailable",
+            _ => "push_unobservable",
+        },
+        Some("accepted_pending") => "marmot_publish_unconfirmed",
+        _ => "marmot_reconcile_exhausted",
+    }
+}
+
+/// Whether the operational cache may be used for this sender and recipient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityStep {
+    UseCached,
+    Import,
+    SenderMismatch,
+    RecipientMismatch,
+    /// A group id is saved without the recipient it was created for.
+    RecipientUnbound,
+}
+
+pub fn bind_identity(
+    cached_sender: Option<&str>,
+    expected_sender: Option<&str>,
+    cached_peer: Option<&str>,
+    cached_group: Option<&str>,
+    recipient: &str,
+    reonboard: bool,
+) -> IdentityStep {
+    if reonboard {
+        return IdentityStep::Import;
+    }
+    if let (Some(cached), Some(expected)) = (filled(cached_sender), filled(expected_sender)) {
+        if !cached.eq_ignore_ascii_case(expected) {
+            return IdentityStep::SenderMismatch;
+        }
+    }
+    if let Some(peer) = filled(cached_peer) {
+        if !peer.eq_ignore_ascii_case(recipient) {
+            return IdentityStep::RecipientMismatch;
+        }
+    } else if filled(cached_group).is_some() {
+        return IdentityStep::RecipientUnbound;
+    }
+    if filled(cached_sender).is_some() {
+        IdentityStep::UseCached
+    } else {
+        IdentityStep::Import
+    }
+}
+
+fn filled(value: Option<&str>) -> Option<&str> {
+    value.filter(|item| !item.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +222,80 @@ mod tests {
         assert_eq!(
             reconcile_conversation(None, ConversationLookup::NotReusable),
             ConversationStep::NotReusable
+        );
+    }
+
+    #[test]
+    fn reconciliation_stops_at_the_budget_with_an_explicit_push_outcome() {
+        assert!(!reconcile_exhausted(true, RECONCILE_BUDGET - 1));
+        assert!(reconcile_exhausted(true, RECONCILE_BUDGET));
+        assert!(!reconcile_exhausted(false, RECONCILE_BUDGET));
+        assert_eq!(
+            exhausted_push_error(Some("relay_accepted"), Some("push_disposition_unknown")),
+            "push_unobservable"
+        );
+        assert_eq!(
+            exhausted_push_error(
+                Some("relay_accepted"),
+                Some("recipient_push_token_unavailable")
+            ),
+            "recipient_push_token_unavailable"
+        );
+        assert_eq!(
+            exhausted_push_error(Some("accepted_pending"), None),
+            "marmot_publish_unconfirmed"
+        );
+    }
+
+    #[test]
+    fn cached_identities_fail_closed_until_explicit_reonboard() {
+        assert_eq!(
+            bind_identity(
+                Some("aa"),
+                Some("bb"),
+                Some("cc"),
+                Some("group"),
+                "cc",
+                false
+            ),
+            IdentityStep::SenderMismatch
+        );
+        assert_eq!(
+            bind_identity(
+                Some("aa"),
+                Some("aa"),
+                Some("cc"),
+                Some("group"),
+                "dd",
+                false
+            ),
+            IdentityStep::RecipientMismatch
+        );
+        assert_eq!(
+            bind_identity(Some("aa"), Some("aa"), None, Some("group"), "dd", false),
+            IdentityStep::RecipientUnbound
+        );
+        assert_eq!(
+            bind_identity(
+                Some("aa"),
+                Some("bb"),
+                Some("cc"),
+                Some("group"),
+                "dd",
+                true
+            ),
+            IdentityStep::Import
+        );
+        assert_eq!(
+            bind_identity(
+                Some("aa"),
+                Some("AA"),
+                Some("cc"),
+                Some("group"),
+                "cc",
+                false
+            ),
+            IdentityStep::UseCached
         );
     }
 }

@@ -414,9 +414,9 @@ async fn marmot_diagnostic<S: OperationalStore>(
             "peer": row.as_ref().and_then(|item| item.peer_pubkey.clone()),
             "lastSyncAt": row.as_ref().and_then(|item| item.last_sync_at).map(watchdog_core::format::format_unix_ms),
             "lastSyncError": row.as_ref().and_then(|item| item.last_sync_error.clone()),
-            "pushTokenAvailable": false,
+            "pushTokenAvailable": "unknown",
             "blocker": marmot_blocker(),
-            "note": "Relay acceptance is not phone delivery. Push tokens are not returned by this endpoint.",
+            "note": "Relay acceptance is not phone delivery. This endpoint does not read MDK token storage, so push readiness is unknown rather than false. Push tokens are not returned.",
         }),
     )
 }

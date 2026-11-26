@@ -12,7 +12,7 @@ Status values remain `healthy`, `degraded`, `down`, `unknown`, and `misconfigure
 | Outbox claim, extend, same envelope, stale token rejected | `src/cycles/dispatch.ts` | store + engine dispatch | store test | |
 | NIP-17 gift wrap and kind 10050 inbox selection | `src/alerts/nip17.ts`, `relay.ts` | `watchdog-notify` | gift-wrap round trip, inbox selection | Same `nostr` revision MDK pins (`4904ffb`). |
 | Telegram dual and nostr fallback | `src/alerts/telegram.ts` | engine cycle + native | not separately tested | Critical only. |
-| Marmot message and WhiteNoise push | not in the TypeScript app | native helper calls `marmot-app`; Worker still unavailable | fixture exchange with an official runtime; no phone test | Loopback relay only. Not accepted as phone delivery. |
+| Marmot message and WhiteNoise push | not in the TypeScript app | native helper calls `marmot-app`; Worker still unavailable | fixture exchange, gift wrap on the fixture, and one WhiteNoise-relay decrypt | Phone delivery and Worker MDK remain open. |
 | HTTP JSON, redirects, size limit | `src/checks/http-json.ts` | engine probes | URL policy tests | Authenticated probes do not follow redirects. |
 | Signed heartbeat and nonce replay | `src/checks/heartbeat.ts` | core + store | store replay test | HMAC over `timestamp\nnonce\nMETHOD\npath\nsha256(body)`. |
 | Alby Hub and BTCPay classification | `src/checks/alby-hub.ts`, `btcpay.ts` | `watchdog-core` classify + probes | policy test for BTCPay 2.4.1 | |

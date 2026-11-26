@@ -243,20 +243,29 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
                 },
             };
             let finished = clock.unix_ms();
-            let attempt = if outcome.hold_attempt {
-                row.attempt_count
-            } else {
-                row.attempt_count + 1
-            };
+            let attempt = watchdog_core::marmot_recovery::reconcile_attempt(row.attempt_count);
+            let exhausted =
+                watchdog_core::marmot_recovery::reconcile_exhausted(outcome.hold_attempt, attempt);
             let state = if outcome.accepted {
                 DeliveryState::RelayAccepted
-            } else if outcome.hold_attempt {
+            } else if outcome.hold_attempt && !exhausted {
                 DeliveryState::Retrying
             } else {
-                next_delivery_state(attempt, outcome.terminal)
+                next_delivery_state(attempt, outcome.terminal || exhausted)
             };
-            let next_attempt = if outcome.hold_attempt {
-                finished + 60_000
+            let error = if exhausted {
+                Some(
+                    watchdog_core::marmot_recovery::exhausted_push_error(
+                        outcome.message_phase.as_deref(),
+                        outcome.push_phase.as_deref(),
+                    )
+                    .to_string(),
+                )
+            } else {
+                outcome.error.clone()
+            };
+            let next_attempt = if outcome.hold_attempt && !exhausted {
+                finished + 60_000_i64.saturating_mul(attempt.min(15))
             } else {
                 finished + watchdog_core::backoff_ms(attempt)
             };
@@ -267,7 +276,7 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
                     state,
                     attempt,
                     next_attempt,
-                    outcome.error.as_deref(),
+                    error.as_deref(),
                     Some(
                         &serde_json::to_string(&outcome.accepted_relays)
                             .unwrap_or_else(|_| "[]".to_string()),

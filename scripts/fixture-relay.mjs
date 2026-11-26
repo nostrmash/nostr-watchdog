@@ -104,6 +104,29 @@ sockets.on("connection", (socket) => {
   });
 });
 
+server.on("request", (request, response) => {
+  if (request.url !== "/stats") {
+    response.statusCode = 404;
+    response.end();
+    return;
+  }
+  const counts = {};
+  const giftWraps = [];
+  for (const event of events.values()) {
+    const kind = String(event.kind);
+    counts[kind] = (counts[kind] || 0) + 1;
+    if (event.kind === 1059) {
+      const target = (event.tags || []).find((tag) => tag[0] === "p");
+      giftWraps.push({
+        idPrefix: String(event.id).slice(0, 12),
+        recipientPrefix: target ? String(target[1]).slice(0, 12) : "",
+      });
+    }
+  }
+  response.setHeader("content-type", "application/json");
+  response.end(JSON.stringify({ counts, giftWraps }));
+});
+
 server.listen(port, "127.0.0.1", () => {
   const bound = server.address();
   process.stdout.write(`ws://127.0.0.1:${bound.port}\n`);

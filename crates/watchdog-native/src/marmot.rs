@@ -14,9 +14,10 @@ use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use watchdog_core::catalog::{project_by_id, project_recipient};
+use watchdog_core::marmot_recovery::{bind_identity, IdentityStep};
 use watchdog_core::settings::load_settings;
 use watchdog_engine::DeliveryOutcome;
-use watchdog_notify::recipient_pubkey;
+use watchdog_notify::{public_key_hex, recipient_pubkey};
 use watchdog_store::{MarmotProjectRow, OutboxRow, SqliteStore};
 
 pub async fn deliver(
@@ -57,37 +58,93 @@ pub async fn deliver(
         return pending("marmot_helper_unavailable");
     }
     let known = store.marmot_project(&row.project_id).ok().flatten();
-    let account = if let Some(account) = known
-        .as_ref()
-        .and_then(|row| row.pubkey.clone())
-        .filter(|account| !account.is_empty())
-    {
-        account
+    let expected_sender = if nsec.is_empty() {
+        None
     } else {
-        if nsec.is_empty() {
-            return failed("sender_key_missing");
+        match public_key_hex(&nsec) {
+            Ok(account) => Some(account),
+            Err(_) => return failed("sender_key_invalid"),
         }
-        let relays = settings.bootstrap.clone();
-        let imported = match call(
+    };
+    let reonboard = get("MARMOT_REONBOARD") == project.id;
+    let cached_sender = known.as_ref().and_then(|item| item.pubkey.as_deref());
+    let cached_peer = known.as_ref().and_then(|item| item.peer_pubkey.as_deref());
+    let cached_group = known.as_ref().and_then(|item| item.group_id_hex.as_deref());
+    let account = match bind_identity(
+        cached_sender,
+        expected_sender.as_deref(),
+        cached_peer,
+        cached_group,
+        &recipient,
+        reonboard,
+    ) {
+        IdentityStep::SenderMismatch => return failed("sender_identity_mismatch"),
+        IdentityStep::RecipientMismatch => return failed("recipient_identity_mismatch"),
+        IdentityStep::RecipientUnbound => return failed("recipient_identity_unbound"),
+        IdentityStep::UseCached => cached_sender.unwrap_or_default().to_string(),
+        IdentityStep::Import => {
+            if nsec.is_empty() {
+                return failed("sender_key_missing");
+            }
+            let relays = settings.bootstrap.clone();
+            let imported = match call(
+                &socket,
+                json!({"op": "import", "nsec": nsec, "relays": relays}),
+                Duration::from_secs(60),
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => return pending(&error),
+            };
+            if imported.get("ok") != Some(&Value::Bool(true)) {
+                return outcome_from_error(&imported, false);
+            }
+            let Some(account) = imported.get("account").and_then(Value::as_str) else {
+                return pending("marmot_account_missing");
+            };
+            if let Some(expected) = &expected_sender {
+                if !account.eq_ignore_ascii_case(expected) {
+                    return failed("sender_identity_mismatch");
+                }
+            }
+            account.to_string()
+        }
+    };
+    let existing = if reonboard {
+        None
+    } else {
+        known.and_then(|row| row.group_id_hex)
+    };
+    let group = if let Some(group) = existing.filter(|group| !group.is_empty()) {
+        group
+    } else if reonboard {
+        let created = match call(
             &socket,
-            json!({"op": "import", "nsec": nsec, "relays": relays}),
-            Duration::from_secs(60),
+            json!({
+                "op": "reonboard",
+                "account": account,
+                "members": [recipient]
+            }),
+            Duration::from_secs(90),
         )
         .await
         {
             Ok(value) => value,
             Err(error) => return pending(&error),
         };
-        if imported.get("ok") != Some(&Value::Bool(true)) {
-            return outcome_from_error(&imported, false);
+        if created.get("ok") != Some(&Value::Bool(true)) {
+            remember(store, row, &account, &recipient, None, error_code(&created));
+            return outcome_from_error(&created, true);
         }
-        let Some(account) = imported.get("account").and_then(Value::as_str) else {
-            return pending("marmot_account_missing");
+        let Some(group) = created
+            .get("group")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return pending("marmot_group_missing");
         };
-        account.to_string()
-    };
-    let existing = known.and_then(|row| row.group_id_hex);
-    let group = if let Some(group) = existing.filter(|group| !group.is_empty()) {
+        remember(store, row, &account, &recipient, Some(&group), None);
         group
     } else {
         let created = match call(
@@ -106,7 +163,7 @@ pub async fn deliver(
             Err(error) => return pending(&error),
         };
         if created.get("ok") != Some(&Value::Bool(true)) {
-            remember(store, row, &account, None, error_code(&created));
+            remember(store, row, &account, &recipient, None, error_code(&created));
             return outcome_from_error(&created, true);
         }
         let Some(group) = created
@@ -116,7 +173,7 @@ pub async fn deliver(
         else {
             return pending("marmot_group_missing");
         };
-        remember(store, row, &account, Some(&group), None);
+        remember(store, row, &account, &recipient, Some(&group), None);
         group
     };
     let sent = match call(
@@ -137,7 +194,14 @@ pub async fn deliver(
         Err(error) => return pending(&error),
     };
     if sent.get("ok") != Some(&Value::Bool(true)) {
-        remember(store, row, &account, Some(&group), error_code(&sent));
+        remember(
+            store,
+            row,
+            &account,
+            &recipient,
+            Some(&group),
+            error_code(&sent),
+        );
         return outcome_from_error(&sent, true);
     }
     let disposition = sent
@@ -154,7 +218,7 @@ pub async fn deliver(
         .and_then(|ids| ids.first())
         .and_then(Value::as_str)
         .map(str::to_string);
-    remember(store, row, &account, Some(&group), None);
+    remember(store, row, &account, &recipient, Some(&group), None);
     match disposition {
         "rejected" => failed("marmot_send_rejected"),
         // A relay-accepted group message is not a phone notification. MDK does
@@ -399,6 +463,7 @@ fn remember(
     store: &SqliteStore,
     row: &OutboxRow,
     account: &str,
+    recipient: &str,
     group: Option<&str>,
     error: Option<&str>,
 ) {
@@ -408,7 +473,7 @@ fn remember(
             pubkey: Some(account.to_string()),
             conversation_id: group.map(str::to_string),
             group_id_hex: group.map(str::to_string),
-            peer_pubkey: None,
+            peer_pubkey: Some(recipient.to_string()),
             last_sync_at: None,
             last_sync_error: error.map(str::to_string),
             key_package_published_at: None,

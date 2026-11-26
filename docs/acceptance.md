@@ -2,7 +2,7 @@
 
 This procedure is for a person with a test phone. It is not something CI can pass. Do not run it against the production sender keys or the operator's existing WhiteNoise account. Automated tests in this repository do not prove that an iPhone displayed a notification.
 
-Status: the helper has been built and has exchanged one encrypted alert with an official `MarmotApp` runtime on a loopback relay. A physical device test has not been performed. Do not mark that test passed from the fixture result.
+Status: the helper has exchanged encrypted alerts with an official `MarmotApp` runtime on the loopback fixture and on `wss://relay.eu.whitenoise.chat` plus `wss://relay.us.whitenoise.chat`. The loopback run also observed a kind-1059 gift wrap addressed to a throwaway notification server. A physical device test has not been performed. Do not mark that test passed from either relay result.
 
 ## Build
 
@@ -26,7 +26,10 @@ The helper process uses an 8 MiB Tokio worker stack. MDK futures overflow the de
 
 Use a new sender and a WhiteNoise account that is not a daily driver. Do not reuse production `SFS_BOT_NSEC` or `NOSTRMASH_BOT_NSEC`.
 
+`scripts/whitenoise-acceptance.sh` checks the Odin binary, both executables, and `OPERATOR_TOKEN`, then prints this environment for an isolated directory. It does not send an alert.
+
 ```bash
+export OPERATOR_TOKEN="<fresh local secret>"
 export MARMOT_ROOT="$PWD/data/marmot-test"
 export MARMOT_SOCKET="$MARMOT_ROOT/watchdog.sock"
 export MARMOT_HELPER="$PWD/crates/watchdog-marmot/target/release/watchdog-marmot"
@@ -36,7 +39,7 @@ export ALERTS_ENABLED=true
 export WATCHDOG_ENABLED=true
 export SFS_BOT_NSEC="<test sender nsec>"
 export ADMIN_NPUB="<test recipient hex or npub>"
-export BOOTSTRAP_RELAYS="wss://relay.example"
+export BOOTSTRAP_RELAYS="wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat"
 mkdir -p "$MARMOT_ROOT"
 chmod 700 "$MARMOT_ROOT"
 ./target/release/nostr-watchdog
@@ -68,6 +71,8 @@ Expected queue state after dispatch is `relay_accepted` only when a relay accept
 - `marmot_helper_unavailable`: the helper did not answer a ping. Check `MARMOT_HELPER`, `MARMOT_ROOT` mode `0700`, and that Odin was present at build time.
 - `marmot_helper_busy`: the helper process is alive and a command is in progress. That is not a dead process. Do not start a second helper against the same root.
 - `--allow-loopback` exists only for a loopback fixture relay. The watchdog does not pass it. WhiteNoise onboarding uses public `wss` relays.
+- `sender_identity_mismatch`, `recipient_identity_mismatch`, or `recipient_identity_unbound`: the saved project row does not match the current keys. Set `MARMOT_REONBOARD` to the project id for one process start, then unset it. The helper will not create a replacement conversation on its own.
+- `push_unobservable` or `recipient_push_token_unavailable` after repeated retries: reconciliation stopped. The group message is not sent again. A phone notification was not confirmed.
 - `recipient_absent` or `sender_absent`: the group does not contain both configured accounts. Do not send.
 - `membership_rejected`: an account other than the sender and recipient is in the group.
 - `recipient_push_token_unavailable`: MDK has no active push-token record for a current member. The group message can still be accepted. Push was not attempted.

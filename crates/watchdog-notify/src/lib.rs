@@ -27,5 +27,5 @@ pub use nip17_flow::{
 pub const MARMOT_ENGINE_STATUS: &str = "native_mdk_not_linked";
 
 pub fn marmot_blocker() -> &'static str {
-    "Official Marmot messaging and push triggers live in marmot-app, which requires SQLCipher, OpenSSL, a filesystem, and Tokio. cgka-engine itself compiles, but its StorageProvider implementation in storage-sqlite does not build for wasm32-unknown-unknown. This build will not publish a homemade MLS ciphertext."
+    "Native delivery uses the watchdog-marmot helper. The Worker does not link marmot-app. The only MDK StorageProvider at this revision is storage-sqlite on rusqlite 0.40 with bundled-sqlcipher-vendored-openssl. Push-trigger publication inside submit_text is best-effort and its relay result is not returned, so a published message stays push_disposition_unknown until reconciliation reaches an explicit terminal state."
 }
