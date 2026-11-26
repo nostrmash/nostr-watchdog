@@ -63,6 +63,7 @@ jobs:
         with:
           toolchain: "1.100.0"
           targets: wasm32-unknown-unknown
+          components: llvm-tools
 
       - name: Check the staging Worker
         run: cargo check -p watchdog-worker --target wasm32-unknown-unknown
