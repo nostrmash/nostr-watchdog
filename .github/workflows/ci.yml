@@ -90,15 +90,18 @@ jobs:
             fi
             sleep 2
           done
-          curl -fsS http://127.0.0.1:8787/healthz | grep -F '"live":true'
+          curl -fsS http://127.0.0.1:8787/healthz | grep -F '"status":"ok"'
           docker exec watchdog test -x /usr/local/bin/nostr-watchdog
           docker exec watchdog test -x /usr/local/bin/watchdog-marmot
           docker exec watchdog test -d /data/marmot
-          docker exec -d watchdog /usr/local/bin/watchdog-marmot --root /data/marmot --socket /data/marmot/helper.sock
+          docker exec -d watchdog sh -c '/usr/local/bin/watchdog-marmot --root /data/marmot --socket /data/marmot/helper.sock >/data/marmot/helper.log 2>&1'
           sleep 2
-          docker exec watchdog test -S /data/marmot/helper.sock
+          if ! docker exec watchdog test -S /data/marmot/helper.sock; then
+            docker exec watchdog cat /data/marmot/helper.log || true
+            exit 1
+          fi
           docker restart watchdog
-          curl -fsS http://127.0.0.1:8787/healthz | grep -F '"live":true'
+          curl -fsS http://127.0.0.1:8787/healthz | grep -F '"status":"ok"'
           docker exec watchdog test -d /data/marmot
 
   workerd:
