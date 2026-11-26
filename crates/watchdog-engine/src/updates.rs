@@ -9,6 +9,7 @@ use regex::Regex;
 use serde_json::Value;
 use uuid::Uuid;
 use watchdog_core::catalog::{project_by_id, telegram_chat};
+use watchdog_core::clock::Clock;
 use watchdog_core::domain::{
     AlertClass, AlertDraft, Destination, MonitorDefinition, Severity, VendorId,
 };
@@ -17,7 +18,6 @@ use watchdog_core::security_feed::{
     assess_security, official_github_url, AdvisoryRef, SecurityStatus,
 };
 use watchdog_core::semver::{latest_stable, update_available, ReleaseRef};
-use watchdog_core::clock::Clock;
 use watchdog_core::settings::{route_for, Settings, TelegramMode};
 use watchdog_core::status::VendorView;
 use watchdog_store::{OperationalStore, UpstreamRow, VersionRow};
@@ -397,9 +397,18 @@ async fn record_vendor<S: OperationalStore>(
     );
     let partial = outcome.coverage == "partial" || outcome.coverage == "policy_only";
     if hard_failure && consecutive >= 3 {
-        let previous_success = previous.as_ref().and_then(|row| row.succeeded_at).unwrap_or(0);
-        for alert in integrity_alerts(settings, get, monitor, previous_success, consecutive, outcome)
-        {
+        let previous_success = previous
+            .as_ref()
+            .and_then(|row| row.succeeded_at)
+            .unwrap_or(0);
+        for alert in integrity_alerts(
+            settings,
+            get,
+            monitor,
+            previous_success,
+            consecutive,
+            outcome,
+        ) {
             store.insert_alert(&alert, outcome.checked_at).await?;
         }
     }
@@ -840,10 +849,24 @@ fn routed_drafts(
     let route = route_for(settings, get, monitor.project_id, severity);
     let mut drafts = Vec::new();
     if route.nip17 {
-        drafts.push(routed(monitor, severity, class, logical_key, Destination::Nostr, text));
+        drafts.push(routed(
+            monitor,
+            severity,
+            class,
+            logical_key,
+            Destination::Nostr,
+            text,
+        ));
     }
     if route.marmot {
-        drafts.push(routed(monitor, severity, class, logical_key, Destination::Marmot, text));
+        drafts.push(routed(
+            monitor,
+            severity,
+            class,
+            logical_key,
+            Destination::Marmot,
+            text,
+        ));
     }
     if route.telegram
         && settings.telegram_mode == TelegramMode::Dual
@@ -1017,6 +1040,7 @@ mod tests {
         DeliveryOutcome {
             accepted: false,
             terminal: false,
+            hold_attempt: false,
             error: Some("delivery_deferred".to_string()),
             accepted_relays: Vec::new(),
             failed_relays: Vec::new(),
@@ -1057,8 +1081,8 @@ mod tests {
             1_000,
             &watchdog_core::clock::ManualClock::new(1_000),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let version = store.read_version("sfs-btcpay").unwrap().unwrap();
         assert_eq!(version.security_status, "version_unavailable");
         assert_eq!(version.latest.as_deref(), Some("v2.4.2"));

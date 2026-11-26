@@ -67,10 +67,7 @@ mod tests {
     use super::*;
 
     fn all() -> Vec<String> {
-        MIGRATIONS
-            .iter()
-            .map(|(id, _)| (*id).to_string())
-            .collect()
+        MIGRATIONS.iter().map(|(id, _)| (*id).to_string()).collect()
     }
 
     #[test]

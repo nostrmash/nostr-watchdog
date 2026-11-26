@@ -22,15 +22,24 @@ pub struct InboxFrames {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelayControl {
-    Event { subscription: String, event_json: String },
-    Eose { subscription: String },
+    Event {
+        subscription: String,
+        event_json: String,
+    },
+    Eose {
+        subscription: String,
+    },
     Ok {
         event_id: String,
         accepted: bool,
     },
-    Closed { subscription: String },
+    Closed {
+        subscription: String,
+    },
     Notice,
-    Auth { challenge: String },
+    Auth {
+        challenge: String,
+    },
     Ignore,
 }
 
@@ -71,7 +80,10 @@ pub fn discovery_relays(bootstrap: &[String], remembered: &[String]) -> Vec<Stri
     let mut relays = Vec::new();
     for relay in bootstrap.iter().chain(remembered.iter()) {
         let normalized = relay.trim().trim_end_matches('/').to_string();
-        if normalized.is_empty() || relays.iter().any(|existing: &String| existing == &normalized)
+        if normalized.is_empty()
+            || relays
+                .iter()
+                .any(|existing: &String| existing == &normalized)
         {
             continue;
         }
@@ -83,7 +95,11 @@ pub fn discovery_relays(bootstrap: &[String], remembered: &[String]) -> Vec<Stri
     relays
 }
 
-pub fn fold_discovery(events: &[VerifiedInbox], completed: usize, failures: usize) -> DiscoveryFold {
+pub fn fold_discovery(
+    events: &[VerifiedInbox],
+    completed: usize,
+    failures: usize,
+) -> DiscoveryFold {
     let relays = select_inbox(events)
         .map(|event| event.relays)
         .unwrap_or_default();
@@ -118,18 +134,37 @@ pub fn parse_relay_frame(text: &str) -> RelayControl {
     let kind = items.first().and_then(Value::as_str).unwrap_or("");
     match kind {
         "EVENT" => RelayControl::Event {
-            subscription: items.get(1).and_then(Value::as_str).unwrap_or("").to_string(),
-            event_json: items.get(2).map(|event| event.to_string()).unwrap_or_default(),
+            subscription: items
+                .get(1)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            event_json: items
+                .get(2)
+                .map(|event| event.to_string())
+                .unwrap_or_default(),
         },
         "EOSE" => RelayControl::Eose {
-            subscription: items.get(1).and_then(Value::as_str).unwrap_or("").to_string(),
+            subscription: items
+                .get(1)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         },
         "OK" => RelayControl::Ok {
-            event_id: items.get(1).and_then(Value::as_str).unwrap_or("").to_string(),
+            event_id: items
+                .get(1)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             accepted: items.get(2).and_then(Value::as_bool).unwrap_or(false),
         },
         "CLOSED" => RelayControl::Closed {
-            subscription: items.get(1).and_then(Value::as_str).unwrap_or("").to_string(),
+            subscription: items
+                .get(1)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         },
         "NOTICE" => RelayControl::Notice,
         "AUTH" => {
@@ -178,7 +213,9 @@ mod tests {
             &["wss://inbox.example".to_string()],
         );
         assert_eq!(inbox, vec!["wss://inbox.example".to_string()]);
-        assert!(bootstrap.iter().any(|relay| relay == "wss://bootstrap.example"));
+        assert!(bootstrap
+            .iter()
+            .any(|relay| relay == "wss://bootstrap.example"));
         assert!(inbox.iter().all(|relay| relay != "wss://bootstrap.example"));
     }
 

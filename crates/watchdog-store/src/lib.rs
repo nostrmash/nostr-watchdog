@@ -11,10 +11,10 @@ mod schema;
 mod sqlite;
 
 pub use contract::OperationalStore;
-pub use schema::{schema_status, MIGRATIONS, SCHEMA_VERSION};
 pub use model::{
     CommitOutcome, FailedAlert, HeartbeatStored, LoadedMemory, MarmotProjectRow, OutboxRow,
     StoreError, UpstreamRow, VersionRow,
 };
+pub use schema::{schema_status, MIGRATIONS, SCHEMA_VERSION};
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;

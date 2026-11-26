@@ -1142,11 +1142,7 @@ pub async fn schema_ready(db: &D1Database) -> Result<(), StoreError> {
                 .await
                 .map_err(|_| StoreError::Database("schema_not_ready".to_string()))?;
             rows.into_iter()
-                .map(|row| {
-                    as_text(&row["name"])
-                        .trim_end_matches(".sql")
-                        .to_string()
-                })
+                .map(|row| as_text(&row["name"]).trim_end_matches(".sql").to_string())
                 .collect::<Vec<_>>()
         }
     };

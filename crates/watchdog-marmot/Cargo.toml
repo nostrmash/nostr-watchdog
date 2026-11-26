@@ -19,6 +19,11 @@ hex = "0.4"
 marmot-app = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 watchdog-core = { path = "../watchdog-core" }
 zeroize = "1"
+
+[dev-dependencies]
+hex = "0.4"
+nostr = { git = "https://github.com/nostrdevkit/nostr", rev = "4904ffb85f60178375a1dda659a61793f36f03b8" }

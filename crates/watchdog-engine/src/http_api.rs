@@ -133,7 +133,17 @@ pub async fn handle<S: OperationalStore, N: Notifier, C: Clock>(
         ApiRequest::Relays {
             authorization,
             project,
-        } => relays(store, settings, get, authorization.as_deref(), &project, now).await,
+        } => {
+            relays(
+                store,
+                settings,
+                get,
+                authorization.as_deref(),
+                &project,
+                now,
+            )
+            .await
+        }
         ApiRequest::MarmotDiagnostic {
             authorization,
             project,
@@ -597,7 +607,8 @@ async fn relays<S: OperationalStore>(
     if !known_project(project) {
         return json_response(400, json!({"error": "bad_request"}));
     }
-    let Some(raw) = project_recipient(&get("PROJECT_RECIPIENTS"), &get("ADMIN_NPUB"), project) else {
+    let Some(raw) = project_recipient(&get("PROJECT_RECIPIENTS"), &get("ADMIN_NPUB"), project)
+    else {
         return json_response(
             409,
             json!({"error": "recipient_missing", "inboxRelays": [], "cached": false}),

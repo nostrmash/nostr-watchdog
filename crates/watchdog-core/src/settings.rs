@@ -240,7 +240,9 @@ pub fn config_alias(key: &str) -> Option<&'static str> {
 /// Drop the transport suffix so two failed transports share one fallback key.
 pub fn logical_notification_key(dedupe_key: &str) -> &str {
     match dedupe_key.rsplit_once(':') {
-        Some((head, tail)) if matches!(tail, "nostr" | "marmot" | "telegram") && !head.is_empty() => {
+        Some((head, tail))
+            if matches!(tail, "nostr" | "marmot" | "telegram") && !head.is_empty() =>
+        {
             head
         }
         _ => dedupe_key,

@@ -8,12 +8,12 @@ use watchdog_core::catalog::{project_by_id, project_recipient};
 use watchdog_core::clock::Clock;
 use watchdog_core::settings::load_settings;
 use watchdog_core::url_policy::assert_wss_url;
+pub use watchdog_notify::InboxFrames;
 use watchdog_notify::{
     build_gift_wrap, definitive_negative, discovery_relays, event_json, fold_discovery,
     interpret_cache, parse_event, publication_relays, recipient_pubkey, verify_frames,
     CacheDecision,
 };
-pub use watchdog_notify::InboxFrames;
 use watchdog_store::{OperationalStore, OutboxRow};
 
 use crate::cycle::DeliveryOutcome;
@@ -65,15 +65,21 @@ pub async fn deliver_nip17<S: OperationalStore, R: RelayIo, C: Clock>(
     if nsec.is_empty() {
         return terminal("sender_key_missing");
     }
-    let Some(recipient_raw) = project_recipient(&get("PROJECT_RECIPIENTS"), &get("ADMIN_NPUB"), project.id)
+    let Some(recipient_raw) =
+        project_recipient(&get("PROJECT_RECIPIENTS"), &get("ADMIN_NPUB"), project.id)
     else {
         return terminal("recipient_missing");
     };
     let Ok(recipient) = recipient_pubkey(&recipient_raw) else {
         return terminal("recipient_invalid");
     };
-    let relays = match interpret_cache(store.relay_cache(&recipient, clock.unix_ms()).await.ok().flatten())
-    {
+    let relays = match interpret_cache(
+        store
+            .relay_cache(&recipient, clock.unix_ms())
+            .await
+            .ok()
+            .flatten(),
+    ) {
         CacheDecision::Negative => return terminal("recipient_inbox_missing"),
         CacheDecision::Fresh(relays) => relays,
         CacheDecision::Discover => {
@@ -169,10 +175,10 @@ pub async fn deliver_nip17<S: OperationalStore, R: RelayIo, C: Clock>(
     {
         return retry("claim_lost");
     }
-    let event_json = if let Some(stored) = row
-        .envelope_json
-        .clone()
-        .or(store.read_envelope(&row.id).await.ok().flatten())
+    let event_json = if let Some(stored) =
+        row.envelope_json
+            .clone()
+            .or(store.read_envelope(&row.id).await.ok().flatten())
     {
         stored
     } else {
@@ -231,6 +237,7 @@ pub async fn deliver_nip17<S: OperationalStore, R: RelayIo, C: Clock>(
     DeliveryOutcome {
         accepted: published,
         terminal: false,
+        hold_attempt: false,
         error: if !published {
             Some("relay_rejected".to_string())
         } else if failed.is_empty() {
@@ -255,6 +262,7 @@ fn terminal(error: &str) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
         terminal: true,
+        hold_attempt: false,
         error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),
@@ -269,6 +277,7 @@ fn retry(error: &str) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
         terminal: false,
+        hold_attempt: false,
         error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),
@@ -348,7 +357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_and_native_publish_only_to_the_recipient_inbox_and_reuse_the_event() {
+    async fn scripted_relay_publishes_only_to_the_advertised_inbox() {
         let store = SqliteStore::memory().unwrap();
         let recipient = Keys::generate();
         let sender = Keys::generate();
@@ -363,7 +372,9 @@ mod tests {
             inbox_json: inbox,
             published: Mutex::new(Vec::new()),
         };
-        store.insert_alert(&draft("disk is full"), 1_700_000_000_000).unwrap();
+        store
+            .insert_alert(&draft("disk is full"), 1_700_000_000_000)
+            .unwrap();
         let claimed = store
             .claim_outbox(1_700_000_000_000, 1_700_000_120_000, Some("nostr"), 1)
             .unwrap();
@@ -376,23 +387,15 @@ mod tests {
             "DELIVERY_CLAIM_MS" => "120000".to_string(),
             _ => String::new(),
         };
-        let first = deliver_nip17(
-            &store,
-            &relay,
-            &get,
-            &claimed[0],
-            &claim,
-            5_000,
-            &clock,
-        )
-        .await;
+        let first = deliver_nip17(&store, &relay, &get, &claimed[0], &claim, 5_000, &clock).await;
         assert!(first.accepted, "{first:?}");
         let published = relay.published.lock().unwrap().clone();
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].0, "wss://inbox.example");
         assert!(!published[0].1.contains("disk is full"));
         let stored = store.read_envelope("alt_nip17").unwrap().unwrap();
-        let again = store.claim_outbox(clock.unix_ms(), clock.unix_ms() + 120_000, Some("nostr"), 1);
+        let again =
+            store.claim_outbox(clock.unix_ms(), clock.unix_ms() + 120_000, Some("nostr"), 1);
         // The first delivery accepted the alert, so it is not claimed again.
         // A retry of the same stored envelope is what the outbox keeps.
         assert!(again.unwrap().is_empty());
@@ -402,5 +405,106 @@ mod tests {
             parse_event(&stored).unwrap().id.to_hex(),
             parse_event(&published[0].1).unwrap().id.to_hex()
         );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_publish_is_retried_with_the_same_event_id() {
+        let store = SqliteStore::memory().unwrap();
+        let recipient = Keys::generate();
+        let sender = Keys::generate();
+        let inbox = sign_inbox(
+            &recipient.secret_key().to_bech32().unwrap(),
+            &["wss://inbox.example/"],
+            1_700_000_000,
+        )
+        .unwrap();
+        let relay = Scripted {
+            inbox_on: "wss://bootstrap.example".to_string(),
+            inbox_json: inbox,
+            published: Mutex::new(Vec::new()),
+        };
+        store
+            .insert_alert(&draft("disk is full"), 1_700_000_000_000)
+            .unwrap();
+        let claimed = store
+            .claim_outbox(1_700_000_000_000, 1_700_000_120_000, Some("nostr"), 1)
+            .unwrap();
+        let claim = claimed[0].claim_token.clone().unwrap();
+        let clock = ManualClock::new(1_700_000_000_000);
+        let get = |key: &str| match key {
+            "SFS_BOT_NSEC" => sender.secret_key().to_bech32().unwrap(),
+            "ADMIN_NPUB" => recipient.public_key().to_hex(),
+            "BOOTSTRAP_RELAYS" => "wss://bootstrap.example".to_string(),
+            "DELIVERY_CLAIM_MS" => "120000".to_string(),
+            _ => String::new(),
+        };
+        // The scripted adapter accepts only the inbox relay. Point publication
+        // at a relay that rejects once by using a fresh adapter whose publish
+        // fails, then a second adapter that accepts the stored event.
+        let rejecting = RejectOnce {
+            inner: &relay,
+            failed: Mutex::new(false),
+        };
+        let first =
+            deliver_nip17(&store, &rejecting, &get, &claimed[0], &claim, 5_000, &clock).await;
+        assert!(!first.accepted, "{first:?}");
+        let stored = store.read_envelope("alt_nip17").unwrap().unwrap();
+        let first_id = parse_event(&stored).unwrap().id.to_hex();
+        let mut row = claimed[0].clone();
+        row.envelope_json = Some(stored.clone());
+        let second = deliver_nip17(&store, &relay, &get, &row, &claim, 5_000, &clock).await;
+        assert!(second.accepted, "{second:?}");
+        assert_eq!(second.message_event_id.as_deref(), Some(first_id.as_str()));
+        let published = relay.published.lock().unwrap().clone();
+        assert!(published
+            .iter()
+            .all(|(target, _)| target == "wss://inbox.example"));
+        assert!(published.len() >= 2);
+        let ids: Vec<_> = published
+            .iter()
+            .map(|(_, json)| parse_event(json).unwrap().id.to_hex())
+            .collect();
+        assert!(ids.iter().all(|id| id == &first_id));
+    }
+
+    struct RejectOnce<'a> {
+        inner: &'a Scripted,
+        failed: Mutex<bool>,
+    }
+
+    impl RelayIo for RejectOnce<'_> {
+        async fn query_inbox(
+            &self,
+            relay: &str,
+            author: &str,
+            signer: Option<&str>,
+            timeout_ms: i64,
+        ) -> Result<InboxFrames, String> {
+            self.inner
+                .query_inbox(relay, author, signer, timeout_ms)
+                .await
+        }
+
+        async fn publish(
+            &self,
+            relay: &str,
+            event_json: &str,
+            signer: Option<&str>,
+            timeout_ms: i64,
+        ) -> Result<bool, String> {
+            let mut failed = self.failed.lock().unwrap();
+            if !*failed {
+                *failed = true;
+                self.inner
+                    .published
+                    .lock()
+                    .unwrap()
+                    .push((relay.to_string(), event_json.to_string()));
+                return Ok(false);
+            }
+            self.inner
+                .publish(relay, event_json, signer, timeout_ms)
+                .await
+        }
     }
 }

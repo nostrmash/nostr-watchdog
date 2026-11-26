@@ -10,11 +10,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use watchdog_marmot::Session;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // MDK futures are deep. Upstream integration tests use an 8 MiB worker stack.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .expect("runtime");
+    runtime.block_on(run());
+}
+
+async fn run() {
     let mut root = None;
     let mut socket = None;
     let mut relays = Vec::new();
+    let mut allow_loopback = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -25,6 +35,7 @@ async fn main() {
                     relays.push(relay);
                 }
             }
+            "--allow-loopback" => allow_loopback = true,
             _ => {}
         }
     }
@@ -33,7 +44,7 @@ async fn main() {
         std::process::exit(2);
     };
     let socket = socket.unwrap_or_else(|| root.join("watchdog.sock"));
-    let session = match watchdog_marmot::open(&root, &relays) {
+    let session = match watchdog_marmot::open(&root, &relays, allow_loopback) {
         Ok(session) => session,
         Err(error) => {
             eprintln!("watchdog-marmot open failed: {error}");
@@ -50,11 +61,39 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let health_path = root.join("health.sock");
+    if health_path.exists() {
+        let _ = std::fs::remove_file(&health_path);
+    }
+    let health = match UnixListener::bind(&health_path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("watchdog-marmot health socket failed: {error}");
+            std::process::exit(1);
+        }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&health_path, std::fs::Permissions::from_mode(0o600));
     }
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = health.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let (_, mut write) = stream.into_split();
+                let response = json!({"ok": true, "pong": true});
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    write_json(&mut write, response),
+                )
+                .await;
+            });
+        }
+    });
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("sigterm");
     loop {
@@ -91,7 +130,15 @@ async fn handle(session: &Session, mut stream: UnixStream) -> Result<(), String>
         }
     };
     let response = dispatch(session, request).await;
-    write_json(&mut write, response).await
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        write_json(&mut write, response),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("response_timeout".to_string()),
+    }
 }
 
 async fn dispatch(session: &Session, request: Value) -> Value {
@@ -120,6 +167,14 @@ async fn dispatch(session: &Session, request: Value) -> Value {
             let members = strings(request.get("members"));
             session
                 .create_group(&account, &name, &members)
+                .await
+                .map(|group| json!({"group": group}))
+        }
+        "reonboard" => {
+            let account = text(&request, "account");
+            let members = strings(request.get("members"));
+            session
+                .reonboard(&account, &members)
                 .await
                 .map(|group| json!({"group": group}))
         }
@@ -180,7 +235,10 @@ async fn read_bounded_line(stream: &mut UnixStream, max: usize) -> Result<String
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        let read = stream.read(&mut byte).await.map_err(|error| error.to_string())?;
+        let read = stream
+            .read(&mut byte)
+            .await
+            .map_err(|error| error.to_string())?;
         if read == 0 || byte[0] == b'\n' {
             break;
         }

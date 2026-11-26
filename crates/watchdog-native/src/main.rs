@@ -284,6 +284,7 @@ async fn main() {
         .expect("serve");
     let _ = scheduler_task.await;
     let _ = dispatch_task.await;
+    marmot::shutdown_helper();
 }
 
 async fn shutdown(stop: Arc<std::sync::atomic::AtomicBool>) {
@@ -630,6 +631,7 @@ async fn deliver_telegram(
         DeliveryOutcome {
             accepted: true,
             terminal: false,
+            hold_attempt: false,
             error: None,
             accepted_relays: Vec::new(),
             failed_relays: Vec::new(),
@@ -647,6 +649,7 @@ fn terminal(error: &str) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
         terminal: true,
+        hold_attempt: false,
         error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),
@@ -693,6 +696,7 @@ fn retry_error(error: &str) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
         terminal: false,
+        hold_attempt: false,
         error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),

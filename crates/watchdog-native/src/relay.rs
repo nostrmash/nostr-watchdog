@@ -77,9 +77,8 @@ pub async fn query_inbox(
                     let Some(nsec) = signer else {
                         return Err("relay_auth_required".to_string());
                     };
-                    let frame = auth_frame(nsec, &challenge, relay).map_err(|_| {
-                        "relay_auth_required".to_string()
-                    })?;
+                    let frame = auth_frame(nsec, &challenge, relay)
+                        .map_err(|_| "relay_auth_required".to_string())?;
                     send_text(&mut socket, &frame, deadline).await?;
                     authed = true;
                 }
@@ -159,7 +158,10 @@ pub async fn publish(
                     authed = true;
                 }
                 RelayControl::Auth { .. } => return Err("relay_auth_required".to_string()),
-                RelayControl::Ok { event_id, accepted: ok } if event_id == id => {
+                RelayControl::Ok {
+                    event_id,
+                    accepted: ok,
+                } if event_id == id => {
                     accepted = ok;
                     break;
                 }
@@ -180,18 +182,19 @@ async fn send_text(
     text: &str,
     deadline: Instant,
 ) -> Result<(), String> {
-    timeout_until(deadline, socket.send(Message::Text(text.to_string().into())))
-        .await?
-        .map_err(|_| "relay_closed".to_string())
+    timeout_until(
+        deadline,
+        socket.send(Message::Text(text.to_string().into())),
+    )
+    .await?
+    .map_err(|_| "relay_closed".to_string())
 }
 
 async fn connect(
     relay: &str,
     deadline: Instant,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-    String,
-> {
+) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>, String>
+{
     let https = workers_websocket_url(relay).map_err(|error| error.message.to_string())?;
     let url = https.replacen("https://", "wss://", 1);
     let parsed = Url::parse(&url).map_err(|_| "relay_url_invalid".to_string())?;
@@ -200,11 +203,7 @@ async fn connect(
         .ok_or_else(|| "relay_url_invalid".to_string())?
         .to_string();
     let port = parsed.port_or_known_default().unwrap_or(443);
-    let address = timeout_until(
-        deadline,
-        crate::net::resolve_pinned(&host, port, false),
-    )
-    .await??;
+    let address = timeout_until(deadline, crate::net::resolve_pinned(&host, port, false)).await??;
     let stream = timeout_until(deadline, TcpStream::connect(address))
         .await?
         .map_err(|_| "relay_connect_failed".to_string())?;
@@ -234,8 +233,11 @@ async fn timeout_until<T>(
 }
 
 fn uuid_like() -> String {
-    format!("{:032x}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0))
+    format!(
+        "{:032x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    )
 }

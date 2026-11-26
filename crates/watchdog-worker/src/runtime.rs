@@ -8,10 +8,11 @@ use serde_json::Value;
 use watchdog_core::clock::SystemClock;
 use watchdog_core::settings::{config_alias, load_settings, CONFIG_KEYS};
 use watchdog_engine::{
-    deliver_nip17, dispatch_due, handle, run_check_cycle, run_update_cycle, ApiRequest, ApiResponse,
-    DeliveryOutcome, HttpClient, InboxFrames, Notifier, ProbeRequest, ProbeResponse, RelayIo,
+    deliver_nip17, dispatch_due, handle, run_check_cycle, run_update_cycle, ApiRequest,
+    ApiResponse, DeliveryOutcome, HttpClient, InboxFrames, Notifier, ProbeRequest, ProbeResponse,
+    RelayIo,
 };
-use watchdog_notify::{auth_frame, parse_relay_frame, MARMOT_ENGINE_STATUS, RelayControl};
+use watchdog_notify::{auth_frame, parse_relay_frame, RelayControl, MARMOT_ENGINE_STATUS};
 use watchdog_store::OutboxRow;
 use worker::{
     console_log, AbortController, D1Database, Delay, Env, Fetch, Headers, Method, Request,
@@ -117,7 +118,15 @@ struct WorkerHttp;
 
 impl HttpClient for WorkerHttp {
     async fn send(&self, request: ProbeRequest) -> Result<ProbeResponse, String> {
-        bounded_http(&request.method, &request.url, &request.headers, None, request.timeout, request.max_bytes).await
+        bounded_http(
+            &request.method,
+            &request.url,
+            &request.headers,
+            None,
+            request.timeout,
+            request.max_bytes,
+        )
+        .await
     }
 }
 
@@ -192,6 +201,7 @@ impl Notifier for WorkerNotifier {
             DeliveryOutcome {
                 accepted: true,
                 terminal: false,
+                hold_attempt: false,
                 error: None,
                 accepted_relays: Vec::new(),
                 failed_relays: Vec::new(),
@@ -211,6 +221,7 @@ impl Notifier for WorkerNotifier {
         DeliveryOutcome {
             accepted: false,
             terminal: false,
+            hold_attempt: false,
             error: Some("marmot_engine_unavailable".to_string()),
             accepted_relays: Vec::new(),
             failed_relays: Vec::new(),
@@ -236,7 +247,8 @@ impl RelayIo for WorkerRelay {
         let request =
             serde_json::json!(["REQ", sub, {"kinds": [10050], "authors": [author], "limit": 5}])
                 .to_string();
-        let frames = relay_exchange(relay, &request, signer, timeout_ms, Exchange::Query { sub }).await?;
+        let frames =
+            relay_exchange(relay, &request, signer, timeout_ms, Exchange::Query { sub }).await?;
         match frames {
             ExchangeResult::Inbox(frames) => Ok(frames),
             ExchangeResult::Published(_) => Err("relay_malformed".to_string()),
@@ -297,9 +309,21 @@ async fn relay_exchange(
         .map_err(|error| error.message.to_string())?;
     let url = url.replacen("https://", "wss://", 1);
     let parsed = url.parse().map_err(|_| "relay_url_invalid".to_string())?;
-    let socket = WebSocket::connect(parsed)
-        .await
-        .map_err(|_| "relay_connect_failed".to_string())?;
+    let deadline = now_ms() + timeout_ms.max(1);
+    let connect = WebSocket::connect(parsed);
+    futures_util::pin_mut!(connect);
+    let socket = match futures_util::future::select(
+        connect,
+        Delay::from(Duration::from_millis(
+            deadline.saturating_sub(now_ms()).max(1) as u64,
+        )),
+    )
+    .await
+    {
+        Either::Left((Ok(socket), _)) => socket,
+        Either::Left((Err(_), _)) => return Err("relay_connect_failed".to_string()),
+        Either::Right((_, _)) => return Err("relay_timeout".to_string()),
+    };
     // Register the listener before accept so an immediate AUTH or OK is kept.
     let mut events = socket.events().map_err(|_| "relay_closed".to_string())?;
     socket
@@ -308,7 +332,6 @@ async fn relay_exchange(
     socket
         .send_with_str(frame)
         .map_err(|_| "relay_closed".to_string())?;
-    let deadline = now_ms() + timeout_ms.max(1);
     let mut seen = Vec::new();
     let mut eose = false;
     let mut accepted = false;
@@ -413,10 +436,7 @@ async fn relay_exchange(
     }
     let _ = socket.close(Some(1000), Some("done"));
     Ok(match goal {
-        Exchange::Query { .. } => ExchangeResult::Inbox(InboxFrames {
-            events: seen,
-            eose,
-        }),
+        Exchange::Query { .. } => ExchangeResult::Inbox(InboxFrames { events: seen, eose }),
         Exchange::Publish { .. } => ExchangeResult::Published(accepted),
     })
 }
@@ -453,12 +473,20 @@ async fn bounded_http(
     }
     let http_request =
         Request::new_with_init(url, &init).map_err(|_| "probe_url_invalid".to_string())?;
+    let deadline = now_ms() + timeout.as_millis() as i64;
     let controller = AbortController::default();
     let signal = controller.signal();
     let fetch_handle = Fetch::Request(http_request);
     let fetch = fetch_handle.send_with_signal(&signal);
     futures_util::pin_mut!(fetch);
-    let mut response = match futures_util::future::select(fetch, Delay::from(timeout)).await {
+    let mut response = match futures_util::future::select(
+        fetch,
+        Delay::from(Duration::from_millis(
+            deadline.saturating_sub(now_ms()).max(1) as u64,
+        )),
+    )
+    .await
+    {
         Either::Left((Ok(response), _)) => response,
         Either::Left((Err(_), _)) => return Err("probe_failed".to_string()),
         Either::Right((_, fetch)) => {
@@ -497,9 +525,19 @@ async fn bounded_http(
     let mut body = Vec::new();
     let mut stream = response.stream().map_err(|_| "probe_failed".to_string())?;
     loop {
+        let remaining = deadline.saturating_sub(now_ms());
+        if remaining == 0 {
+            controller.abort();
+            return Err("probe_timeout".to_string());
+        }
         let next = stream.next();
         futures_util::pin_mut!(next);
-        let chunk = match futures_util::future::select(next, Delay::from(timeout)).await {
+        let chunk = match futures_util::future::select(
+            next,
+            Delay::from(Duration::from_millis(remaining as u64)),
+        )
+        .await
+        {
             Either::Left((Some(Ok(chunk)), _)) => chunk,
             Either::Left((Some(Err(_)), _)) => return Err("probe_failed".to_string()),
             Either::Left((None, _)) => break,
@@ -649,6 +687,7 @@ fn terminal(error: &str) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
         terminal: true,
+        hold_attempt: false,
         error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),
@@ -663,6 +702,7 @@ fn retry(error: &str) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
         terminal: false,
+        hold_attempt: false,
         error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),

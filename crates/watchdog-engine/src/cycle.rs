@@ -20,6 +20,10 @@ use crate::probes::{probe_monitor, HttpClient};
 pub struct DeliveryOutcome {
     pub accepted: bool,
     pub terminal: bool,
+    /// Keep the current attempt count and try again later. Used when a Marmot
+    /// message is already submitted and a later retry must reconcile it instead
+    /// of burning the attempt budget or encrypting it again.
+    pub hold_attempt: bool,
     pub error: Option<String>,
     pub accepted_relays: Vec<String>,
     pub failed_relays: Vec<String>,
@@ -215,12 +219,7 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
                 continue;
             }
             if !store
-                .extend_claim(
-                    &row.id,
-                    &token,
-                    now + settings.delivery_claim_ms,
-                    now,
-                )
+                .extend_claim(&row.id, &token, now + settings.delivery_claim_ms, now)
                 .await
                 .unwrap_or(false)
             {
@@ -233,6 +232,7 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
                 None => DeliveryOutcome {
                     accepted: false,
                     terminal: true,
+                    hold_attempt: false,
                     error: Some("project_invalid".to_string()),
                     accepted_relays: Vec::new(),
                     failed_relays: Vec::new(),
@@ -243,11 +243,22 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
                 },
             };
             let finished = clock.unix_ms();
-            let attempt = row.attempt_count + 1;
+            let attempt = if outcome.hold_attempt {
+                row.attempt_count
+            } else {
+                row.attempt_count + 1
+            };
             let state = if outcome.accepted {
                 DeliveryState::RelayAccepted
+            } else if outcome.hold_attempt {
+                DeliveryState::Retrying
             } else {
                 next_delivery_state(attempt, outcome.terminal)
+            };
+            let next_attempt = if outcome.hold_attempt {
+                finished + 60_000
+            } else {
+                finished + watchdog_core::backoff_ms(attempt)
             };
             let owned = store
                 .finish_delivery(
@@ -255,7 +266,7 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
                     &token,
                     state,
                     attempt,
-                    finished + watchdog_core::backoff_ms(attempt),
+                    next_attempt,
                     outcome.error.as_deref(),
                     Some(
                         &serde_json::to_string(&outcome.accepted_relays)
@@ -272,8 +283,14 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
                     finished,
                 )
                 .await?;
+            let redundancy = outcome.hold_attempt
+                && matches!(
+                    outcome.message_phase.as_deref(),
+                    Some("relay_accepted" | "completion_unknown")
+                );
             if owned
                 && !outcome.accepted
+                && (redundancy || !outcome.hold_attempt)
                 && settings.telegram_mode == TelegramMode::NostrFallback
                 && matches!(row.destination.as_str(), "nostr" | "marmot")
             {
@@ -284,11 +301,7 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
     Ok(())
 }
 
-fn transport_enabled(
-    settings: &Settings,
-    get: &impl Fn(&str) -> String,
-    row: &OutboxRow,
-) -> bool {
+fn transport_enabled(settings: &Settings, get: &impl Fn(&str) -> String, row: &OutboxRow) -> bool {
     let Some(severity) = Severity::parse(&row.severity) else {
         return false;
     };

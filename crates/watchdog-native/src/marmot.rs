@@ -45,9 +45,6 @@ pub async fn deliver(
         return failed("project_invalid");
     };
     let nsec = get(project.sender_secret);
-    if nsec.is_empty() {
-        return failed("sender_key_missing");
-    }
     let Some(recipient_raw) =
         project_recipient(&get("PROJECT_RECIPIENTS"), &get("ADMIN_NPUB"), project.id)
     else {
@@ -59,28 +56,37 @@ pub async fn deliver(
     if ensure_helper(vars, &socket).await.is_err() {
         return pending("marmot_helper_unavailable");
     }
-    let relays = settings.bootstrap.clone();
-    let imported = match call(
-        &socket,
-        json!({"op": "import", "nsec": nsec, "relays": relays}),
-        Duration::from_secs(60),
-    )
-    .await
+    let known = store.marmot_project(&row.project_id).ok().flatten();
+    let account = if let Some(account) = known
+        .as_ref()
+        .and_then(|row| row.pubkey.clone())
+        .filter(|account| !account.is_empty())
     {
-        Ok(value) => value,
-        Err(error) => return pending(&error),
+        account
+    } else {
+        if nsec.is_empty() {
+            return failed("sender_key_missing");
+        }
+        let relays = settings.bootstrap.clone();
+        let imported = match call(
+            &socket,
+            json!({"op": "import", "nsec": nsec, "relays": relays}),
+            Duration::from_secs(60),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => return pending(&error),
+        };
+        if imported.get("ok") != Some(&Value::Bool(true)) {
+            return outcome_from_error(&imported, false);
+        }
+        let Some(account) = imported.get("account").and_then(Value::as_str) else {
+            return pending("marmot_account_missing");
+        };
+        account.to_string()
     };
-    if imported.get("ok") != Some(&Value::Bool(true)) {
-        return outcome_from_error(&imported, false);
-    }
-    let Some(account) = imported.get("account").and_then(Value::as_str) else {
-        return pending("marmot_account_missing");
-    };
-    let existing = store
-        .marmot_project(&row.project_id)
-        .ok()
-        .flatten()
-        .and_then(|row| row.group_id_hex);
+    let existing = known.and_then(|row| row.group_id_hex);
     let group = if let Some(group) = existing.filter(|group| !group.is_empty()) {
         group
     } else {
@@ -90,7 +96,7 @@ pub async fn deliver(
                 "op": "create_group",
                 "account": account,
                 "name": format!("watchdog-{}", project.id),
-                "members": [recipient_raw]
+                "members": [recipient]
             }),
             Duration::from_secs(90),
         )
@@ -100,7 +106,7 @@ pub async fn deliver(
             Err(error) => return pending(&error),
         };
         if created.get("ok") != Some(&Value::Bool(true)) {
-            remember(store, row, account, None, error_code(&created));
+            remember(store, row, &account, None, error_code(&created));
             return outcome_from_error(&created, true);
         }
         let Some(group) = created
@@ -110,7 +116,7 @@ pub async fn deliver(
         else {
             return pending("marmot_group_missing");
         };
-        remember(store, row, account, Some(&group), None);
+        remember(store, row, &account, Some(&group), None);
         group
     };
     let sent = match call(
@@ -131,7 +137,7 @@ pub async fn deliver(
         Err(error) => return pending(&error),
     };
     if sent.get("ok") != Some(&Value::Bool(true)) {
-        remember(store, row, account, Some(&group), error_code(&sent));
+        remember(store, row, &account, Some(&group), error_code(&sent));
         return outcome_from_error(&sent, true);
     }
     let disposition = sent
@@ -148,22 +154,25 @@ pub async fn deliver(
         .and_then(|ids| ids.first())
         .and_then(Value::as_str)
         .map(str::to_string);
-    remember(store, row, account, Some(&group), None);
+    remember(store, row, &account, Some(&group), None);
     match disposition {
         "rejected" => failed("marmot_send_rejected"),
-        "published" => DeliveryOutcome {
-            accepted: true,
-            terminal: false,
-            error: None,
-            accepted_relays: Vec::new(),
-            failed_relays: Vec::new(),
-            message_phase: Some("relay_accepted".to_string()),
-            push_phase: Some(push.to_string()),
-            message_event_id: message_id,
-            push_envelope: None,
-        },
-        "accepted_pending" => pending_phase("marmot_publish_pending", "accepted_pending", push),
-        _ => pending_phase("marmot_completion_unknown", "completion_unknown", push),
+        // A relay-accepted group message is not a phone notification. MDK does
+        // not currently expose push-trigger acceptance, so the outbox keeps
+        // reconciling and the configured Telegram redundancy may run once.
+        "published" => held(push, "relay_accepted", push, message_id),
+        "accepted_pending" => held(
+            "marmot_publish_pending",
+            "accepted_pending",
+            push,
+            message_id,
+        ),
+        _ => held(
+            "marmot_completion_unknown",
+            "completion_unknown",
+            push,
+            message_id,
+        ),
     }
 }
 
@@ -195,30 +204,52 @@ fn socket_path(vars: &HashMap<String, String>) -> Option<PathBuf> {
 
 async fn ensure_helper(vars: &HashMap<String, String>, socket: &Path) -> Result<(), String> {
     reap_helper();
-    if ping(socket).await.is_ok() {
+    if ping_health(vars).await.is_ok() {
         return Ok(());
     }
-    stop_helper();
+    // A live process that does not answer is busy or still starting. Killing
+    // it would interrupt an MDK mutation. A socket that accepts connections
+    // belongs to a process this parent may not have spawned.
+    if child_running() || UnixStream::connect(socket).await.is_ok() {
+        return Err("marmot_helper_busy".to_string());
+    }
     if socket.exists() {
         let _ = std::fs::remove_file(socket);
+    }
+    if let Some(health) = health_socket(vars) {
+        if health.exists() {
+            let _ = std::fs::remove_file(&health);
+        }
     }
     spawn_helper(vars, socket)?;
     let mut delay = Duration::from_millis(100);
     for _ in 0..8 {
-        if ping(socket).await.is_ok() {
+        if ping_health(vars).await.is_ok() {
             return Ok(());
+        }
+        if !child_running() {
+            return Err("marmot_helper_unavailable".to_string());
         }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_secs(2));
     }
-    Err("marmot_helper_unavailable".to_string())
+    Err("marmot_helper_busy".to_string())
 }
 
-async fn ping(socket: &Path) -> Result<(), String> {
+fn health_socket(vars: &HashMap<String, String>) -> Option<PathBuf> {
+    vars.get("MARMOT_ROOT")
+        .filter(|path| !path.is_empty())
+        .map(|root| PathBuf::from(root).join("health.sock"))
+}
+
+async fn ping_health(vars: &HashMap<String, String>) -> Result<(), String> {
+    let Some(socket) = health_socket(vars) else {
+        return Err("marmot_helper_unavailable".to_string());
+    };
     if !socket.exists() {
         return Err("marmot_helper_unavailable".to_string());
     }
-    let value = call(socket, json!({"op": "ping"}), Duration::from_secs(2)).await?;
+    let value = call(&socket, json!({"op": "ping"}), Duration::from_secs(1)).await?;
     if value.get("ok") == Some(&Value::Bool(true)) {
         Ok(())
     } else {
@@ -226,19 +257,63 @@ async fn ping(socket: &Path) -> Result<(), String> {
     }
 }
 
-fn helper_child() -> &'static Mutex<Option<std::process::Child>> {
-    static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
-    &CHILD
-}
-
-fn stop_helper() {
+fn child_running() -> bool {
     let mut guard = helper_child()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(mut child) = guard.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+    let Some(child) = guard.as_mut() else {
+        return false;
+    };
+    match child.try_wait() {
+        Ok(None) => true,
+        _ => {
+            *guard = None;
+            false
+        }
     }
+}
+
+/// Ask the helper to leave, then force it only after a short wait.
+pub fn shutdown_helper() {
+    let mut guard = helper_child()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut child) = guard.take() else {
+        return;
+    };
+    signal_term(child.id());
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        if started.elapsed() > Duration::from_secs(5) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn signal_term(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGTERM: i32 = 15;
+        let _ = kill(pid as i32, SIGTERM);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+fn helper_child() -> &'static Mutex<Option<std::process::Child>> {
+    static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+    &CHILD
 }
 
 fn reap_helper() {
@@ -369,6 +444,7 @@ fn pending_phase(error: &str, message: &str, push: &str) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
         terminal: false,
+        hold_attempt: false,
         error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),
@@ -379,10 +455,26 @@ fn pending_phase(error: &str, message: &str, push: &str) -> DeliveryOutcome {
     }
 }
 
+fn held(error: &str, message: &str, push: &str, message_id: Option<String>) -> DeliveryOutcome {
+    DeliveryOutcome {
+        accepted: false,
+        terminal: false,
+        hold_attempt: true,
+        error: Some(error.to_string()),
+        accepted_relays: Vec::new(),
+        failed_relays: Vec::new(),
+        message_phase: Some(message.to_string()),
+        push_phase: Some(push.to_string()),
+        message_event_id: message_id,
+        push_envelope: None,
+    }
+}
+
 fn failed(error: &str) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
         terminal: true,
+        hold_attempt: false,
         error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),
@@ -393,10 +485,7 @@ fn failed(error: &str) -> DeliveryOutcome {
     }
 }
 
-async fn read_bounded_line(
-    stream: &mut UnixStream,
-    max: usize,
-) -> Result<String, String> {
+async fn read_bounded_line(stream: &mut UnixStream, max: usize) -> Result<String, String> {
     use tokio::io::AsyncReadExt;
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
