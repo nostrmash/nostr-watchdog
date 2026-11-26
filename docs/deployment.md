@@ -1,92 +1,87 @@
 # Deployment
 
-Do not deploy until you mean to. CI runs `wrangler deploy --dry-run` and does not publish. `pnpm deploy:staging` and `pnpm deploy:production` do publish.
+Two targets exist. Only the native binary runs the monitors. The staging Worker is a health check and must stay separate from production.
 
-## Plan
-
-Use Cloudflare Workers Paid. As of 22 November 2026, the documented Cron Trigger CPU limits are:
-
-| Plan                                          | Cron CPU                                                |
-| --------------------------------------------- | ------------------------------------------------------- |
-| Workers Free                                  | 10 ms                                                   |
-| Workers Paid, cron interval under 1 hour      | 30 seconds default, up to 5 minutes via `limits.cpu_ms` |
-| Workers Paid, cron interval of 1 hour or more | up to 15 minutes of CPU                                 |
-
-Network time spent waiting on probes is not CPU time. This Worker sets `limits.cpu_ms` to 30000. A Workers-runtime test builds one gift wrap and expects it to finish in under 2 seconds. That is a budget, not a measured production CPU trace, and it is already more than the Free plan's 10 ms cron budget before D1 and a second project. The Free plan is not supported. Confirm the limit on the account you deploy to.
-
-The minute cron is the uptime path. The hour cron is the only path that calls GitHub. One Worker and one D1 database per environment is the whole footprint. There is no queue, KV namespace, or second Worker.
-
-## Databases
-
-Create one database per environment and replace the placeholder ids in `wrangler.jsonc`.
-
-```sh
-wrangler d1 create nostr-watchdog
-wrangler d1 create nostr-watchdog-staging
-```
-
-Put each returned `database_id` on the matching `d1_databases` entry. The top-level entry is local and development. `env.staging` is `nostr-watchdog-staging`. `env.production` is `nostr-watchdog`.
-
-Apply migrations yourself. These commands talk to Cloudflare when you pass `--remote`:
-
-```sh
-pnpm migrate:local
-wrangler d1 migrations apply nostr-watchdog-staging --env staging --remote
-wrangler d1 migrations apply nostr-watchdog --env production --remote
-```
-
-`pnpm migrate:staging` and `pnpm migrate:production` are the same remote commands. They are not run by CI. `0002_hardening.sql` adds columns and replaces the one-open-incident index with one open incident per monitor and kind. `0003_vendor_checks.sql` adds `scheduler_runs.last_success_at` and the `vendor_checks` table. `0004_vendor_source_state.sql` adds release, advisory, and coverage state to that table. `0005_source_failures.sql` adds per-source failure counts, the last partial success, and the security reminder timestamp. These apply to an empty database and to a database that already has `0001_init.sql`. They do not delete rows. Apply `0003`, `0004`, and `0005` before deploying the code that reads those columns. Do not run a migration twice by hand: D1 records applied migrations. The ids in `wrangler.jsonc` are placeholders until you paste the ids these commands return. Do not invent ids.
-
-## Secrets and environments
-
-Use a different sender key, operator token, and heartbeat secret in each environment so a test alert does not land in the production conversation.
-
-```sh
-wrangler secret put OPERATOR_TOKEN --env staging
-wrangler secret put STATUS_READ_TOKEN --env staging
-wrangler secret put READ_GATEWAY_HEALTH_TOKEN --env staging
-wrangler secret put PUBLISH_GATEWAY_HEALTH_TOKEN --env staging
-wrangler secret put SFS_BOT_NSEC --env staging
-# repeat for every name in docs/configuration.md, then again for production
-```
-
-The `SFS_BOT_NSEC` name is a sample binding. Use the secret name declared by each project you keep. Local development reads `.dev.vars`, which is gitignored. Start from `.dev.vars.example`.
-
-Set `ADMIN_NPUB`, `BOOTSTRAP_RELAYS`, and any URL vars in the environment you are deploying. Leave enable flags false on the first deploy. Turn one monitor on only after a manual request against the real URL matches the contract you configured.
-
-## Deploy and roll back
-
-```sh
-pnpm build
-pnpm deploy:staging
-```
-
-Deploy production only after staging has been checked:
-
-```sh
-pnpm deploy:production
-```
-
-To stop probes without deleting the Worker, set `WATCHDOG_ENABLED` to `false` and deploy again. To keep recording incidents but stop delivery, set `ALERTS_ENABLED` to `false`. `/v1/status` then reports `alerts_disabled` and returns HTTP 503. To stop one service, set its enable flag to `false`. A disabled monitor is skipped, and a skipped check does not close an open incident. Silence that incident from the operator route if reminders should stop.
-
-`wrangler rollback --env staging` or `wrangler rollback --env production` restores the previous Worker version. It does not roll back D1 rows. Old outbox rows can still be delivered if they are `queued` or `retrying` and alerts are enabled.
-
-## GitHub rate limit
-
-The hour cron requests releases and advisories separately for each enabled monitor that names a vendor. A failure of one feed does not suppress a fresh result from the other, and a verified vendor affected-range still alerts when both feeds are down. A partial result does not refresh the last complete security check. One source can stay down for the two-hour grace, or for three failed hourly attempts, and then `/v1/status` degrades even if the other source keeps succeeding. Anonymous GitHub API usage is 60 requests per hour per origin. A 403 or 429 stores `x-ratelimit-reset` and the next run uses the cache until that time. Cached data is not treated as a new verification. Requests time out and stop at 256 KiB. Do not point the minute cron at the GitHub API. `GITHUB_TOKEN` is optional and should be a public-repo read token.
-
-## An external checker
-
-Run one HTTPS check from outside Cloudflare against `GET /v1/status`. Prefer `STATUS_READ_TOKEN` for that probe. It can read status and cannot acknowledge incidents, retry alerts, or send diagnostics. `OPERATOR_TOKEN` also works and should stay with the operator. Page when the response is not HTTP 200, when the request times out, or when no response arrives. That covers the Worker being unreachable, monitoring disabled, alerts disabled, no monitors enabled, a stale scheduler, a stale individual monitor sample, a stale or partial security-update cycle, incomplete installed-version coverage, dead letters, persistent relay delivery failures, and missing alert configuration. A customer service being down does not by itself make this status non-200. `/healthz` only answers whether the isolate is up. Verifying `X-Watchdog-Signature` is optional and catches a proxy that replaces the body. This repository does not ship that second checker. Do not point it at a customer service to test an outage.
-
-Use a monitor that is not hosted on Cloudflare. [Uptime Kuma](https://github.com/louislam/uptime-kuma) and [Healthchecks.io](https://healthchecks.io) both fit. Give the checker its own notification channel, such as email or a Telegram chat that is not the Watchdog bot, so a Cloudflare outage can still reach you. Do not commit the token or the account URL.
+## Native process
 
 ```bash
-curl --fail-with-body --silent --show-error --max-time 20 \
-  --header "authorization: Bearer $STATUS_READ_TOKEN" \
-  "https://watchdog.example/v1/status"
+cargo build --release -p watchdog-native
+./target/release/nostr-watchdog
 ```
 
-In Uptime Kuma, add an HTTP(s) - Keyword monitor. URL is `https://<worker>/v1/status`. Method is GET. Header is `authorization: Bearer <STATUS_READ_TOKEN>`. Keyword is `"status":"healthy"`. Interval is 60 seconds. Timeout is 20 seconds. Accepted status is 200. Notify with the independent channel. A timeout, a connection error, and any other body all fail the check.
+Environment variables use the names already documented for the TypeScript Worker. Add `DATABASE_PATH` and `LISTEN_ADDR`. Optional `WATCHDOG_CONFIG` points at a TOML file:
 
-Healthchecks.io can run the same curl from a server you control and ping a check UUID only when the command exits 0. Do not use a Cloudflare Worker or a Cloudflare Cron Trigger for this check. A relay accepting a Nostr event does not prove the phone displayed it.
+```toml
+[vars]
+WATCHDOG_ENABLED = "true"
+ALERTS_ENABLED = "true"
+OPERATOR_TOKEN = "replace-me"
+ENABLE_NIP17 = "true"
+ENABLE_MARMOT = "false"
+```
+
+The environment overrides the file. Leave monitor `ENABLE_*` flags false until the endpoint is set.
+
+`GET /healthz` returns 200 when the process is up. `GET /readyz` returns 200 when SQLite answers.
+
+Stop the process with SIGINT. The current minute's probes finish or are dropped when the runtime shuts down. State that was committed stays in SQLite. On the next start the outbox claim leases expire and those rows can be claimed again. Stored gift wraps are reused.
+
+### systemd
+
+```ini
+[Unit]
+Description=Nostr Watchdog
+After=network-online.target
+
+[Service]
+Type=simple
+User=watchdog
+Group=watchdog
+EnvironmentFile=/etc/nostr-watchdog.env
+ExecStart=/usr/local/bin/nostr-watchdog
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Put secrets in `/etc/nostr-watchdog.env` with mode `0600`. The SQLite directory must be writable by `watchdog` and not by other users.
+
+### Backup
+
+Stop the process or use SQLite's backup API. Copying the file while the process is writing can tear a page. `sqlite3 data/watchdog.sqlite ".backup data/watchdog.sqlite.bak"` is the safe copy. Restoring that file restores incidents and outbox rows. It does not restore an MLS conversation, because this build does not have one. When Marmot state exists, do not copy an old snapshot back over a newer epoch. Re-onboard instead.
+
+### Docker
+
+```bash
+docker build -t nostr-watchdog .
+docker run --rm -p 8787:8787 -v watchdog-data:/data -e OPERATOR_TOKEN=replace-me nostr-watchdog
+```
+
+The image runs as uid 10001 and keeps the database on `/data`. It does not include Node.js. It does not contact Cloudflare.
+
+## Cloudflare staging
+
+`wrangler.staging.toml` is the only Wrangler config for this branch's Worker. The existing `wrangler.jsonc` belongs to the TypeScript Worker. Do not deploy it from this branch over the production name.
+
+```bash
+npx wrangler d1 create nostr-watchdog-rust-staging
+```
+
+Put the new database id into `wrangler.staging.toml`. Leave the production id alone. Then:
+
+```bash
+npx wrangler deploy --config wrangler.staging.toml
+```
+
+That deploy is manual. GitHub Actions on this branch does not publish a Worker. The staging Worker does not send alerts. Do not bind production secrets to it.
+
+Building the Worker requires the `wasm32-unknown-unknown` target and `worker-build` 0.9. Wrangler is a Node tool used only at deploy time.
+
+## Resource notes
+
+No production traffic was measured. The native check loop is one process, one SQLite file, and one HTTP client. It does not keep relay sockets open between alerts. Vendor checks run hourly and store the GitHub JSON they parsed, bounded by the existing 7-day upstream retention.
+
+The Worker stub does not run probes, so it does not show the CPU cost of gift wrap or MLS on Workers. The TypeScript notes still apply to `main`: paid-plan cron CPU is required for gift-wrap work, and the free plan's 10 ms budget is not enough. MLS state would add Durable Object storage and a sync tick. That cost is not measured here because the engine is not linked.

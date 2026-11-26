@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - feat/rust-rewrite
   pull_request:
   workflow_dispatch:
 
@@ -11,96 +12,79 @@ permissions:
   contents: read
 
 jobs:
-  lint-and-typecheck:
+  rust:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          version: 12.21.0
+          toolchain: "1.100.0"
+          components: rustfmt, clippy
 
-      - name: Setup Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: "26.13.1"
-          cache: pnpm
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Clippy
+        run: cargo clippy --workspace --exclude watchdog-worker --all-targets -- -W clippy::all
 
-      - name: Validate formatting, lint, and types
-        run: pnpm validate
+      - name: Test
+        run: cargo test --workspace --exclude watchdog-worker
 
-      - name: Audit production dependencies
-        run: pnpm audit --prod --audit-level=high
+      - name: Release binary
+        run: cargo build --release -p watchdog-native
 
-  unit-and-integration-tests:
-    needs: lint-and-typecheck
+      - name: Install cargo-deny and cargo-audit
+        run: |
+          cargo install cargo-deny --locked
+          cargo install cargo-audit --locked
+
+      - name: Dependency policy
+        run: cargo deny check
+
+      - name: Known vulnerabilities
+        run: cargo audit
+
+  wasm-worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          version: 12.21.0
+          toolchain: "1.100.0"
+          targets: wasm32-unknown-unknown
 
-      - name: Setup Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: "26.13.1"
-          cache: pnpm
+      - name: Check the staging Worker
+        run: cargo check -p watchdog-worker --target wasm32-unknown-unknown
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Check the pinned cgka-engine for wasm
+        run: cargo check --manifest-path probes/mdk-engine/Cargo.toml --target wasm32-unknown-unknown
 
-      - name: Run unit tests
-        run: pnpm test:unit
-
-      - name: Run integration tests
-        run: pnpm test:integration
-
-      - name: Run security tests
-        run: pnpm test:security
-
-  coverage-and-build:
-    needs: unit-and-integration-tests
+  image:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 12.21.0
+      - name: Build the image
+        run: docker build -t nostr-watchdog:ci .
 
-      - name: Setup Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: "26.13.1"
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Run coverage
-        run: pnpm test:coverage
-
-      - name: Build
-        run: pnpm build
-
-      - name: Upload coverage artifact
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage-summary
-          path: coverage/coverage-summary.json
-          if-no-files-found: ignore
+      - name: Boot and read health
+        run: |
+          docker run -d --name watchdog -p 8787:8787 nostr-watchdog:ci
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:8787/healthz; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs watchdog
+          exit 1

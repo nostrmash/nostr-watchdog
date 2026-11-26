@@ -1,0 +1,29 @@
+# Staging Worker for the Rust rewrite. This file must not be used to update
+# the production Worker "nostr-watchdog" or its D1 database.
+# Deploy is manual: npx wrangler deploy --config wrangler.staging.toml
+# GitHub Actions does not deploy this.
+
+name = "nostr-watchdog-rust-staging"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-11-22"
+workers_dev = true
+
+[build]
+command = "worker-build --release"
+
+[limits]
+cpu_ms = 30000
+
+[triggers]
+crons = ["* * * * *", "0 * * * *"]
+
+[vars]
+ENVIRONMENT = "staging"
+WATCHDOG_ENABLED = "false"
+ALERTS_ENABLED = "false"
+ENABLE_MARMOT = "false"
+ENABLE_NIP17 = "false"
+
+# D1 is omitted on purpose. Create a database named nostr-watchdog-rust-staging
+# and add it here only after the Worker actually runs the shared engine.
+# Do not paste the production database id into this file.

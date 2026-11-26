@@ -1,0 +1,11 @@
+target
+.git
+.github
+node_modules
+probes
+tests
+src
+*.md
+!README.md
+.dev.vars
+.setup-secrets.json

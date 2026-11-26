@@ -1,37 +1,38 @@
-# Staging acceptance
+# WhiteNoise acceptance
 
-Run this against a staging Worker. Do not point it at production payment or publishing services. A relay acknowledgement is not phone delivery.
+This procedure is for a person with a test phone. It is not something CI can pass. Do not run it against the production sender keys or the operator's existing WhiteNoise account. Automated tests in this repository do not prove that an iPhone displayed a notification.
 
-Automated tests cover the code paths. The steps below are the ones that need a real account, a real relay, or a phone.
+Status: pending. No attempt has been made from this Rust code.
 
-## Before starting
+## Before any message is sent
 
-1. Create a staging D1 database and paste its id into `wrangler.jsonc` under `env.staging`. Do not invent an id.
-2. Apply migrations through `0005_source_failures.sql`: `pnpm migrate:staging`.
-3. Set staging secrets: `OPERATOR_TOKEN`, `STATUS_READ_TOKEN`, `STATUS_SIGNING_SECRET`, separate `SFS_BOT_NSEC` and `NOSTRMASH_BOT_NSEC`, `HEARTBEAT_KEYS`, read-only `ALBY_AUTH_TOKEN` and `BTCPAY_API_KEY`, and optional `TELEGRAM_BOT_TOKEN` plus `TELEGRAM_CHAT_IDS`.
-4. Set `PROJECT_RECIPIENTS` or `ADMIN_NPUB` to an npub that has published a signed kind `10050` inbox relay list. Set `BOOTSTRAP_RELAYS` to relays that store that list.
-5. Set `READ_GATEWAY_HEALTH_TOKEN` and `PUBLISH_GATEWAY_HEALTH_TOKEN` to the same values as each gateway's `HEALTH_PROBE_TOKEN`.
-6. Leave monitors disabled until the matching URL or heartbeat secret is set. An enabled monitor with an empty URL is misconfigured and `/v1/status` stays non-200.
-7. Deploy with `pnpm deploy:staging`. Confirm the cron triggers exist. Do not deploy production from this checklist.
+1. Create a new Nostr keypair for the watchdog test sender. Do not reuse `SFS_BOT_NSEC` or `NOSTRMASH_BOT_NSEC` from production.
+2. Install WhiteNoise on a device you control and create or use a test account that is not the daily driver.
+3. Confirm the Rust process is the native binary, `ENABLE_MARMOT` is still false, and the diagnostic says the engine is unavailable.
 
-## Checks
+Stop here with the current build. The steps below are the acceptance script for the day an official MDK storage adapter is linked. Running them now cannot succeed, because the process will not publish a Marmot message.
 
-| #   | Check                 | How                                                                                                                   | Pass                                                                                                                   |
-| --- | --------------------- | --------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| 1   | Deploy and cron       | Wrangler tail for one minute and one hour trigger                                                                     | Both jobs finish without `cycle_failed`                                                                                |
-| 2   | D1                    | `GET /v1/status` with `STATUS_READ_TOKEN`                                                                             | HTTP 200 only when `status` is `healthy`; the body includes `securityChecks`                                           |
-| 3   | Inbox discovery       | Operator relay diagnostic                                                                                             | The newest valid kind `10050` relays are listed                                                                        |
-| 4   | Two sender identities | One test alert per project                                                                                            | The gift wraps use different pubkeys                                                                                   |
-| 5   | Relay acknowledgement | Outbox row                                                                                                            | State is `relay_accepted` on at least one advertised inbox relay                                                       |
-| 6   | Phone                 | Locked-screen notification in a client that reads the recipient's inbox                                               | The message is visible. Do not mark this passed because a relay accepted the event                                     |
-| 7   | Outage and recovery   | Point one staging monitor at a closed port, wait for the failure threshold, then restore it                           | One open incident, then one recovery. No second outage alert                                                           |
-| 8   | Stalled worker        | Send a signed heartbeat with unchanged `progress` and `idle: false` until `HEARTBEAT_PROGRESS_SECONDS`                | The monitor becomes degraded. A fresh idle heartbeat does not                                                          |
-| 9   | Alby or BTCPay        | Use a read-only token against a staging hub or server, including a locked or unsynchronized response                  | The result is degraded or down, and the token cannot pay or spend                                                      |
-| 10  | Confirmed advisory    | Install a version inside a verified affected range, or use the bundled BTCPay policy on a staging version below 2.4.2 | One critical security alert                                                                                            |
-| 11  | Advisory outage       | Block only `api.github.com` security-advisories while releases still answer                                           | The release alert is kept. After three hourly failures, `/v1/status` is degraded. Recovery does not send a second copy |
-| 12  | Relay outage          | Use an inbox relay that refuses the gift wrap and set `TELEGRAM_CRITICAL_MODE` to `nostr_fallback`                    | One Telegram message. No second fallback for the same alert                                                            |
-| 13  | Dead letter           | Leave a row failing until eight attempts                                                                              | State is `failed` and `/v1/status` is non-200. Retry from the operator route queues it once                            |
-| 14  | External checker      | The non-Cloudflare probe in `docs/deployment.md`                                                                      | It pages on a timeout and on a forced `ALERTS_ENABLED=false` deploy, through its own channel                           |
-| 15  | Rollback              | `wrangler rollback --env staging`, then deploy the new version again                                                  | A queued alert is not sent twice. D1 rows are not rolled back by the Worker rollback                                   |
+## When an adapter exists
 
-Record which rows were executed. Leave phone delivery, production uptime, and the external check unmarked until they actually happened.
+1. Publish the test sender's key package and add the test WhiteNoise account as the only member.
+2. Reject a second member. The diagnostic must not show that member as joined.
+3. Send one test alert with `POST /v1/diagnostics/test-alert` and `"projectId": "smartflowsocial"` while selecting the Marmot transport. Confirm the alert text is visible in WhiteNoise while the app is open.
+4. Repeat with the app backgrounded, then with the phone locked, then after force-quitting the app. Record wall-clock time from the relay `OK` for the group message to the notification. Those are three different results. Relay `OK` alone is not a pass.
+5. Restart the watchdog process and send another alert. The same conversation must continue without creating a second group.
+6. Leave the process idle past the sync interval, then send again.
+7. Rotate the test device's push token, or reinstall WhiteNoise, and send again.
+8. Block the relays, confirm the outbox stays retrying, restore the relays, and confirm the stored event is the one that is published.
+9. With Telegram configured for critical alerts, create a critical incident and confirm Telegram still arrives when the Marmot publish fails, and that a Marmot failure does not cancel Telegram.
+
+## Targets, not guarantees
+
+These are the bars for calling the transport ready. They are not a claim about this branch.
+
+- At least 100 controlled sends under ordinary connectivity.
+- At least 99 of those observed on the device.
+- Median time under 5 seconds and 95th percentile under 15 seconds, measured on the device.
+- No duplicate notification for one stored publication during normal operation.
+- No MLS state that fails to open after a restart.
+- No manual repair between the sends after the initial join.
+
+A pass still does not mean v1.0.0 until the staging deploy and the migration notes have been reviewed.
