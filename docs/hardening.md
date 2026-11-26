@@ -62,7 +62,7 @@ cargo test -p watchdog-core -p watchdog-engine -p watchdog-notify -p watchdog-na
 
 ## Gates
 
-These are the results of this working tree. A GitHub Actions URL is recorded only after the workflow for the pushed commit has been created. The previous green run, https://github.com/nostrmash/nostr-watchdog/actions/runs/45881010284, is commit `4a3eadc` and does not include this change.
+These are the results for commit `2278d2f`. The workflow run is https://github.com/nostrmash/nostr-watchdog/actions/runs/45889582901. The earlier green run, https://github.com/nostrmash/nostr-watchdog/actions/runs/45881010284, is commit `4a3eadc` and does not include this change.
 
 | Gate | Result on this branch |
 | --- | --- |
@@ -74,8 +74,8 @@ These are the results of this working tree. A GitHub Actions URL is recorded onl
 | C6 Claims and retries | SQLite tests cover a stale token, an expired claim, transport-specific dead-letter retry, and shutdown that releases only `native-<pid>`. NIP-17 envelope reuse is covered by the engine tests. A live helper timeout was not executed on this branch. |
 | C7 D1 adapter concurrency | The workerd probe calls the store. It does not apply the fence by executing SQL against the D1 file from the test script. Reminder and acknowledgement races on two overlapping Worker isolates were not executed. |
 | C8 Isolated workerd suite | `sh tests/runtime/worker-scheduled.sh` passed: incident open and recovery, Telegram fallback, status HMAC, heartbeat replay and stale rejection, the D1 fence above, and the probe deadline. The fixture binds port 0. It does not kill an unrelated listener. |
-| C9 Docker | The Dockerfile pins Odin `dev-2026-10` revision `84bc3fc` and SHA-256 `c3c8b095621fd0c75f7f73e3a0829f1b4d45324225f20ba11ed8dc4da310a8ab`, builds linux/amd64 only, and leaves Odin out of the runtime image. The image was not built on this machine. The CI `image` job is the build. A marker file is not Marmot conversation recovery. |
-| C10 CI | `.github/workflows/ci.yml` runs fmt, Clippy, tests, cargo-deny, cargo-audit, the Worker and MDK wasm checks, the image job, and the workerd suite. Native helper tests, the OpenMLS Durable Object, Agent B's workspace, and a workerd MDK conversation are not jobs on this branch. The SQLCipher WASM probe is not a required success. Public relay tests stay opt-in. |
+| C9 Docker | The Dockerfile pins Odin `dev-2026-10` revision `84bc3fc` and SHA-256 `c3c8b095621fd0c75f7f73e3a0829f1b4d45324225f20ba11ed8dc4da310a8ab`, builds linux/amd64 only, and leaves Odin out of the runtime image. The image was not built on this arm64 machine. CI job `image` on run 45889582901 built it, started the watchdog, checked the helper socket, restarted the container, and found `/data/watchdog.sqlite` and `/data/marmot/persistence-marker` still present. A marker file is not Marmot conversation recovery. |
+| C10 CI | Run https://github.com/nostrmash/nostr-watchdog/actions/runs/45889582901 completed with `rust`, `wasm-worker`, `image`, and `workerd` all successful. That covers fmt, Clippy, tests, cargo-deny, cargo-audit, the Worker and MDK wasm checks, the image job, and the workerd suite. Native helper tests, the OpenMLS Durable Object, Agent B's workspace, and a workerd MDK conversation are not jobs on this branch. The SQLCipher WASM probe is not a required success. Public relay tests stay opt-in. |
 | C11 Migrations | `0011_delivery_fencing.sql` is additive. Existing files `0001`–`0010` are unchanged. SQLite tests upgrade a TypeScript-shaped database and an interrupted `0011` without inventing acceptance or an observed zero. No production database was migrated. |
 | C12 Integration contract | `docs/agent-c-integration.md` is the shared contract. `POST /v1/diagnostics/marmot/onboard` returns `unavailable` until `MarmotControl` is replaced. It does not claim a conversation exists. |
 
