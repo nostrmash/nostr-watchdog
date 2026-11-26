@@ -1,0 +1,21 @@
+[package]
+name = "marmot-worker-interop"
+version = "0.1.0"
+description = "Official SQLite MDK recipient used to test the Cloudflare storage provider."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cgka-engine = { workspace = true }
+cgka-traits = { workspace = true }
+getrandom = "0.2"
+hex = { workspace = true }
+k256 = { workspace = true }
+marmot-worker-runtime = { path = "../runtime" }
+nostr = { workspace = true }
+sha2 = { workspace = true }
+storage-sqlite = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182", features = ["test-support"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+transport-nostr-peeler = { workspace = true }
