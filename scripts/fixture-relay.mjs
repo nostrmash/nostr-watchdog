@@ -1,12 +1,16 @@
-// In-memory NIP-01 relay for local Marmot tests. It stores events and answers
-// REQ with EVENT then EOSE. It does not check signatures. It is not a public
-// relay and it listens on loopback only.
+// Loopback NIP-01 relay for local Marmot tests. It stores events and answers
+// REQ with EVENT then EOSE. Signature checks happen in the Rust test, which
+// holds the notification server's key. This process checks event shape only.
+// It listens on 127.0.0.1 and has no package dependency.
 
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { WebSocketServer } from "ws";
 
 const port = Number(process.env.PORT || 0);
 const events = new Map();
+const clients = new Set();
+const rejectKinds = new Set();
+let seq = 0;
 
 function address(event) {
   const d = (event.tags || []).find((tag) => tag[0] === "d");
@@ -41,7 +45,10 @@ function matching(filters, event) {
 }
 
 function limited(filters, found) {
-  found.sort((left, right) => right.created_at - left.created_at);
+  found.sort(
+    (left, right) =>
+      right.event.created_at - left.event.created_at || right.seq - left.seq,
+  );
   const limit = filters.reduce(
     (bound, filter) =>
       typeof filter.limit === "number" ? Math.min(bound, filter.limit) : bound,
@@ -50,81 +57,298 @@ function limited(filters, found) {
   return found.slice(0, limit);
 }
 
-const server = createServer();
-const sockets = new WebSocketServer({ server });
-const clients = new Set();
-sockets.on("connection", (socket) => {
-  socket.subs = new Map();
-  clients.add(socket);
-  socket.on("close", () => clients.delete(socket));
-  socket.on("message", (data) => {
+function hex(value, length) {
+  return typeof value === "string" && value.length === length && /^[0-9a-f]+$/i.test(value);
+}
+
+function structurallyValid(event) {
+  return (
+    event &&
+    typeof event === "object" &&
+    hex(event.id, 64) &&
+    hex(event.pubkey, 64) &&
+    hex(event.sig, 128) &&
+    Number.isInteger(event.kind) &&
+    Number.isInteger(event.created_at) &&
+    typeof event.content === "string" &&
+    Array.isArray(event.tags)
+  );
+}
+
+function broadcast(stored) {
+  const event = stored.event;
+  for (const client of clients) {
+    for (const [sub, filters] of client.subs) {
+      if (matching(filters, event)) {
+        client.send(JSON.stringify(["EVENT", sub, event]));
+      }
+    }
+  }
+}
+
+function acceptEvent(event) {
+  if (!structurallyValid(event)) {
+    return { ok: false, message: "invalid: event shape" };
+  }
+  if (rejectKinds.has(event.kind)) {
+    return { ok: false, message: "blocked: kind" };
+  }
+  const key = address(event);
+  if (key) {
+    for (const [id, stored] of events) {
+      if (address(stored.event) === key && stored.event.created_at <= event.created_at) {
+        events.delete(id);
+      }
+    }
+  }
+  seq += 1;
+  const stored = { seq, event };
+  events.set(event.id, stored);
+  broadcast(stored);
+  return { ok: true, message: "" };
+}
+
+function encodeFrame(opcode, payload) {
+  const body = Buffer.from(payload);
+  let header;
+  if (body.length < 126) {
+    header = Buffer.alloc(2);
+    header[1] = body.length;
+  } else if (body.length < 65536) {
+    header = Buffer.alloc(4);
+    header[1] = 126;
+    header.writeUInt16BE(body.length, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(body.length), 2);
+  }
+  header[0] = 0x80 | opcode;
+  return Buffer.concat([header, body]);
+}
+
+class Client {
+  constructor(socket) {
+    this.socket = socket;
+    this.buffer = Buffer.alloc(0);
+    this.subs = new Map();
+    this.fragments = [];
+    this.fragmentOpcode = 1;
+    clients.add(this);
+  }
+
+  send(text) {
+    if (!this.socket.destroyed) this.socket.write(encodeFrame(1, text));
+  }
+
+  push(chunk) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    while (this.consume()) {}
+  }
+
+  consume() {
+    if (this.buffer.length < 2) return false;
+    const first = this.buffer[0];
+    const second = this.buffer[1];
+    const fin = (first & 0x80) !== 0;
+    const opcode = first & 0x0f;
+    const masked = (second & 0x80) !== 0;
+    let length = second & 0x7f;
+    let offset = 2;
+    if (length === 126) {
+      if (this.buffer.length < 4) return false;
+      length = this.buffer.readUInt16BE(2);
+      offset = 4;
+    } else if (length === 127) {
+      if (this.buffer.length < 10) return false;
+      const wide = this.buffer.readBigUInt64BE(2);
+      if (wide > BigInt(1_000_000)) {
+        this.socket.destroy();
+        return false;
+      }
+      length = Number(wide);
+      offset = 10;
+    }
+    if (length > 1_000_000) {
+      this.socket.destroy();
+      return false;
+    }
+    const maskLength = masked ? 4 : 0;
+    if (this.buffer.length < offset + maskLength + length) return false;
+    let payload = this.buffer.subarray(offset + maskLength, offset + maskLength + length);
+    if (masked) {
+      const mask = this.buffer.subarray(offset, offset + 4);
+      payload = Buffer.from(payload);
+      for (let index = 0; index < payload.length; index += 1) {
+        payload[index] ^= mask[index % 4];
+      }
+    }
+    this.buffer = this.buffer.subarray(offset + maskLength + length);
+    this.frame(fin, opcode, payload);
+    return true;
+  }
+
+  frame(fin, opcode, payload) {
+    if (opcode === 0 || opcode === 1 || opcode === 2) {
+      const kind = opcode === 0 ? this.fragmentOpcode : opcode;
+      if (opcode !== 0) {
+        this.fragments = [];
+        this.fragmentOpcode = kind;
+      }
+      this.fragments.push(Buffer.from(payload));
+      if (!fin) return;
+      const message = Buffer.concat(this.fragments);
+      this.fragments = [];
+      if (kind === 1) this.message(message.toString("utf8"));
+      return;
+    }
+    if (opcode === 8) {
+      if (!this.socket.destroyed) this.socket.write(encodeFrame(8, payload));
+      this.socket.end();
+      return;
+    }
+    if (opcode === 9) {
+      if (!this.socket.destroyed) this.socket.write(encodeFrame(10, payload));
+    }
+  }
+
+  message(text) {
     let message;
     try {
-      message = JSON.parse(data.toString());
+      message = JSON.parse(text);
     } catch {
       return;
     }
     if (!Array.isArray(message) || message.length === 0) return;
     const [type, ...rest] = message;
-    if (type === "EVENT" && rest[0] && typeof rest[0].id === "string") {
-      const event = rest[0];
-      const key = address(event);
-      if (key) {
-        for (const [id, stored] of events) {
-          if (address(stored) === key && stored.created_at <= event.created_at) {
-            events.delete(id);
-          }
-        }
-      }
-      events.set(event.id, event);
-      socket.send(JSON.stringify(["OK", event.id, true, ""]));
-      for (const client of clients) {
-        for (const [sub, filters] of client.subs) {
-          if (matching(filters, event)) {
-            client.send(JSON.stringify(["EVENT", sub, event]));
-          }
-        }
-      }
+    if (type === "EVENT" && rest[0] && typeof rest[0] === "object") {
+      const result = acceptEvent(rest[0]);
+      const id = typeof rest[0].id === "string" ? rest[0].id : "";
+      this.send(JSON.stringify(["OK", id, result.ok, result.message]));
       return;
     }
     if (type === "REQ" && typeof rest[0] === "string") {
       const sub = rest[0];
       const filters = rest.slice(1).filter((item) => item && typeof item === "object");
-      socket.subs.set(sub, filters);
-      const found = [...events.values()].filter((event) => matching(filters, event));
-      for (const event of limited(filters, found)) {
-        socket.send(JSON.stringify(["EVENT", sub, event]));
+      this.subs.set(sub, filters);
+      const found = [...events.values()].filter((stored) => matching(filters, stored.event));
+      for (const stored of limited(filters, found)) {
+        this.send(JSON.stringify(["EVENT", sub, stored.event]));
       }
-      socket.send(JSON.stringify(["EOSE", sub]));
+      this.send(JSON.stringify(["EOSE", sub]));
       return;
     }
     if (type === "CLOSE" && typeof rest[0] === "string") {
-      socket.subs.delete(rest[0]);
+      this.subs.delete(rest[0]);
     }
-  });
-});
+  }
+}
 
-server.on("request", (request, response) => {
-  if (request.url !== "/stats") {
-    response.statusCode = 404;
-    response.end();
+function readBody(request) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > 1_000_000) {
+        reject(new Error("too_large"));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("end", () => resolve(Buffer.concat(chunks)));
+    request.on("error", reject);
+  });
+}
+
+const server = createServer(async (request, response) => {
+  const url = new URL(request.url || "/", "http://127.0.0.1");
+  if (request.method === "GET" && url.pathname === "/stats") {
+    const counts = {};
+    const giftWraps = [];
+    for (const stored of events.values()) {
+      const kind = String(stored.event.kind);
+      counts[kind] = (counts[kind] || 0) + 1;
+      if (stored.event.kind === 1059) {
+        const target = (stored.event.tags || []).find((tag) => tag[0] === "p");
+        giftWraps.push({
+          idPrefix: String(stored.event.id).slice(0, 12),
+          recipientPrefix: target ? String(target[1]).slice(0, 12) : "",
+        });
+      }
+    }
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ counts, giftWraps }));
     return;
   }
-  const counts = {};
-  const giftWraps = [];
-  for (const event of events.values()) {
-    const kind = String(event.kind);
-    counts[kind] = (counts[kind] || 0) + 1;
-    if (event.kind === 1059) {
-      const target = (event.tags || []).find((tag) => tag[0] === "p");
-      giftWraps.push({
-        idPrefix: String(event.id).slice(0, 12),
-        recipientPrefix: target ? String(target[1]).slice(0, 12) : "",
-      });
-    }
+  if (request.method === "GET" && url.pathname === "/order") {
+    const order = [...events.values()]
+      .map((stored) => ({ seq: stored.seq, kind: stored.event.kind }))
+      .sort((left, right) => left.seq - right.seq);
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify(order));
+    return;
   }
-  response.setHeader("content-type", "application/json");
-  response.end(JSON.stringify({ counts, giftWraps }));
+  if (request.method === "GET" && url.pathname === "/events") {
+    const kind = Number(url.searchParams.get("kind"));
+    const selected = [...events.values()]
+      .filter((stored) => stored.event.kind === kind)
+      .sort((left, right) => left.seq - right.seq)
+      .map((stored) => ({ seq: stored.seq, event: stored.event }));
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify(selected));
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/event") {
+    try {
+      const event = JSON.parse(await readBody(request));
+      const result = acceptEvent(event);
+      response.statusCode = result.ok ? 200 : 400;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify(result));
+    } catch {
+      response.statusCode = 400;
+      response.end();
+    }
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/control") {
+    try {
+      const body = JSON.parse(await readBody(request));
+      rejectKinds.clear();
+      for (const kind of body.rejectKinds || []) rejectKinds.add(kind);
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ rejectKinds: [...rejectKinds] }));
+    } catch {
+      response.statusCode = 400;
+      response.end();
+    }
+    return;
+  }
+  response.statusCode = 404;
+  response.end();
+});
+
+server.on("upgrade", (request, socket) => {
+  const key = request.headers["sec-websocket-key"];
+  if (!key || request.headers.upgrade?.toLowerCase() !== "websocket") {
+    socket.destroy();
+    return;
+  }
+  const accept = createHash("sha1")
+    .update(String(key) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    .digest("base64");
+  socket.write(
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+      "Upgrade: websocket\r\n" +
+      "Connection: Upgrade\r\n" +
+      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+  );
+  const client = new Client(socket);
+  socket.on("data", (chunk) => client.push(chunk));
+  socket.on("close", () => clients.delete(client));
+  socket.on("error", () => clients.delete(client));
 });
 
 server.listen(port, "127.0.0.1", () => {
