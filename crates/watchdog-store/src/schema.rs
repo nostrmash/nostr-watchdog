@@ -41,9 +41,13 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0009_operations",
         include_str!("../../../migrations/0009_operations.sql"),
     ),
+    (
+        "0010_lifecycle",
+        include_str!("../../../migrations/0010_lifecycle.sql"),
+    ),
 ];
 
-pub const SCHEMA_VERSION: &str = "0009_operations";
+pub const SCHEMA_VERSION: &str = "0010_lifecycle";
 
 /// Columns the running binary selects. A ledger entry without the column is
 /// not ready. A column without its ledger entry is not ready either.
@@ -58,6 +62,12 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[
     ("alert_outbox", "push_attempts"),
     ("alert_outbox", "logical_id"),
     ("alert_outbox", "submission_generation"),
+    ("alert_outbox", "message_reconcile_attempts"),
+    ("alert_outbox", "token_wait_attempts"),
+    ("alert_outbox", "push_publication_attempts"),
+    ("alert_outbox", "settled_at"),
+    ("alert_outbox", "operation_id"),
+    ("alert_outbox", "claim_owner"),
     ("alert_outbox", "terminal_reason"),
     ("incidents", "decision_generation"),
     ("incidents", "acked_at"),
@@ -79,6 +89,8 @@ pub const REQUIRED_INDEXES: &[&str] = &[
     "alert_outbox_due",
     "alert_outbox_state",
     "alert_outbox_logical",
+    "alert_outbox_operation",
+    "alert_outbox_owner",
     "heartbeat_nonces_expiry",
     "relay_list_cache_expiry",
     "idx_marmot_push_records_group",

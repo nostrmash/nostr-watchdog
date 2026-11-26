@@ -81,14 +81,46 @@ jobs:
       - name: Build the image
         run: docker build -t nostr-watchdog:ci .
 
-      - name: Boot and read health
+      - name: Boot, health, persistent state, and helper startup
         run: |
           docker run -d --name watchdog -p 8787:8787 nostr-watchdog:ci
           for _ in 1 2 3 4 5 6 7 8 9 10; do
             if curl -fsS http://127.0.0.1:8787/healthz; then
-              exit 0
+              break
             fi
             sleep 2
           done
-          docker logs watchdog
-          exit 1
+          curl -fsS http://127.0.0.1:8787/healthz | grep -F '"live":true'
+          docker exec watchdog test -x /usr/local/bin/nostr-watchdog
+          docker exec watchdog test -x /usr/local/bin/watchdog-marmot
+          docker exec watchdog test -d /data/marmot
+          docker exec -d watchdog /usr/local/bin/watchdog-marmot --root /data/marmot --socket /data/marmot/helper.sock
+          sleep 2
+          docker exec watchdog test -S /data/marmot/helper.sock
+          docker restart watchdog
+          curl -fsS http://127.0.0.1:8787/healthz | grep -F '"live":true'
+          docker exec watchdog test -d /data/marmot
+
+  workerd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          targets: wasm32-unknown-unknown
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install worker-build
+        run: cargo install worker-build --locked
+
+      - name: Workerd scheduled suite
+        run: sh tests/runtime/worker-scheduled.sh

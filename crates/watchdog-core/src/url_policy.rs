@@ -63,7 +63,9 @@ pub fn assert_probe_url(raw: &str, policy: UrlPolicy<'_>) -> Result<Url, UrlPoli
             message: "The probe host is not on the configured allowlist.",
         });
     }
-    if url.port().is_some() {
+    // Public probes stay on 443. The private profile is an explicit opt-in
+    // and may name the service port. Production configs do not set it.
+    if url.port().is_some() && !policy.private_network {
         return Err(UrlPolicyError {
             message: "The probe URL uses a non-default port.",
         });
@@ -399,6 +401,17 @@ mod tests {
     fn private_profile_allows_an_explicit_private_destination() {
         let url = assert_probe_url("http://10.1.2.3/health", allow!("10.1.2.3", true)).unwrap();
         assert_eq!(url.host_str(), Some("10.1.2.3"));
+        assert!(
+            assert_probe_url("http://10.1.2.3:8765/health", allow!("10.1.2.3", false)).is_err()
+        );
+        let fixture =
+            assert_probe_url("http://10.1.2.3:8765/health", allow!("10.1.2.3", true)).unwrap();
+        assert_eq!(fixture.port(), Some(8765));
+        assert!(assert_probe_url(
+            "https://app.example:8443/health",
+            allow!("app.example", false)
+        )
+        .is_err());
     }
 
     #[test]

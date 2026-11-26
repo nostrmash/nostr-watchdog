@@ -63,6 +63,7 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
             &notifier,
             ApiRequest::Ready {
                 marmot_supported: false,
+                startup_grace: false,
             },
             now_ms(),
             &SystemClock,
@@ -70,7 +71,7 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
         .await;
         return exact_json(response);
     }
-    let request = match api_request(&mut req).await {
+    let request = match api_request(&mut req, &get("OPERATOR_TOKEN")).await {
         Some(request) => request,
         None => return Response::error("not_found", 404),
     };
@@ -102,27 +103,69 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
     let http = WorkerHttp;
     let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
     let started = now_ms();
-    let deadline = started + 20_000;
-    let now = started;
-    if let Err(error) =
-        run_check_cycle(&store, &settings, &get, &http, &notifier, now, &SystemClock).await
-    {
-        console_log!("monitoring cycle failed: {error}");
-    }
-    if event.cron().starts_with("0 ") && now_ms() < deadline {
-        if let Err(error) =
-            run_update_cycle(&store, &settings, &get, &http, &notifier, now, &SystemClock).await
+    let hourly = event.cron().starts_with("0 ");
+    if hourly {
+        let deadline = started + 15_000;
+        if let Err(error) = run_update_cycle(
+            &store,
+            &settings,
+            &get,
+            &http,
+            &notifier,
+            started,
+            &SystemClock,
+            deadline,
+        )
+        .await
         {
             console_log!("vendor cycle failed: {error}");
         }
+        if now_ms() < deadline {
+            if let Err(error) = dispatch_transport(
+                &store,
+                &settings,
+                &get,
+                &notifier,
+                &SystemClock,
+                "marmot",
+                1,
+                0,
+                deadline,
+                "push",
+                "worker",
+            )
+            .await
+            {
+                console_log!("push reconciliation failed: {error}");
+            }
+        }
+        if now_ms() < deadline {
+            let _ = store.prune(now_ms()).await;
+        }
+        return Ok(());
     }
-    for (destination, critical, other, kind) in [
-        ("telegram", 2_usize, 1_usize, "delivery"),
-        ("nostr", 2, 1, "delivery"),
-        ("marmot", 1, 1, "delivery"),
-        ("marmot", 1, 0, "push"),
+    let health_deadline = started + 12_000;
+    if let Err(error) = run_check_cycle(
+        &store,
+        &settings,
+        &get,
+        &http,
+        &notifier,
+        started,
+        &SystemClock,
+        health_deadline,
+    )
+    .await
+    {
+        console_log!("monitoring cycle failed: {error}");
+    }
+    let dispatch_deadline = started + 20_000;
+    for (destination, critical, other) in [
+        ("telegram", 2_usize, 1_usize),
+        ("nostr", 2, 1),
+        ("marmot", 1, 1),
     ] {
-        if now_ms() >= deadline {
+        if now_ms() >= dispatch_deadline {
             break;
         }
         if let Err(error) = dispatch_transport(
@@ -134,16 +177,14 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
             destination,
             critical,
             other,
-            deadline,
-            kind,
+            dispatch_deadline,
+            "delivery",
+            "worker",
         )
         .await
         {
             console_log!("dispatch failed: {error}");
         }
-    }
-    if now_ms() < deadline {
-        let _ = store.prune(now_ms()).await;
     }
     Ok(())
 }
@@ -658,7 +699,17 @@ fn schema_error(error: &watchdog_store::StoreError) -> &'static str {
     }
 }
 
-async fn api_request(req: &mut Request) -> Option<ApiRequest> {
+fn operator_authorized(header: &Option<String>, operator: &str) -> bool {
+    let header = header.as_deref().unwrap_or("");
+    let token = header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+        .unwrap_or("")
+        .trim();
+    !operator.is_empty() && watchdog_core::crypto::secrets_equal(operator, token)
+}
+
+async fn api_request(req: &mut Request, operator: &str) -> Option<ApiRequest> {
     let path = req.path();
     let authorization = req.headers().get("authorization").ok().flatten();
     let header = |name: &str| req.headers().get(name).ok().flatten().unwrap_or_default();
@@ -707,7 +758,7 @@ async fn api_request(req: &mut Request) -> Option<ApiRequest> {
             id: (*id).to_string(),
         }),
         (Method::Post, ["v1", "diagnostics", "marmot", "onboard"]) => {
-            if authorization.is_none() {
+            if !operator_authorized(&authorization, operator) {
                 return Some(ApiRequest::Onboard {
                     authorization,
                     body: Vec::new(),
@@ -741,7 +792,7 @@ async fn api_request(req: &mut Request) -> Option<ApiRequest> {
             })
         }
         (Method::Post, ["v1", "diagnostics", "test-alert"]) => {
-            if authorization.is_none() {
+            if !operator_authorized(&authorization, operator) {
                 return Some(ApiRequest::TestAlert {
                     authorization,
                     body: Vec::new(),
@@ -763,7 +814,7 @@ async fn api_request(req: &mut Request) -> Option<ApiRequest> {
             id: (*id).to_string(),
         }),
         (Method::Post, ["v1", "incidents", id, action]) => {
-            if authorization.is_none() {
+            if !operator_authorized(&authorization, operator) {
                 return Some(ApiRequest::Incident {
                     authorization,
                     id: (*id).to_string(),

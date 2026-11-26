@@ -620,27 +620,31 @@ impl SqliteStore {
         limit: i64,
         kind: &str,
         oldest: i64,
+        runtime_id: &str,
     ) -> Result<Vec<OutboxRow>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id FROM alert_outbox
              WHERE state IN ('queued', 'retrying') AND next_attempt_at <= ?1
+               AND settled_at IS NULL
                AND (claim_until IS NULL OR claim_until < ?1)
                AND (?2 IS NULL OR destination = ?2)
                AND (
                  ((?3 = 'delivery' OR ?3 = 'delivery-critical' OR ?3 = 'delivery-other')
                     AND NOT (
                       destination = 'marmot'
-                      AND COALESCE(message_state, '') IN ('accepted', 'accepted_pending')
-                      AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', '')
+                      AND COALESCE(message_state, '') IN ('relay_accepted', 'accepted', 'accepted_pending')
+                      AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')
                     )
                     AND (?3 != 'delivery-critical' OR severity = 'critical')
                     AND (?3 != 'delivery-other' OR severity != 'critical'))
                  OR (?3 = 'push'
                     AND destination = 'marmot'
-                    AND COALESCE(message_state, '') IN ('accepted', 'accepted_pending')
-                    AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', '')
-                    AND COALESCE(push_attempts, 0) < 8
+                    AND COALESCE(message_state, '') IN ('relay_accepted', 'accepted', 'accepted_pending')
+                    AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')
+                    AND COALESCE(push_publication_attempts, 0) < 2
+                    AND COALESCE(unobservable_attempts, 0) < 2
+                    AND COALESCE(token_wait_attempts, 0) < 2
                     AND updated_at >= ?4)
                )
              ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, created_at
@@ -656,9 +660,10 @@ impl SqliteStore {
         for id in ids {
             let token = uuid::Uuid::new_v4().to_string();
             let changed = conn.execute(
-                "UPDATE alert_outbox SET claim_until = ?1, claim_token = ?2, state = 'retrying', updated_at = ?3
-                 WHERE id = ?4 AND state IN ('queued', 'retrying') AND (claim_until IS NULL OR claim_until < ?3)",
-                params![claim_until, token, now, id],
+                "UPDATE alert_outbox SET claim_until = ?1, claim_token = ?2, claim_owner = ?3, state = 'retrying', updated_at = ?4
+                 WHERE id = ?5 AND state IN ('queued', 'retrying') AND settled_at IS NULL
+                   AND (claim_until IS NULL OR claim_until < ?4)",
+                params![claim_until, token, runtime_id, now, id],
             )?;
             if changed > 0 {
                 if let Some(mut row) = read_outbox(&conn, &id)? {
@@ -821,28 +826,34 @@ impl SqliteStore {
 
     pub fn retry_dead_letter(&self, id: &str, now: i64) -> Result<RetryMode, StoreError> {
         let conn = self.lock()?;
-        let existing: Option<(Option<String>,)> = conn
+        let existing: Option<(String, Option<String>, Option<String>)> = conn
             .query_row(
-                "SELECT envelope_json FROM alert_outbox WHERE id = ?1 AND state = 'failed'",
+                "SELECT destination, envelope_json, message_state FROM alert_outbox WHERE id = ?1 AND state = 'failed'",
                 params![id],
-                |row| Ok((row.get(0)?,)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((envelope,)) = existing else {
+        let Some((destination, envelope, message_state)) = existing else {
             return Ok(RetryMode::Missing);
         };
-        let mode = if envelope.is_some() {
-            RetryMode::SameOperation
-        } else {
-            RetryMode::NewSubmission
+        let mode = match destination.as_str() {
+            "marmot" => RetryMode::Reconcile,
+            "telegram" => RetryMode::SameOperation,
+            "nostr" if envelope.is_some() => RetryMode::SameOperation,
+            "nostr" => RetryMode::NewSubmission,
+            _ if envelope.is_some() => RetryMode::SameOperation,
+            _ => RetryMode::NewSubmission,
         };
+        let _ = message_state;
         conn.execute(
             "UPDATE alert_outbox
              SET state = 'queued', next_attempt_at = ?1, claim_until = NULL, claim_token = NULL,
-                 last_error = NULL, updated_at = ?1,
-                 attempt_count = CASE WHEN envelope_json IS NULL THEN 0 ELSE attempt_count END,
+                 claim_owner = NULL, settled_at = NULL, updated_at = ?1,
+                 attempt_count = CASE
+                   WHEN destination = 'nostr' AND envelope_json IS NULL THEN 0
+                   ELSE attempt_count END,
                  submission_generation = CASE
-                   WHEN envelope_json IS NULL THEN submission_generation + 1
+                   WHEN destination = 'nostr' AND envelope_json IS NULL THEN submission_generation + 1
                    ELSE submission_generation END
              WHERE id = ?2 AND state = 'failed'",
             params![now, id],
@@ -1378,19 +1389,53 @@ impl SqliteStore {
                  logical_id = COALESCE(logical_id, ?12),
                  message_state = CASE
                    WHEN ?7 IS NULL THEN message_state
-                   WHEN ?7 IN ('relay_accepted', 'message_accepted') THEN 'accepted'
-                   WHEN ?7 IN ('accepted_pending', 'completion_unknown') THEN 'accepted_pending'
-                   WHEN ?7 = 'message_prepared' THEN 'prepared'
-                   ELSE 'failed' END,
+                   WHEN ?7 IN ('relay_accepted', 'message_accepted', 'accepted', 'published') THEN 'relay_accepted'
+                   WHEN ?7 = 'accepted_pending' THEN 'accepted_pending'
+                   WHEN ?7 = 'completion_unknown' THEN 'completion_unknown'
+                   WHEN ?7 IN ('message_prepared', 'prepared') THEN 'prepared'
+                   WHEN ?7 = 'not_submitted' THEN 'not_submitted'
+                   WHEN ?7 IN ('rejected', 'failed') THEN 'rejected'
+                   ELSE message_state END,
                  push_state = CASE
                    WHEN ?8 IS NULL THEN push_state
-                   WHEN ?8 = 'push_trigger_accepted' THEN 'accepted'
-                   WHEN ?8 IN ('push_token_unavailable', 'push_unobservable', 'completion_unknown') THEN 'unobservable'
-                   WHEN ?8 = 'push_trigger_prepared' THEN 'pending'
-                   WHEN ?8 = 'push_expired' THEN 'expired'
-                   ELSE 'rejected' END,
-                 message_attempts = message_attempts + CASE WHEN ?7 IS NOT NULL THEN 1 ELSE 0 END,
-                 push_attempts = push_attempts + CASE WHEN ?8 IS NOT NULL THEN 1 ELSE 0 END,
+                   WHEN ?8 IN ('relay_accepted', 'push_trigger_accepted') THEN 'relay_accepted'
+                   WHEN ?8 = 'unknown' THEN 'unknown'
+                   WHEN ?8 = 'not_required' THEN 'not_required'
+                   WHEN ?8 = 'not_attempted' THEN 'not_attempted'
+                   WHEN ?8 IN ('token_unavailable', 'push_token_unavailable') THEN 'token_unavailable'
+                   WHEN ?8 IN ('prepared', 'push_trigger_prepared') THEN 'prepared'
+                   WHEN ?8 = 'pending' THEN 'pending'
+                   WHEN ?8 = 'publication_attempted' THEN 'publication_attempted'
+                   WHEN ?8 = 'rejected' THEN 'rejected'
+                   WHEN ?8 IN ('expired', 'push_expired') THEN 'expired'
+                   WHEN ?8 IN ('unobservable', 'push_unobservable') THEN 'unobservable'
+                   WHEN ?8 = 'terminal_failure' THEN 'terminal_failure'
+                   ELSE push_state END,
+                 message_attempts = message_attempts + CASE
+                   WHEN ?7 IS NOT NULL AND COALESCE(message_phase, '') != ?7
+                     AND COALESCE(message_state, '') IN ('', 'not_submitted', 'prepared')
+                     AND ?7 NOT IN ('not_submitted')
+                     AND ?7 IN ('relay_accepted', 'message_accepted', 'accepted', 'published', 'accepted_pending', 'completion_unknown', 'message_prepared', 'prepared', 'rejected', 'failed')
+                   THEN 1 ELSE 0 END,
+                 message_reconcile_attempts = message_reconcile_attempts + CASE
+                   WHEN ?7 IS NOT NULL AND COALESCE(message_phase, '') != ?7
+                     AND COALESCE(message_state, '') IN ('relay_accepted', 'accepted', 'accepted_pending', 'completion_unknown')
+                   THEN 1 ELSE 0 END,
+                 token_wait_attempts = token_wait_attempts + CASE
+                   WHEN ?8 IN ('token_unavailable', 'push_token_unavailable') AND COALESCE(push_phase, '') != ?8 THEN 1 ELSE 0 END,
+                 push_publication_attempts = push_publication_attempts + CASE
+                   WHEN ?8 IN ('publication_attempted', 'prepared', 'push_trigger_prepared') AND COALESCE(push_phase, '') != ?8 THEN 1 ELSE 0 END,
+                 unobservable_attempts = unobservable_attempts + CASE
+                   WHEN ?8 IN ('unobservable', 'push_unobservable') AND COALESCE(push_phase, '') != ?8 THEN 1 ELSE 0 END,
+                 unknown_attempts = unknown_attempts + CASE
+                   WHEN (?7 = 'completion_unknown' OR ?8 = 'unknown') AND (COALESCE(message_phase, '') != COALESCE(?7, '') OR COALESCE(push_phase, '') != COALESCE(?8, '')) THEN 1 ELSE 0 END,
+                 push_attempts = push_attempts + CASE
+                   WHEN ?8 IN ('publication_attempted', 'push_trigger_prepared') AND COALESCE(push_phase, '') != ?8 THEN 1 ELSE 0 END,
+                 preserve_message = CASE
+                   WHEN ?7 IN ('relay_accepted', 'message_accepted', 'accepted', 'published', 'accepted_pending') THEN 1
+                   ELSE preserve_message END,
+                 operation_id = COALESCE(operation_id, CASE WHEN destination = 'marmot' THEN id ELSE NULL END),
+                 started_at_ms = COALESCE(started_at_ms, ?11),
                  message_updated_at = CASE WHEN ?7 IS NOT NULL THEN ?11 ELSE message_updated_at END,
                  push_updated_at = CASE WHEN ?8 IS NOT NULL THEN ?11 ELSE push_updated_at END,
                  terminal_reason = COALESCE(?4, terminal_reason)
@@ -1417,11 +1462,17 @@ impl SqliteStore {
             return Ok(false);
         }
         if let Some(alert) = fallback {
+            let logical = logical_notification_id(&alert.dedupe_key);
             tx.execute(
                 "INSERT OR IGNORE INTO alert_outbox (
                     id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
                     state, payload_text, attempt_count, next_attempt_at, created_at, updated_at, logical_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10, ?11)",
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, 0, ?10, ?10, ?10, ?11
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM alert_outbox
+                   WHERE destination = 'telegram' AND logical_id = ?11 AND id != ?1
+                 )",
                 params![
                     alert.id,
                     alert.alert_class.as_str(),
@@ -1433,7 +1484,7 @@ impl SqliteStore {
                     alert.severity.as_str(),
                     alert.text,
                     now,
-                    logical_notification_id(&alert.dedupe_key),
+                    logical,
                 ],
             )?;
         }
@@ -1469,11 +1520,44 @@ impl SqliteStore {
         }
     }
 
-    pub fn release_open_claims(&self, now: i64) -> Result<usize, StoreError> {
+    pub fn release_open_claims(&self, runtime_id: &str, now: i64) -> Result<usize, StoreError> {
+        if runtime_id.is_empty() {
+            return Ok(0);
+        }
         Ok(self.lock()?.execute(
             "UPDATE alert_outbox
-             SET claim_until = NULL, claim_token = NULL, state = 'retrying', updated_at = ?1
-             WHERE state = 'retrying' AND claim_token IS NOT NULL",
+             SET claim_until = NULL, claim_token = NULL, claim_owner = NULL, state = 'retrying', updated_at = ?1
+             WHERE state = 'retrying' AND claim_owner = ?2",
+            params![now, runtime_id],
+        )?)
+    }
+
+    pub fn settle_expired(&self, now: i64) -> Result<usize, StoreError> {
+        Ok(self.lock()?.execute(
+            "UPDATE alert_outbox
+             SET state = CASE
+                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted') THEN 'relay_accepted'
+                   WHEN COALESCE(message_state, '') = 'completion_unknown' THEN 'failed'
+                   ELSE 'failed' END,
+                 settled_at = ?1,
+                 terminal_reason = COALESCE(terminal_reason, 'reconciliation_window'),
+                 push_state = CASE
+                   WHEN COALESCE(push_state, '') IN ('publication_attempted', 'prepared', 'pending') THEN 'unobservable'
+                   ELSE push_state END,
+                 claim_token = NULL,
+                 claim_until = NULL,
+                 updated_at = ?1
+             WHERE state IN ('queued', 'retrying')
+               AND settled_at IS NULL
+               AND (claim_until IS NULL OR claim_until < ?1)
+               AND (
+                 updated_at < ?1 - 86400000
+                 OR (COALESCE(message_state, '') = 'completion_unknown' AND message_reconcile_attempts >= 4)
+                 OR (COALESCE(message_state, '') IN ('accepted_pending', 'prepared') AND message_attempts >= 8 AND updated_at < ?1 - 900000)
+                 OR (COALESCE(push_state, '') = 'token_unavailable' AND token_wait_attempts >= 2)
+                 OR (COALESCE(push_state, '') IN ('publication_attempted', 'unobservable') AND unobservable_attempts >= 2)
+                 OR COALESCE(push_state, '') IN ('rejected', 'terminal_failure', 'expired')
+               )",
             params![now],
         )?)
     }
@@ -1513,7 +1597,8 @@ impl SqliteStore {
     pub fn record_onboarding(
         &self,
         project_id: &str,
-        idempotency_key: &str,
+        operation_id: &str,
+        replace: bool,
         now: i64,
     ) -> Result<Option<OnboardReceipt>, StoreError> {
         self.lock()?.execute(
@@ -1523,10 +1608,12 @@ impl SqliteStore {
              ON CONFLICT(project_id) DO UPDATE SET
                onboard_idempotency_key = excluded.onboard_idempotency_key,
                onboard_requested_at = excluded.onboard_requested_at,
+               engine_status = 'onboard_requested',
                updated_at = excluded.updated_at
              WHERE marmot_projects.onboard_idempotency_key IS NULL
-                OR marmot_projects.onboard_idempotency_key = excluded.onboard_idempotency_key",
-            params![project_id, now, idempotency_key],
+                OR marmot_projects.onboard_idempotency_key = excluded.onboard_idempotency_key
+                OR ?4 = 1",
+            params![project_id, now, operation_id, i64::from(replace)],
         )?;
         self.lock()?
             .query_row(
@@ -1686,7 +1773,10 @@ fn read_outbox(conn: &Connection, id: &str) -> Result<Option<OutboxRow>, StoreEr
                 accepted_relays, failed_relays, last_error, created_at, updated_at,
                 message_phase, push_phase, push_envelope_json, message_event_id,
                 message_state, push_state, message_attempts, push_attempts, message_updated_at,
-                push_updated_at, terminal_reason, operator_ack_at, logical_id, submission_generation
+                push_updated_at, terminal_reason, operator_ack_at, logical_id, submission_generation,
+                message_reconcile_attempts, unknown_attempts, token_wait_attempts,
+                push_publication_attempts, unobservable_attempts, started_at_ms, preserve_message,
+                settled_at, operation_id, claim_owner
          FROM alert_outbox WHERE id = ?1",
         params![id],
         |row| {
@@ -1725,6 +1815,16 @@ fn read_outbox(conn: &Connection, id: &str) -> Result<Option<OutboxRow>, StoreEr
                 operator_ack_at: row.get(31)?,
                 logical_id: row.get(32)?,
                 submission_generation: row.get(33)?,
+                message_reconcile_attempts: row.get(34)?,
+                unknown_attempts: row.get(35)?,
+                token_wait_attempts: row.get(36)?,
+                push_publication_attempts: row.get(37)?,
+                unobservable_attempts: row.get(38)?,
+                started_at_ms: row.get(39)?,
+                preserve_message: row.get::<_, i64>(40)? == 1,
+                settled_at: row.get(41)?,
+                operation_id: row.get(42)?,
+                claim_owner: row.get(43)?,
             })
         },
     )
@@ -1866,8 +1966,18 @@ impl OperationalStore for SqliteStore {
         limit: i64,
         kind: &str,
         oldest: i64,
+        runtime_id: &str,
     ) -> Result<Vec<OutboxRow>, StoreError> {
-        SqliteStore::claim_outbox(self, now, claim_until, destination, limit, kind, oldest)
+        SqliteStore::claim_outbox(
+            self,
+            now,
+            claim_until,
+            destination,
+            limit,
+            kind,
+            oldest,
+            runtime_id,
+        )
     }
     async fn claim_ownership(
         &self,
@@ -2085,8 +2195,11 @@ impl OperationalStore for SqliteStore {
     async fn acknowledge_alert(&self, id: &str, now: i64) -> Result<bool, StoreError> {
         SqliteStore::acknowledge_alert(self, id, now)
     }
-    async fn release_open_claims(&self, now: i64) -> Result<usize, StoreError> {
-        SqliteStore::release_open_claims(self, now)
+    async fn release_open_claims(&self, runtime_id: &str, now: i64) -> Result<usize, StoreError> {
+        SqliteStore::release_open_claims(self, runtime_id, now)
+    }
+    async fn settle_expired(&self, now: i64) -> Result<usize, StoreError> {
+        SqliteStore::settle_expired(self, now)
     }
     async fn expedite_destination(&self, destination: &str, now: i64) -> Result<usize, StoreError> {
         SqliteStore::expedite_destination(self, destination, now)
@@ -2094,10 +2207,11 @@ impl OperationalStore for SqliteStore {
     async fn record_onboarding(
         &self,
         project_id: &str,
-        idempotency_key: &str,
+        operation_id: &str,
+        replace: bool,
         now: i64,
     ) -> Result<Option<OnboardReceipt>, StoreError> {
-        SqliteStore::record_onboarding(self, project_id, idempotency_key, now)
+        SqliteStore::record_onboarding(self, project_id, operation_id, replace, now)
     }
     async fn count_delivery_pressure(&self, now: i64) -> Result<(i64, i64), StoreError> {
         SqliteStore::count_delivery_pressure(self, now)
@@ -2259,7 +2373,9 @@ mod tests {
                 10,
             )
             .unwrap();
-        let claimed = store.claim_outbox(10, 100, None, 4, "delivery", 0).unwrap();
+        let claimed = store
+            .claim_outbox(10, 100, None, 4, "delivery", 0, "test")
+            .unwrap();
         assert_eq!(claimed.len(), 1);
         let token = claimed[0].claim_token.clone().unwrap();
         assert!(!store.extend_claim("alt_1", "other", 200, 10).unwrap());
@@ -2545,7 +2661,7 @@ mod tests {
             )
             .unwrap();
         let claimed = store
-            .claim_outbox(1_000, 1_500, Some("nostr"), 1, "delivery", 0)
+            .claim_outbox(1_000, 1_500, Some("nostr"), 1, "delivery", 0, "test")
             .unwrap();
         let token = claimed[0].claim_token.clone().unwrap();
         assert!(!store
@@ -2555,5 +2671,520 @@ mod tests {
             store.claim_ownership("alt_claim", &token, 2_000).unwrap(),
             ClaimOwnership::Expired
         ));
+    }
+
+    fn draft(id: &str, destination: Destination, dedupe: &str) -> AlertDraft {
+        AlertDraft {
+            id: id.to_string(),
+            alert_class: AlertClass::Outage,
+            incident_id: Some("inc".to_string()),
+            monitor_id: "sfs-web".to_string(),
+            project_id: "smartflowsocial".to_string(),
+            dedupe_key: dedupe.to_string(),
+            destination,
+            severity: Severity::Critical,
+            text: "down".to_string(),
+        }
+    }
+
+    #[test]
+    fn fallback_is_created_only_by_the_winning_claim_and_is_not_duplicated() {
+        let store = SqliteStore::memory().unwrap();
+        store
+            .insert_alert(
+                &draft("alt_m", Destination::Marmot, "incident:inc:open:marmot"),
+                10,
+            )
+            .unwrap();
+        let claimed = store
+            .claim_outbox(10, 100, Some("marmot"), 1, "delivery", 0, "runtime-a")
+            .unwrap();
+        let token = claimed[0].claim_token.clone().unwrap();
+        let fallback = draft(
+            "alt_t",
+            Destination::Telegram,
+            "incident:inc:fallback:telegram",
+        );
+        assert!(!store
+            .finish_with_fallback(
+                "alt_m",
+                "stale",
+                DeliveryState::Failed,
+                1,
+                10,
+                Some("lost"),
+                None,
+                None,
+                Some("rejected"),
+                Some("unobservable"),
+                None,
+                None,
+                Some("logical"),
+                Some(&fallback),
+                20,
+            )
+            .unwrap());
+        assert!(store.read_outbox_row("alt_t").unwrap().is_none());
+        assert!(store
+            .finish_with_fallback(
+                "alt_m",
+                &token,
+                DeliveryState::Failed,
+                1,
+                10,
+                Some("rejected"),
+                None,
+                None,
+                Some("rejected"),
+                Some("unobservable"),
+                None,
+                None,
+                Some("logical"),
+                Some(&fallback),
+                20,
+            )
+            .unwrap());
+        assert!(store.read_outbox_row("alt_t").unwrap().is_some());
+        let again = draft("alt_t2", Destination::Telegram, "incident:inc:fallback");
+        store
+            .insert_alert(
+                &draft("alt_m2", Destination::Marmot, "incident:inc:open:marmot:2"),
+                30,
+            )
+            .unwrap();
+        let second = store
+            .claim_outbox(30, 100, Some("marmot"), 1, "delivery", 0, "runtime-a")
+            .unwrap();
+        assert!(store
+            .finish_with_fallback(
+                "alt_m2",
+                &second[0].claim_token.clone().unwrap(),
+                DeliveryState::Failed,
+                1,
+                30,
+                Some("rejected"),
+                None,
+                None,
+                Some("rejected"),
+                Some("unobservable"),
+                None,
+                None,
+                Some("logical-2"),
+                Some(&again),
+                40,
+            )
+            .unwrap());
+        let logical = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT logical_id FROM alert_outbox WHERE id = 'alt_t'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let count: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM alert_outbox WHERE destination = 'telegram' AND logical_id = ?1",
+                params![logical],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(store.read_outbox_row("alt_t2").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_repeated_phase_does_not_increment_and_unknown_is_not_rejected() {
+        let store = SqliteStore::memory().unwrap();
+        store
+            .insert_alert(&draft("alt_p", Destination::Marmot, "phase"), 10)
+            .unwrap();
+        let claimed = store
+            .claim_outbox(10, 200, Some("marmot"), 1, "delivery", 0, "runtime-a")
+            .unwrap();
+        let token = claimed[0].claim_token.clone().unwrap();
+        assert!(store
+            .finish_with_fallback(
+                "alt_p",
+                &token,
+                DeliveryState::Retrying,
+                1,
+                10,
+                None,
+                None,
+                None,
+                Some("relay_accepted"),
+                Some("publication_attempted"),
+                Some("event-1"),
+                None,
+                None,
+                None,
+                20,
+            )
+            .unwrap());
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE alert_outbox SET state = 'retrying', claim_token = 'again', claim_until = 300, updated_at = 30 WHERE id = 'alt_p'",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .finish_with_fallback(
+                "alt_p",
+                "again",
+                DeliveryState::Retrying,
+                1,
+                30,
+                None,
+                None,
+                None,
+                Some("relay_accepted"),
+                Some("unobservable"),
+                Some("event-1"),
+                None,
+                None,
+                None,
+                40,
+            )
+            .unwrap());
+        let row = store.read_outbox_row("alt_p").unwrap().unwrap();
+        assert_eq!(row.message_state.as_deref(), Some("relay_accepted"));
+        assert_eq!(row.push_state.as_deref(), Some("unobservable"));
+        assert_eq!(row.message_attempts, 1);
+        assert_eq!(row.message_reconcile_attempts, 0);
+        assert_eq!(row.push_publication_attempts, 1);
+        assert_eq!(row.unobservable_attempts, 1);
+        assert!(row.preserve_message);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE alert_outbox SET state = 'retrying', claim_token = 'bad', claim_until = 500 WHERE id = 'alt_p'",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .finish_with_fallback(
+                "alt_p",
+                "bad",
+                DeliveryState::Failed,
+                2,
+                50,
+                Some("unknown"),
+                None,
+                None,
+                Some("not-a-message-state"),
+                Some("not-a-push-state"),
+                None,
+                None,
+                None,
+                None,
+                60,
+            )
+            .unwrap());
+        let row = store.read_outbox_row("alt_p").unwrap().unwrap();
+        assert_eq!(row.message_state.as_deref(), Some("relay_accepted"));
+        assert_eq!(row.push_state.as_deref(), Some("unobservable"));
+    }
+
+    #[test]
+    fn retries_follow_the_transport_and_shutdown_releases_only_this_runtime() {
+        let store = SqliteStore::memory().unwrap();
+        store
+            .insert_alert(&draft("nip", Destination::Nostr, "nip"), 10)
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE alert_outbox SET state = 'failed', envelope_json = '{\"id\":\"evt\"}', message_state = 'relay_accepted' WHERE id = 'nip'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.retry_dead_letter("nip", 20).unwrap(),
+            RetryMode::SameOperation
+        );
+        let row = store.read_outbox_row("nip").unwrap().unwrap();
+        assert_eq!(row.message_state.as_deref(), Some("relay_accepted"));
+        assert_eq!(row.submission_generation, 0);
+        store
+            .insert_alert(&draft("marmot", Destination::Marmot, "marmot"), 10)
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE alert_outbox SET state = 'failed', message_state = 'accepted_pending', operation_id = 'marmot' WHERE id = 'marmot'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.retry_dead_letter("marmot", 20).unwrap(),
+            RetryMode::Reconcile
+        );
+        let row = store.read_outbox_row("marmot").unwrap().unwrap();
+        assert_eq!(row.message_state.as_deref(), Some("accepted_pending"));
+        store
+            .insert_alert(&draft("bare", Destination::Nostr, "bare"), 10)
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE alert_outbox SET state = 'failed' WHERE id = 'bare'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.retry_dead_letter("bare", 20).unwrap(),
+            RetryMode::NewSubmission
+        );
+        assert_eq!(
+            store
+                .read_outbox_row("bare")
+                .unwrap()
+                .unwrap()
+                .submission_generation,
+            1
+        );
+        store
+            .insert_alert(&draft("owned", Destination::Telegram, "owned"), 10)
+            .unwrap();
+        store
+            .claim_outbox(10, 1_000, Some("telegram"), 1, "delivery", 0, "runtime-a")
+            .unwrap();
+        store
+            .insert_alert(&draft("other", Destination::Telegram, "other"), 10)
+            .unwrap();
+        store
+            .claim_outbox(10, 1_000, Some("telegram"), 1, "delivery", 0, "runtime-b")
+            .unwrap();
+        assert_eq!(store.release_open_claims("runtime-a", 20).unwrap(), 1);
+        let other = store.read_outbox_row("other").unwrap().unwrap();
+        assert_eq!(other.claim_owner.as_deref(), Some("runtime-b"));
+        assert!(other.claim_token.is_some());
+        assert_eq!(store.release_open_claims("", 20).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_acknowledged_incident_does_not_accept_a_stale_reminder() {
+        let store = SqliteStore::memory().unwrap();
+        let mut loaded = store.load_memory("sfs-web").unwrap();
+        for now in [1_i64, 2] {
+            let result = check_result(
+                MonitorStatus::Down,
+                Some("http_status"),
+                "down",
+                Some(10),
+                None,
+            );
+            let next = transition(TransitionInput {
+                memory: &loaded.memory,
+                result: &result,
+                now,
+                failure_threshold: 2,
+                recovery_threshold: 2,
+                severity: Severity::Critical,
+                incident_on_degraded: false,
+                unknown_threshold: 5,
+                reminder_seconds: 0,
+                new_incident_id: "inc_one",
+                new_integrity_incident_id: "inc_integrity",
+            });
+            let alerts = next
+                .notices
+                .iter()
+                .map(|notice| AlertDraft {
+                    id: format!("open_{now}"),
+                    alert_class: AlertClass::Outage,
+                    incident_id: Some(notice.incident_id.clone()),
+                    monitor_id: "sfs-web".to_string(),
+                    project_id: "smartflowsocial".to_string(),
+                    dedupe_key: format!("incident:{}:open:nostr", notice.incident_id),
+                    destination: Destination::Nostr,
+                    severity: notice.severity,
+                    text: "down".to_string(),
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                store
+                    .commit_check(
+                        "sfs-web",
+                        "smartflowsocial",
+                        loaded.generation,
+                        &next.memory,
+                        &result,
+                        now,
+                        &next.notices,
+                        &alerts,
+                    )
+                    .unwrap()
+                    .committed
+            );
+            loaded = store.load_memory("sfs-web").unwrap();
+        }
+        let incident = loaded.memory.open_incident.clone().unwrap();
+        let remind = Notice {
+            event: NoticeEvent::Remind,
+            incident_id: incident.id.clone(),
+            kind: IncidentKind::Outage,
+            severity: Severity::Critical,
+            reason: "still down".to_string(),
+            occurred_at: 100,
+            monitor_status: MonitorStatus::Down,
+            decision_generation: incident.decision_generation,
+            reminder_count: incident.reminder_count,
+        };
+        let reminder = AlertDraft {
+            id: "remind_1".to_string(),
+            alert_class: AlertClass::Reminder,
+            incident_id: Some(incident.id.clone()),
+            monitor_id: "sfs-web".to_string(),
+            project_id: "smartflowsocial".to_string(),
+            dedupe_key: "incident:inc_one:reminder:1".to_string(),
+            destination: Destination::Nostr,
+            severity: Severity::Critical,
+            text: "still down".to_string(),
+        };
+        let result = check_result(
+            MonitorStatus::Down,
+            Some("http_status"),
+            "down",
+            Some(10),
+            None,
+        );
+        assert!(
+            store
+                .commit_check(
+                    "sfs-web",
+                    "smartflowsocial",
+                    loaded.generation,
+                    &loaded.memory,
+                    &result,
+                    100,
+                    &[remind.clone()],
+                    &[reminder.clone()],
+                )
+                .unwrap()
+                .committed
+        );
+        assert!(store.read_outbox_row("remind_1").unwrap().is_some());
+        loaded = store.load_memory("sfs-web").unwrap();
+        assert!(store.ack_incident(&incident.id, 110).unwrap());
+        let stale = reminder_after_ack(&store, &loaded, &incident.id);
+        assert!(!stale);
+        assert!(store.read_outbox_row("remind_stale").unwrap().is_none());
+    }
+
+    fn reminder_after_ack(store: &SqliteStore, loaded: &LoadedMemory, incident_id: &str) -> bool {
+        let incident = loaded.memory.open_incident.clone().unwrap();
+        let remind = Notice {
+            event: NoticeEvent::Remind,
+            incident_id: incident_id.to_string(),
+            kind: IncidentKind::Outage,
+            severity: Severity::Critical,
+            reason: "stale".to_string(),
+            occurred_at: 120,
+            monitor_status: MonitorStatus::Down,
+            decision_generation: incident.decision_generation,
+            reminder_count: incident.reminder_count,
+        };
+        let reminder = AlertDraft {
+            id: "remind_stale".to_string(),
+            alert_class: AlertClass::Reminder,
+            incident_id: Some(incident_id.to_string()),
+            monitor_id: "sfs-web".to_string(),
+            project_id: "smartflowsocial".to_string(),
+            dedupe_key: "incident:inc_one:reminder:stale".to_string(),
+            destination: Destination::Nostr,
+            severity: Severity::Critical,
+            text: "stale".to_string(),
+        };
+        let result = check_result(
+            MonitorStatus::Down,
+            Some("http_status"),
+            "down",
+            Some(10),
+            None,
+        );
+        store
+            .commit_check(
+                "sfs-web",
+                "smartflowsocial",
+                loaded.generation,
+                &loaded.memory,
+                &result,
+                120,
+                &[remind],
+                &[reminder],
+            )
+            .unwrap()
+            .committed
+            && store.read_outbox_row("remind_stale").unwrap().is_some()
+    }
+
+    #[test]
+    fn typescript_history_upgrades_without_inventing_acceptance() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);",
+        )
+        .unwrap();
+        for (id, sql) in crate::schema::MIGRATIONS.iter().take(5) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, 0)",
+                params![id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO alert_outbox (
+                id, alert_class, monitor_id, project_id, dedupe_key, destination, severity,
+                state, payload_text, next_attempt_at, created_at, updated_at
+             ) VALUES ('legacy', 'outage', 'sfs-web', 'smartflowsocial', 'legacy', 'marmot',
+                       'critical', 'failed', 'down', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        for (id, sql) in crate::schema::MIGRATIONS.iter().skip(5) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, 0)",
+                params![id],
+            )
+            .unwrap();
+        }
+        let state: Option<String> = conn
+            .query_row(
+                "SELECT message_state FROM alert_outbox WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, None);
+        let push: Option<String> = conn
+            .query_row(
+                "SELECT push_state FROM alert_outbox WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(push, None);
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT message_attempts FROM alert_outbox WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
+        assert!(validate_open_schema(&conn).is_ok());
     }
 }

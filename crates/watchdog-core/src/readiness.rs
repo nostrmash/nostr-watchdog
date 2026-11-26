@@ -28,6 +28,8 @@ pub struct ReadinessInput {
     pub projects_ready: bool,
     pub pending_recovery: i64,
     pub recent_retrying: i64,
+    /// True only during the documented startup window before the first success.
+    pub startup_grace: bool,
 }
 
 pub fn evaluate_readiness(input: &ReadinessInput) -> (bool, Value) {
@@ -38,15 +40,18 @@ pub fn evaluate_readiness(input: &ReadinessInput) -> (bool, Value) {
         .is_some_and(|age| age <= input.scheduler_stale_after_ms)
     {
         "fresh"
+    } else if input.scheduler_age_ms.is_none() && input.startup_grace {
+        "starting"
     } else if input.scheduler_age_ms.is_none() {
-        "unknown"
+        "uninitialized"
     } else {
         "stale"
     };
-    let marmot_blocks = input.marmot_enabled && input.marmot_state == "unavailable";
+    let marmot_blocks =
+        input.marmot_enabled && matches!(input.marmot_state, "unavailable" | "unconfigured");
     let nip17_blocks = input.nip17_enabled && !input.nip17_ready;
     let telegram_blocks = input.telegram_enabled && !input.telegram_ready;
-    let scheduler_blocks = scheduler == "stale";
+    let scheduler_blocks = scheduler == "stale" || scheduler == "uninitialized";
     let ready = input.database_ok
         && input.schema_ok
         && input.configuration_ok
@@ -70,7 +75,7 @@ pub fn evaluate_readiness(input: &ReadinessInput) -> (bool, Value) {
         "pushTokens": input.push_tokens,
         "pendingRecovery": input.pending_recovery,
         "recentRetrying": input.recent_retrying,
-        "policy": "Disabled optional transports are ignored. Unknown Marmot and push-token state do not fail readiness. An enabled mandatory transport that is unavailable does. Historical dead letters do not.",
+        "policy": "Disabled optional transports are ignored. Unknown Marmot and push-token state do not fail readiness. An enabled mandatory transport that is unavailable does. A scheduler that has never succeeded is not ready after the startup grace. Historical dead letters do not.",
     });
     (ready, body)
 }
@@ -107,6 +112,7 @@ mod tests {
             projects_ready: true,
             pending_recovery: 0,
             recent_retrying: 0,
+            startup_grace: false,
         }
     }
 

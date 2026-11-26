@@ -69,6 +69,7 @@ pub enum ApiRequest {
     },
     Ready {
         marmot_supported: bool,
+        startup_grace: bool,
     },
     Rejected {
         status: u16,
@@ -200,9 +201,10 @@ pub async fn handle<S: OperationalStore, N: Notifier, C: Clock>(
             authorization,
             body,
         } => onboard(store, get, authorization.as_deref(), &body, now).await,
-        ApiRequest::Ready { marmot_supported } => {
-            ready(store, settings, get, marmot_supported, now).await
-        }
+        ApiRequest::Ready {
+            marmot_supported,
+            startup_grace,
+        } => ready(store, settings, get, marmot_supported, startup_grace, now).await,
         ApiRequest::Rejected { status, error } => json_response(status, json!({"error": error})),
         ApiRequest::NotFound => json_response(404, json!({"error": "not_found"})),
     }
@@ -419,6 +421,7 @@ async fn test_alert<S: OperationalStore, N: Notifier, C: Clock>(
         1,
         now.saturating_add(4_000),
         "delivery",
+        "api",
     )
     .await;
     let delivery = store
@@ -490,6 +493,7 @@ async fn ready<S: OperationalStore>(
     settings: &Settings,
     get: &impl Fn(&str) -> String,
     marmot_supported: bool,
+    startup_grace: bool,
     now: i64,
 ) -> ApiResponse {
     let snapshot = store.snapshot().await.ok();
@@ -497,14 +501,38 @@ async fn ready<S: OperationalStore>(
         item.runs
             .iter()
             .find(|run| run.name == "checks")
-            .and_then(|run| run.finished_at.or(run.success_at))
+            .and_then(|run| run.success_at)
             .map(|finished| now.saturating_sub(finished))
     });
     let (pending, recent) = store.count_delivery_pressure(now).await.unwrap_or((0, 0));
-    let marmot_state = if !settings.marmot_enabled {
+    let marmot_requested = settings.marmot_enabled
+        || ["smartflowsocial", "nostrmash"].iter().any(|project| {
+            watchdog_core::settings::route_for(
+                settings,
+                get,
+                project,
+                watchdog_core::domain::Severity::Critical,
+            )
+            .marmot
+        });
+    let identity_ready = ["smartflowsocial", "nostrmash"].iter().any(|project| {
+        let Some(definition) = watchdog_core::catalog::project_by_id(project) else {
+            return false;
+        };
+        !get(definition.sender_secret).is_empty()
+            && watchdog_core::catalog::project_recipient(
+                &get("PROJECT_RECIPIENTS"),
+                &get("ADMIN_NPUB"),
+                project,
+            )
+            .is_some()
+    });
+    let marmot_state = if !marmot_requested {
         "disabled"
     } else if !marmot_supported {
         "unavailable"
+    } else if !identity_ready {
+        "unconfigured"
     } else {
         "unknown"
     };
@@ -516,10 +544,16 @@ async fn ready<S: OperationalStore>(
         scheduler_age_ms: age,
         scheduler_stale_after_ms: 180_000,
         nip17_enabled: settings.nip17_enabled,
-        nip17_ready: !settings.bootstrap.is_empty() && !settings.emergency_disable_nip17,
+        nip17_ready: !settings.bootstrap.is_empty()
+            && !settings.emergency_disable_nip17
+            && destinations_ready(
+                settings,
+                get,
+                &watchdog_core::catalog::enabled_monitors(get),
+            ),
         telegram_enabled: !get("TELEGRAM_BOT_TOKEN").is_empty(),
         telegram_ready: !settings.emergency_disable_telegram,
-        marmot_enabled: settings.marmot_enabled,
+        marmot_enabled: marmot_requested,
         marmot_state,
         push_tokens: if settings.marmot_enabled {
             "unknown"
@@ -529,6 +563,7 @@ async fn ready<S: OperationalStore>(
         projects_ready: true,
         pending_recovery: pending,
         recent_retrying: recent,
+        startup_grace,
     };
     let (ok, body) = watchdog_core::readiness::evaluate_readiness(&input);
     json_response(if ok { 200 } else { 503 }, body)
@@ -557,7 +592,16 @@ async fn alert_status<S: OperationalStore>(
             "pushState": row.push_state,
             "attempts": row.attempt_count,
             "messageAttempts": row.message_attempts,
+            "messageReconciliations": row.message_reconcile_attempts,
+            "unknownAttempts": row.unknown_attempts,
+            "tokenWaits": row.token_wait_attempts,
+            "pushPublications": row.push_publication_attempts,
+            "pushReconciliations": row.unobservable_attempts,
             "reconciliationAttempts": row.push_attempts,
+            "operationId": row.operation_id,
+            "preserveMessage": row.preserve_message,
+            "settledAt": row.settled_at,
+            "startedAt": row.started_at_ms,
             "updatedAt": row.updated_at,
             "messageUpdatedAt": row.message_updated_at,
             "pushUpdatedAt": row.push_updated_at,
@@ -604,30 +648,47 @@ async fn onboard<S: OperationalStore>(
     let Some(project_id) = value.get("projectId").and_then(Value::as_str) else {
         return json_response(400, json!({"error": "bad_request"}));
     };
-    let Some(key) = value.get("idempotencyKey").and_then(Value::as_str) else {
+    let Some(key) = value
+        .get("operationId")
+        .or_else(|| value.get("idempotencyKey"))
+        .and_then(Value::as_str)
+    else {
         return json_response(400, json!({"error": "bad_request"}));
     };
+    let replace = value
+        .get("replace")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if !known_project(project_id) || key.trim().is_empty() || key.len() > 128 {
         return json_response(400, json!({"error": "bad_request"}));
     }
-    let Ok(Some(row)) = store.record_onboarding(project_id, key, now).await else {
+    let Ok(Some(row)) = store.record_onboarding(project_id, key, replace, now).await else {
         return json_response(
             503,
             json!({"error": "unavailable", "dependency": "watchdog-marmot helper onboard operation"}),
         );
     };
     if row.idempotency_key != key {
-        return json_response(409, json!({"error": "idempotency_conflict"}));
+        return json_response(
+            409,
+            json!({
+                "error": "operation_in_progress",
+                "operationId": row.idempotency_key,
+                "note": "Pass replace true with a new operationId to rotate. Existing alerts stay on their original operation.",
+            }),
+        );
     }
     json_response(
         202,
         json!({
             "projectId": project_id,
-            "idempotencyKey": key,
+            "operationId": key,
+            "replace": replace,
             "status": "unavailable",
+            "phase": "unavailable",
             "engineStatus": row.engine_status,
             "dependency": "watchdog-marmot helper onboard operation",
-            "note": "The idempotency key is stored. Group creation is performed by the Marmot helper and is not invented here.",
+            "note": "The operation id is stored. Group creation is performed by the Marmot helper or Durable Object and is not invented here.",
         }),
     )
 }
@@ -672,6 +733,10 @@ async fn retry<S: OperationalStore>(
         Ok(watchdog_store::RetryMode::NewSubmission) => json_response(
             200,
             json!({"id": id, "status": "queued", "mode": "new_submission"}),
+        ),
+        Ok(watchdog_store::RetryMode::Reconcile) => json_response(
+            200,
+            json!({"id": id, "status": "queued", "mode": "reconcile"}),
         ),
         Ok(watchdog_store::RetryMode::Missing) => json_response(404, json!({"error": "not_found"})),
         Err(_) => json_response(500, json!({"error": "internal_error"})),

@@ -40,8 +40,10 @@ pub enum RetryMode {
     Missing,
     /// The prepared envelope is still stored. This is the same submission.
     SameOperation,
-    /// No envelope exists, so a later delivery may build a new event.
+    /// No envelope exists, so a later NIP-17 delivery may build a new event.
     NewSubmission,
+    /// Marmot or another journaled transport. Reconcile the same operation.
+    Reconcile,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +98,16 @@ pub struct OutboxRow {
     pub operator_ack_at: Option<i64>,
     pub logical_id: Option<String>,
     pub submission_generation: i64,
+    pub message_reconcile_attempts: i64,
+    pub unknown_attempts: i64,
+    pub token_wait_attempts: i64,
+    pub push_publication_attempts: i64,
+    pub unobservable_attempts: i64,
+    pub started_at_ms: Option<i64>,
+    pub preserve_message: bool,
+    pub settled_at: Option<i64>,
+    pub operation_id: Option<String>,
+    pub claim_owner: Option<String>,
 }
 
 #[derive(Clone, Debug)]

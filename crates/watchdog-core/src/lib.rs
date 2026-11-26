@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod classify;
 pub mod clock;
 pub mod crypto;
+pub mod delivery;
 pub mod domain;
 pub mod format;
 pub mod group_auth;

@@ -477,9 +477,17 @@ pub fn fallback_required(
     let push_unknown = destination == "marmot"
         && matches!(
             push_state,
-            None | Some("unknown") | Some("unobservable") | Some("pending") | Some("expired")
+            None | Some("unknown")
+                | Some("unobservable")
+                | Some("pending")
+                | Some("expired")
+                | Some("token_unavailable")
+                | Some("not_attempted")
         )
-        && matches!(message_state, Some("accepted" | "accepted_pending"));
+        && matches!(
+            message_state,
+            Some("accepted" | "accepted_pending" | "relay_accepted")
+        );
     !outcome_accepted || pending || (hold_attempt && pending) || push_unknown
 }
 

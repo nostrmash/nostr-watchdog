@@ -39,6 +39,7 @@ pub async fn run_update_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C
     notifier: &N,
     now: i64,
     clock: &C,
+    deadline_ms: i64,
 ) -> Result<(), watchdog_store::StoreError> {
     if !settings.enabled {
         return Ok(());
@@ -62,6 +63,9 @@ pub async fn run_update_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C
             continue;
         };
         let renew_at = clock.unix_ms();
+        if deadline_ms.saturating_sub(renew_at) < settings.timeout_ms {
+            break;
+        }
         if !store
             .renew_lease("updates", &owner, renew_at + 600_000, renew_at)
             .await?
@@ -1098,6 +1102,7 @@ mod tests {
             &Silent,
             1_000,
             &watchdog_core::clock::ManualClock::new(1_000),
+            1_000 + 600_000,
         )
         .await
         .unwrap();

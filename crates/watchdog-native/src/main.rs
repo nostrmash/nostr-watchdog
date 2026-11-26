@@ -147,6 +147,7 @@ impl Notifier for NativeNotifier {
 
 #[tokio::main]
 async fn main() {
+    let _ = PROCESS_STARTED.set(std::time::Instant::now());
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -188,12 +189,14 @@ async fn main() {
     let listener = TcpListener::bind(addr).await.expect("bind");
     info!(%addr, "nostr-watchdog listening");
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runtime_id = Arc::new(format!("native-{}", std::process::id()));
     let mut jobs = tokio::task::JoinSet::new();
     jobs.spawn(check_loop(state.clone(), stop.clone()));
     jobs.spawn(vendor_loop(state.clone(), stop.clone()));
     jobs.spawn(transport_loop(
         state.clone(),
         stop.clone(),
+        runtime_id.clone(),
         "telegram",
         15,
         2,
@@ -202,6 +205,7 @@ async fn main() {
     jobs.spawn(transport_loop(
         state.clone(),
         stop.clone(),
+        runtime_id.clone(),
         "nostr",
         15,
         2,
@@ -210,12 +214,13 @@ async fn main() {
     jobs.spawn(transport_loop(
         state.clone(),
         stop.clone(),
+        runtime_id.clone(),
         "marmot",
         15,
         1,
         1,
     ));
-    jobs.spawn(push_loop(state.clone(), stop.clone()));
+    jobs.spawn(push_loop(state.clone(), stop.clone(), runtime_id.clone()));
     jobs.spawn(sync_loop(state.clone(), stop.clone()));
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown(stop.clone()))
@@ -229,7 +234,7 @@ async fn main() {
         jobs.abort_all();
         tracing::warn!("shutdown grace elapsed");
     }
-    let _ = OperationalStore::release_open_claims(&state.store, now_ms()).await;
+    let _ = OperationalStore::release_open_claims(&state.store, &runtime_id, now_ms()).await;
     marmot::shutdown_helper();
 }
 
@@ -255,6 +260,7 @@ async fn check_loop(state: Arc<AppState>, stop: Arc<std::sync::atomic::AtomicBoo
             &notifier,
             now_ms(),
             &SystemClock,
+            now_ms() + 55_000,
         )
         .await
         {
@@ -285,6 +291,7 @@ async fn vendor_loop(state: Arc<AppState>, stop: Arc<std::sync::atomic::AtomicBo
             &notifier,
             now_ms(),
             &SystemClock,
+            now_ms() + 180_000,
         )
         .await
         {
@@ -296,6 +303,7 @@ async fn vendor_loop(state: Arc<AppState>, stop: Arc<std::sync::atomic::AtomicBo
 async fn transport_loop(
     state: Arc<AppState>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    runtime_id: Arc<String>,
     destination: &'static str,
     every_seconds: u64,
     critical: usize,
@@ -326,6 +334,7 @@ async fn transport_loop(
             other,
             deadline,
             "delivery",
+            &runtime_id,
         )
         .await
         {
@@ -334,7 +343,11 @@ async fn transport_loop(
     }
 }
 
-async fn push_loop(state: Arc<AppState>, stop: Arc<std::sync::atomic::AtomicBool>) {
+async fn push_loop(
+    state: Arc<AppState>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    runtime_id: Arc<String>,
+) {
     let mut ticker = tokio::time::interval(Duration::from_secs(30));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -359,6 +372,7 @@ async fn push_loop(state: Arc<AppState>, stop: Arc<std::sync::atomic::AtomicBool
             0,
             now_ms() + 8_000,
             "push",
+            &runtime_id,
         )
         .await
         {
@@ -431,6 +445,15 @@ fn network_code(error: &reqwest::Error) -> String {
     }
 }
 
+static PROCESS_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn startup_grace() -> bool {
+    PROCESS_STARTED
+        .get()
+        .map(|started| started.elapsed() < Duration::from_secs(180))
+        .unwrap_or(false)
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -447,6 +470,7 @@ async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>)
         &state,
         ApiRequest::Ready {
             marmot_supported: true,
+            startup_grace: startup_grace(),
         },
         None,
     )

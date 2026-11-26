@@ -62,6 +62,7 @@ pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C:
     notifier: &N,
     now: i64,
     clock: &C,
+    deadline_ms: i64,
 ) -> Result<(), watchdog_store::StoreError> {
     if !settings.enabled {
         let finished = clock.unix_ms();
@@ -99,6 +100,11 @@ pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C:
         let width = settings.concurrency.max(1) as usize;
         for chunk in due.chunks(width) {
             let renew_at = clock.unix_ms();
+            if renew_at >= deadline_ms {
+                cycle_error = Some("budget_exhausted".to_string());
+                break;
+            }
+            let remaining = (deadline_ms - renew_at).clamp(1_000, settings.timeout_ms);
             if !store
                 .renew_lease("checks", &owner, renew_at + lease_ms, renew_at)
                 .await?
@@ -117,7 +123,7 @@ pub async fn run_check_cycle<S: OperationalStore, H: HttpClient, N: Notifier, C:
                     monitor,
                     get,
                     settings.private_network,
-                    settings.timeout_ms,
+                    remaining,
                     started,
                     settings.stale_seconds,
                     settings.progress_seconds,
@@ -172,23 +178,25 @@ pub async fn dispatch_due<S: OperationalStore, N: Notifier, C: Clock>(
     get: &impl Fn(&str) -> String,
     notifier: &N,
     clock: &C,
+    runtime_id: &str,
 ) -> Result<(), watchdog_store::StoreError> {
     let started = clock.unix_ms();
     let deadline = started + 15_000;
+    let _ = store.settle_expired(started).await;
     dispatch_transport(
-        store, settings, get, notifier, clock, "telegram", 2, 1, deadline, "delivery",
+        store, settings, get, notifier, clock, "telegram", 2, 1, deadline, "delivery", runtime_id,
     )
     .await?;
     dispatch_transport(
-        store, settings, get, notifier, clock, "nostr", 2, 1, deadline, "delivery",
+        store, settings, get, notifier, clock, "nostr", 2, 1, deadline, "delivery", runtime_id,
     )
     .await?;
     dispatch_transport(
-        store, settings, get, notifier, clock, "marmot", 1, 1, deadline, "delivery",
+        store, settings, get, notifier, clock, "marmot", 1, 1, deadline, "delivery", runtime_id,
     )
     .await?;
     dispatch_transport(
-        store, settings, get, notifier, clock, "marmot", 1, 0, deadline, "push",
+        store, settings, get, notifier, clock, "marmot", 1, 0, deadline, "push", runtime_id,
     )
     .await?;
     Ok(())
@@ -205,10 +213,12 @@ pub async fn dispatch_transport<S: OperationalStore, N: Notifier, C: Clock>(
     max_other: usize,
     deadline_ms: i64,
     kind: &str,
+    runtime_id: &str,
 ) -> Result<(), watchdog_store::StoreError> {
     if !settings.alerts_enabled || clock.unix_ms() >= deadline_ms {
         return Ok(());
     }
+    let _ = store.settle_expired(clock.unix_ms()).await;
     if emergency_disabled(settings, destination) {
         let _ = store
             .expedite_destination(destination, clock.unix_ms())
@@ -229,6 +239,7 @@ pub async fn dispatch_transport<S: OperationalStore, N: Notifier, C: Clock>(
         claim_kind,
         max_critical as i64,
         deadline_ms,
+        runtime_id,
     )
     .await?;
     if kind != "push" && max_other > 0 && clock.unix_ms() < deadline_ms {
@@ -242,6 +253,7 @@ pub async fn dispatch_transport<S: OperationalStore, N: Notifier, C: Clock>(
             "delivery-other",
             max_other as i64,
             deadline_ms,
+            runtime_id,
         )
         .await?;
     }
@@ -267,6 +279,7 @@ async fn deliver_claimed<S: OperationalStore, N: Notifier, C: Clock>(
     kind: &str,
     limit: i64,
     deadline_ms: i64,
+    runtime_id: &str,
 ) -> Result<(), watchdog_store::StoreError> {
     if limit <= 0 || clock.unix_ms() >= deadline_ms {
         return Ok(());
@@ -284,6 +297,7 @@ async fn deliver_claimed<S: OperationalStore, N: Notifier, C: Clock>(
             limit,
             kind,
             claimed_at - 7 * 86_400_000,
+            runtime_id,
         )
         .await?;
     for row in rows {

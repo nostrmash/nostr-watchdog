@@ -82,6 +82,7 @@ pub trait OperationalStore {
         limit: i64,
         kind: &str,
         oldest: i64,
+        runtime_id: &str,
     ) -> Result<Vec<OutboxRow>, StoreError>;
     async fn extend_claim(
         &self,
@@ -193,12 +194,14 @@ pub trait OperationalStore {
     ) -> Result<CommitOutcome, StoreError>;
     async fn read_alert(&self, id: &str) -> Result<Option<OutboxRow>, StoreError>;
     async fn acknowledge_alert(&self, id: &str, now: i64) -> Result<bool, StoreError>;
-    async fn release_open_claims(&self, now: i64) -> Result<usize, StoreError>;
+    async fn release_open_claims(&self, runtime_id: &str, now: i64) -> Result<usize, StoreError>;
+    async fn settle_expired(&self, now: i64) -> Result<usize, StoreError>;
     async fn expedite_destination(&self, destination: &str, now: i64) -> Result<usize, StoreError>;
     async fn record_onboarding(
         &self,
         project_id: &str,
-        idempotency_key: &str,
+        operation_id: &str,
+        replace: bool,
         now: i64,
     ) -> Result<Option<OnboardReceipt>, StoreError>;
     async fn count_delivery_pressure(&self, now: i64) -> Result<(i64, i64), StoreError>;

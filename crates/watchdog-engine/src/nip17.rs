@@ -387,6 +387,7 @@ mod tests {
                 1,
                 "delivery",
                 0,
+                "test",
             )
             .unwrap();
         let claim = claimed[0].claim_token.clone().unwrap();
@@ -412,6 +413,7 @@ mod tests {
             1,
             "delivery",
             0,
+            "test",
         );
         // The first delivery accepted the alert, so it is not claimed again.
         // A retry of the same stored envelope is what the outbox keeps.
@@ -451,6 +453,7 @@ mod tests {
                 1,
                 "delivery",
                 0,
+                "test",
             )
             .unwrap();
         let claim = claimed[0].claim_token.clone().unwrap();

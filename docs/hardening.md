@@ -35,7 +35,7 @@ The Worker cannot pin DNS. Its URL policy rejects literal private hosts, credent
 
 Bundled SQLite is `libsqlite3-sys` 0.39.1 through `rusqlite` 0.41, which includes the fix for RUSTSEC-2026-0459. `chrono` remains because the Worker SDK links it and RustSec records no fixed release (`RUSTSEC-2026-0543` is ignored in `deny.toml` for that reason).
 
-`0001` through `0008` are unchanged. `0009_operations.sql` is additive. Native migrations stay transactional. The Worker does not run DDL on a request. Schema validation checks required tables, columns, indexes, and the migration ledger. An unknown ledger id is `schema_unsupported`.
+`0001` through `0008` are unchanged. `0009_operations.sql` and `0010_lifecycle.sql` are additive. `0010` adds phase counters, settlement, operation id, and claim owner. It does not rewrite historical message or push state. Native migrations stay transactional. The Worker does not run DDL on a request. Schema validation checks required tables, columns, indexes, and the migration ledger. An unknown ledger id is `schema_unsupported`.
 
 Rollback of the operational database is restoring a snapshot taken before `0009`, then running the older binary. Do not point an older binary at a database whose ledger contains `0009_operations`. There is no down migration, and rollback does not recreate cryptographic state because this database does not store it.
 

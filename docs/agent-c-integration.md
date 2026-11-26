@@ -1,82 +1,147 @@
 # Agent C integration contract
 
-This branch does not modify the native Marmot helper, `crates/watchdog-native/src/marmot.rs`, `crates/watchdog-core/src/marmot_recovery.rs`, or the Cloudflare Durable Object Marmot work. The shared store and engine now expose the operations those implementations need.
+The shared operational store is a sanitized projection. Native MDK and the Cloudflare Durable Object remain authoritative for cryptographic operation state. This database does not store MLS secrets, private keys, raw device tokens, or encrypted wake capabilities.
 
-## Claim ownership
+Agent A's helper and Agent B's Durable Object are not modified on this branch. The types in `watchdog_core::delivery` are the contract both transports implement. Existing adapters keep compiling. Unknown transport state names stay unknown. They are not stored as `rejected`.
 
-Long native Marmot operations must keep the outbox claim they were given.
+## Application-message states
 
-- `extend_claim(id, token, until, now)` succeeds only while the same token is unexpired, the row is `retrying`, and the new deadline is within five minutes of `now`. An expired token cannot be renewed. Take a new claim instead.
-- `claim_ownership(id, token, now)` returns `Active { until }`, `Expired`, `Lost`, or `Missing`. Call it immediately before an irreversible publish or push. Do not submit a new cryptographic message when the result is not `Active`.
-- `release_open_claims(now)` clears claim tokens on shutdown without deleting a stored envelope.
-- `save_envelope` still refuses to replace an envelope that already exists, and it requires a live claim.
+`not_submitted`, `prepared`, `accepted_pending`, `relay_accepted`, `rejected`, `completion_unknown`.
 
-## Message state and push state
+Legacy aliases, accepted only at the boundary:
 
-`alert_outbox` now stores these independently. They are sanitized projections. They are not MLS secrets, push tokens, or private keys.
-
-| Column | Meaning |
+| Incoming | Canonical |
 | --- | --- |
-| `message_state` | `prepared`, `accepted`, `accepted_pending`, `failed`, or null |
-| `push_state` | `pending`, `accepted`, `unobservable`, `expired`, `rejected`, or null |
-| `message_attempts` | Application-message submissions |
-| `push_attempts` | Push reconciliation attempts |
-| `message_updated_at`, `push_updated_at` | Completion time of that dimension |
-| `terminal_reason` | Sanitized error code |
-| `operator_ack_at` | Operator acknowledgement of the alert row |
-| `logical_id` | Transport-independent notification id used for fallback dedupe |
-| `submission_generation` | Increments only when a dead letter is retried as a new submission |
+| `message_prepared` | `prepared` |
+| `message_accepted`, `accepted`, `published` | `relay_accepted` |
+| `failed` | `rejected` |
 
-`accepted_pending` means the message was handed to a relay or helper and completion was not observed. It is not device delivery. `push_state` of null or `unobservable` is not device delivery either. Push reconciliation is claimed separately (`kind = "push"`) and is limited so it cannot consume the message budget.
+`relay_accepted` stays `relay_accepted` when push fails, expires, or is unobservable. Human acknowledgement is `operator_ack_at` and incident `acked_at`. Neither is inferred from relay acceptance, and relay acceptance is not phone delivery.
 
-`retry_dead_letter` returns:
+## Push states
 
-- `SameOperation` when an envelope already exists. The envelope and attempt count stay. This retries the same NIP-17 event.
-- `NewSubmission` when there is no envelope. `submission_generation` increments and attempts reset.
-- `Missing` when the row is not a dead letter.
+`unknown`, `not_required`, `not_attempted`, `token_unavailable`, `prepared`, `pending`, `publication_attempted`, `relay_accepted`, `rejected`, `expired`, `unobservable`, `terminal_failure`.
 
-## Fallback
+Legacy aliases: `push_token_unavailable`, `push_trigger_prepared`, `push_trigger_accepted`, `push_expired`, `push_unobservable`.
 
-One policy, `queued_transport`, decides delivery for incidents, recoveries, reminders, version notices, security advisories, integrity alerts, and test alerts.
+Agent A's current helper emits `not_attempted`, `token_unavailable`, and `unobservable`. It does not emit push `relay_accepted`, `pending`, `expired`, or `terminal_failure`. A null `push_event_id` stays null. `push_envelope_json` stays null.
 
-- Global `ENABLE_*` flags are defaults. A project route can turn a transport on.
-- `EMERGENCY_DISABLE_NIP17`, `EMERGENCY_DISABLE_MARMOT`, and `EMERGENCY_DISABLE_TELEGRAM` are master switches. They override project routes.
-- A disabled or unconfigured transport is finalized. Critical NIP-17 or Marmot rows can create one Telegram fallback when `TELEGRAM_MODE=nostr_fallback`. The fallback is inserted in the same store operation as the failure.
-- Test alerts never create a fallback.
-- `accepted_pending`, and a critical Marmot message whose push is missing or unobservable, still require the configured fallback.
-- Fallback dedupe uses `logical_id`, not the transport-specific dedupe key.
+## Operation result
 
-## NIP-42 privacy
+`watchdog_core::delivery::operation_view` is the JSON shape:
 
-Discovery connections never sign an AUTH event, even if the caller has the project nsec. An optional challenge is ignored. `auth-required` on OK or CLOSED fails closed with `relay_auth_required`.
+- `projectId`, `operationId`
+- `messageState`, `messageEventId`
+- `pushState`, `pushEventId` (null until a transport actually observes one)
+- `evidence`
+- `error` (sanitized token only)
+- `disposition`: `settled` or `reconcile`
+- `retryAtMs`
+- `phoneDelivery`: always false
 
-Publication connections sign only after a required challenge, at most twice. They wait for OK of the AUTH event id. On acceptance they resend the original event once. The application event id does not change. A rejected AUTH is `relay_auth_rejected`.
+Counters are cumulative and phase-specific. A repeated phase adds nothing. A push reconciliation that restates `relay_accepted` does not increment `message_attempts`. Unknown counters stay zero only when that phase was never observed. They are not invented from a missing field.
 
-Bootstrap relays are discovery infrastructure. A gift wrap is published only to relays in the recipient's validated inbox list.
+| Column | Increments when |
+| --- | --- |
+| `message_attempts` | A new submission leaves `not_submitted` or `prepared` |
+| `message_reconcile_attempts` | An already-open message phase changes |
+| `unknown_attempts` | The phase becomes `completion_unknown` or push `unknown` |
+| `token_wait_attempts` | Push becomes `token_unavailable` |
+| `push_publication_attempts` | Push becomes `prepared` or `publication_attempted` |
+| `unobservable_attempts` | Push becomes `unobservable` |
+| `attempt_count` | Scheduler attempts. Independent of the counters above |
+
+`operation_id` is the stable transport operation id. For Marmot it defaults to the alert id. `submission_generation` increments only for a NIP-17 dead letter that has no signed gift wrap. It is not a new Marmot operation id.
+
+## Reconciliation budgets
+
+`settle_expired` runs before a claim. A row leaves the active queues when any of these is true and the claim is free:
+
+- Older than 24 hours.
+- `completion_unknown` with 4 message reconciliations.
+- `accepted_pending` or `prepared` with 8 message attempts and age over 15 minutes.
+- `token_unavailable` with 2 token waits.
+- `publication_attempted` or `unobservable` with 2 unobservable observations.
+- Push `rejected`, `terminal_failure`, or `expired`.
+
+A settled `relay_accepted` message stays `relay_accepted`. Push `publication_attempted`, `prepared`, or `pending` becomes `unobservable`. The historical phase is kept in `message_phase` and `push_phase`. Recommended retry delays are clamped to 15 seconds through 5 minutes. An unobservable evidence API is not polled forever.
+
+Message reconciliation (`delivery` claim of a not-yet-accepted Marmot row) and push reconciliation (`push` claim) are separate scheduler passes.
+
+## Dead-letter retry
+
+`retry_dead_letter` is transport-aware:
+
+- NIP-17 with `envelope_json`: `SameOperation`. The event id and bytes stay.
+- NIP-17 without an envelope: `NewSubmission`. `submission_generation` increments and `attempt_count` resets. This is the only path that mints a new submission generation.
+- Marmot, with or without a local envelope: `Reconcile`. The journal in the helper or Durable Object is authoritative. Accepted message evidence is not erased.
+- Telegram: `SameOperation`. Delivery is at-least-once. An ambiguous HTTP acknowledgement is not proof the chat received it, and it is not permission to mint a new logical notification.
+- Missing row: `Missing`.
+
+A new logical notification requires a new alert id. A missing NIP-17 envelope is not permission to submit a new Marmot operation.
+
+## Claims and shutdown
+
+`claim_outbox(..., runtime_id)` records `claim_owner`. `extend_claim` requires the same unexpired token, `until > now`, and `until <= now + 300000`. `claim_ownership` returns `Active`, `Expired`, `Lost`, or `Missing`. Call it before an irreversible publish. `save_envelope` requires a live claim and does not replace an existing envelope.
+
+`release_open_claims(runtime_id, now)` clears claims whose `claim_owner` is that runtime. An empty runtime id releases nothing. Native shutdown aborts tasks, then releases only `native-<pid>`. Another process's claims stay. If the helper is still inside `submit_text` after the caller stops, the next owner reconciles `operation_id` and does not encrypt again.
+
+## D1 atomicity
+
+D1 `batch` is the atomic boundary. `finish_with_fallback` updates the winning claim and inserts the Telegram fallback in one batch. The insert reads the updated row (`claim_token IS NULL`, matching state and `updated_at`) and refuses a second Telegram row with the same `logical_id`. A stale token changes zero rows, so the insert selects nothing. A statement error rolls the batch back, so a failed insert does not leave the original finalized.
+
+Reminder updates require the observed `decision_generation`, `reminder_count`, `acked_at IS NULL`, and silence not in the future, plus the winning monitor generation and commit token. The reminder alert insert requires that the reminder update already landed. Vendor version, vendor fence, and vendor alerts are one batch. A version write without the matching vendor token aborts the batch.
 
 ## Onboarding
 
-`POST /v1/diagnostics/marmot/onboard` with operator auth and JSON `{ "projectId", "idempotencyKey" }` stores the key once. The same key reads the same row. A different key returns 409. The response status is `unavailable` until the helper performs onboarding. This API does not create a group and does not invent a conversation id.
+`POST /v1/diagnostics/marmot/onboard` requires the operator token. The body is:
 
-Agent A: stop treating `MARMOT_REONBOARD=<project id>` inside `deliver()` as a per-alert re-onboard. Re-onboarding belongs on this idempotent route, then one helper operation. The current helper `shutdown_helper()` (SIGTERM, then kill after five seconds) is what native shutdown calls. Please also expose a bounded health result the readiness endpoint can store: account initialized, last successful sync, key-package readiness, and recipient-token readiness. Until that exists, readiness reports Marmot as `unknown` on the native process and `unavailable` on the Worker when Marmot is enabled.
+```json
+{
+  "projectId": "smartflowsocial",
+  "operationId": "onboarding-operation-id",
+  "replace": false
+}
+```
 
-Agent B: the Worker does not report Cloudflare Marmot as ready. `marmot_supported` is false. Supply the same diagnostic fields through the store projection when the Durable Object exists. Do not put MLS secrets or push capabilities in D1.
+`idempotencyKey` is an alias of `operationId`. The same project and operation id replays. A different id with `replace: false` returns 409 `operation_in_progress` and the stored id. `replace: true` stores the new id and does not rewrite alert rows. The response is `202` with `status: unavailable` and dependency `watchdog-marmot helper onboard operation`. This route does not invent a group id.
 
-## Readiness
-
-`GET /readyz` checks the database, schema, configuration, scheduler freshness, and required transports. A disabled optional transport stays healthy. Unknown Marmot or push-token state does not fail readiness. An enabled transport this runtime cannot provide does. Historical dead letters do not. Pending recovery counts are reported and do not, by themselves, fail readiness.
+The Worker compares the bearer token before it reads an operator body.
 
 ## Scheduling
 
-Native loops are separate: health every 60 seconds, vendor hourly, Telegram and NIP-17 every 15 seconds, Marmot messages every 15 seconds, push reconciliation every 30 seconds with a limit of one, and Marmot sync on its own loop. Missed ticks are skipped. Each dispatch claims only the rows it will start.
+Native loops stay separate. The check loop stops at about 55 seconds. The vendor loop stops at about 180 seconds. Dispatch passes a deadline and does not start work after it.
 
-The Worker scheduled event always runs health first. Vendor checks run only on the hourly cron and only when time remains. Dispatch order is Telegram, NIP-17, Marmot messages, then one push reconciliation. The budget is 20 seconds inside the 30 second CPU limit.
+The Worker minute cron runs health for 12 seconds, then Telegram, NIP-17, and Marmot message dispatch until 20 seconds. The hourly cron (`0 ...`) runs vendor checks, then push reconciliation and prune. It does not run health. CPU time (`cpu_ms` 30000) is not the wall-clock deadline. An admitted helper or Durable Object mutation is not cancelled by the caller. The owner reconciles it later.
 
-## CI after your branches merge
+Cloudflare Workers are not treated as Marmot-capable. `marmot_supported` is false. An enabled Marmot route, including a project override, makes `/readyz` unavailable. A scheduler with no successful run is `uninitialized` after the native 180 second startup grace. The Worker has no startup grace. Unknown historical push state does not, by itself, fail readiness.
 
-If either branch adds a crate, lockfile, or system package:
+## What Agent A implements
 
-- Audit that lockfile with `cargo deny` and `cargo audit`.
-- Add the crate to the image only when it is a runtime binary. Keep Odin, Node, and other build tools out of the final image.
-- The native SQLCipher WASM probe is an expected-failure experiment. Do not make it a required CI job.
-- Do not add opt-in public relay tests to the routine workflow.
+- Map helper journal states onto the canonical enums above. Do not send a state this contract does not list.
+- Keep `operation_id` equal to the alert id. Reconcile on `RetryMode::Reconcile`. Do not call `submit_text` again while a journal or MDK record exists.
+- Renew the claim with `extend_claim` during the helper call. After `Lost` or `Expired`, do not start another mutation. Let the in-flight call finish.
+- Onboarding uses `operationId` and `replace`. `MARMOT_REONBOARD=<project>` remains `reonboard:<project>` with `replace: true`.
+- `readiness` should return account, canonical convergence, key-package, and recipient-token readiness without token bytes. Until that projection is stored, native readiness reports `unknown` or `unconfigured`.
+
+## What Agent B implements
+
+- The Durable Object is the cryptographic authority on Cloudflare. D1 stores only the projection columns in migrations `0009` and `0010`.
+- Use the same canonical states and the same rule that a push failure does not clear `relay_accepted`.
+- Complete an admitted operation even if the Worker invocation that started it has returned. The next scheduled owner reconciles `operation_id`.
+- Do not put MLS state, private keys, or push capabilities in D1.
+- Expose the same diagnostic fields Agent A's `readiness` exposes. Missing fields stay `unknown`.
+
+## Runtime notes
+
+Worker probes measure latency with `Date.now`. `std::time::Instant` panics on `wasm32-unknown-unknown` and aborts the scheduled invocation before the request is sent.
+
+`PRIVATE_NETWORK_PROFILE` is the only switch that allows a non-default port. Public probe URLs still reject one. The isolated workerd config sets the switch so a local fixture can bind an unprivileged port. Production wrangler files do not set it.
+
+Public status is `misconfigured` for a missing NIP-17 sender or recipient only when NIP-17 is enabled. Disabled NIP-17 does not by itself fail `/v1/status`. Dead letters still make that status `degraded`. Readiness does not treat historical dead letters as a failed scheduler.
+
+`sh tests/runtime/worker-scheduled.sh` builds the Worker, applies migrations `0001`–`0010` to an isolated local D1 database, and runs the fixture against `wrangler dev --test-scheduled`.
+
+## Build and rollback
+
+Migration `0010_lifecycle` is additive. It does not rewrite historical `message_state` or `push_state`. A null historical state stays unknown. Operational rollback is a database snapshot from before `0010`. It is not MLS recovery. An unknown ledger id is `schema_unsupported`.
