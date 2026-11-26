@@ -1,0 +1,15 @@
+[package]
+name = "watchdog-store"
+version = "1.0.0-dev"
+description = "SQLite persistence for Nostr Watchdog incidents, outbox, and Marmot metadata."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+watchdog-core = { workspace = true }
