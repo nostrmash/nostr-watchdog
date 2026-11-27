@@ -21,7 +21,7 @@ use cgka_traits::app_components::{
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::{GroupId, MemberId, TransportMessage};
 use marmot_app::{
-    AccountSetupRequest, AppMessageQuery, CursorPersistence, MarmotApp, MarmotAppConfig,
+    AccountSetupReadiness, AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppConfig,
     MarmotDeployment, PushPlatform, PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION,
 };
 use marmot_worker_interop::OfficialRecipient;
@@ -1494,8 +1494,10 @@ async fn executable_exchange() {
     let listen = format!("127.0.0.1:{port}");
     let operator = "fixture-operator-token";
 
-    let config =
-        isolated_recipient_config(&relay.url).with_cursor_persistence(CursorPersistence::Frozen);
+    // This recipient stays open for the entire incident and restart. A frozen
+    // notification-wake runtime reinstalls its inbox subscription on each
+    // catch-up, replacing the live receive path while the fixture polls.
+    let config = isolated_recipient_config(&relay.url);
     let app = MarmotApp::with_relays_and_config(&recipient_root, vec![relay.url.clone()], config);
     let runtime = app.runtime();
     let relay_endpoints = endpoints(&relay.url);
@@ -1512,6 +1514,7 @@ async fn executable_exchange() {
         .await
         .expect("recipient import");
     assert_eq!(imported.account.account_id_hex, recipient_hex);
+    assert_eq!(imported.readiness, AccountSetupReadiness::NetworkReady);
     assert!(imported.key_package_bytes.unwrap_or(0) > 0);
 
     let mut helper = start_fixture_helper(None, &helper_bin, &root, &socket, &relay.url);
