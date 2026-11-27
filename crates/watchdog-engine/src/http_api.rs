@@ -410,20 +410,26 @@ async fn test_alert<S: OperationalStore, N: Notifier, C: Clock>(
         Ok(true) => {}
     }
     let destination = alert.destination.as_str();
-    let _ = dispatch_transport(
-        store,
-        settings,
-        get,
-        notifier,
-        clock,
-        destination,
-        1,
-        1,
-        now.saturating_add(4_000),
-        "delivery",
-        "api",
-    )
-    .await;
+    // Scheduled mode qualifies the ordinary outbox dispatcher without an
+    // inline send hiding scheduler or claim failures.
+    let scheduled = alert.destination == Destination::Marmot
+        && value.get("dispatch").and_then(Value::as_str) == Some("scheduled");
+    if !scheduled {
+        let _ = dispatch_transport(
+            store,
+            settings,
+            get,
+            notifier,
+            clock,
+            destination,
+            1,
+            1,
+            now.saturating_add(4_000),
+            "delivery",
+            "api",
+        )
+        .await;
+    }
     let delivery = store
         .outbox_state(&alert.id)
         .await
@@ -439,7 +445,11 @@ async fn test_alert<S: OperationalStore, N: Notifier, C: Clock>(
             "queueStatus": delivery,
             "delivery": delivery,
             "deliveryState": delivery,
-            "note": "Omitting transport selects nip17. Queue state is read after dispatch. Relay acceptance is not phone delivery."
+            "note": if scheduled {
+                "The scheduled dispatcher will process this alert."
+            } else {
+                "Omitting transport selects nip17. Queue state is read after dispatch. Relay acceptance is not phone delivery."
+            }
         }),
     )
 }

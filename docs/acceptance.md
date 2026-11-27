@@ -46,7 +46,7 @@ watchdog_request "$watchdog_url/v1/diagnostics/marmot?project=smartflowsocial"
 
 # Run one send after setting the phone state.
 watchdog_request "$watchdog_url/v1/diagnostics/test-alert" \
-  --json '{"projectId":"smartflowsocial","transport":"marmot"}'
+  --json '{"projectId":"smartflowsocial","transport":"marmot","dispatch":"scheduled"}'
 watchdog_request "$watchdog_url/v1/outbox/<alert-id>"
 ```
 

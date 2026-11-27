@@ -197,7 +197,9 @@ async fn cloudflare_onboard(
     };
     let relays: Vec<&str> = notifier
         .vars
-        .get("BOOTSTRAP_RELAYS")
+        .get("MARMOT_BOOTSTRAP_RELAYS")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| notifier.vars.get("BOOTSTRAP_RELAYS"))
         .map(|value| {
             value
                 .split(',')

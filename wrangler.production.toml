@@ -28,6 +28,7 @@ crons = ["* * * * *", "0 * * * *"]
 
 [vars]
 ENVIRONMENT = "production"
+MARMOT_BOOTSTRAP_RELAYS = "wss://nos.lol,wss://relay.primal.net"
 
 [secrets]
 required = ["OPERATOR_TOKEN", "STATUS_READ_TOKEN", "STATUS_SIGNING_SECRET", "HEARTBEAT_KEYS", "SFS_BOT_NSEC", "NOSTRMASH_BOT_NSEC", "MARMOT_OPERATOR_TOKEN"]

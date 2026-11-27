@@ -1670,7 +1670,7 @@ async fn scheduled_incident_reaches_official_recipient_via_both_workers() {
         .replace("migrations_dir = \"migrations\"", &format!("migrations_dir = \"{}\"", root.join("migrations").display()))
         .replace("ALERTS_ENABLED = \"false\"", "ALERTS_ENABLED = \"true\"")
         .replace("ENABLE_MARMOT = \"false\"", &format!(
-            "ENABLE_MARMOT = \"true\"\nENABLE_SFS_WEB = \"true\"\nPRIVATE_NETWORK_PROFILE = \"true\"\nSFS_WEB_READY_URL = \"{}/healthcheck\"\nCHECK_TIMEOUT_MS = \"5000\"\nBOOTSTRAP_RELAYS = \"{}\"",
+            "ENABLE_MARMOT = \"true\"\nENABLE_SFS_WEB = \"true\"\nPRIVATE_NETWORK_PROFILE = \"true\"\nSFS_WEB_READY_URL = \"{}/healthcheck\"\nCHECK_TIMEOUT_MS = \"5000\"\nMARMOT_BOOTSTRAP_RELAYS = \"{}\"",
             relay.http, relay.url,
         ));
     fs::write(operational.as_path(), config).unwrap();
@@ -2034,6 +2034,22 @@ async fn scheduled_incident_reaches_official_recipient_via_both_workers() {
             .unwrap(),
         [later["payload_text"].as_str().unwrap()]
     );
+    let test_alert = worker_json(
+        &format!("{worker_url}/v1/diagnostics/test-alert"),
+        Some(&json!({
+            "projectId": "nostrmash", "transport": "marmot", "dispatch": "scheduled"
+        })),
+    );
+    assert_eq!(test_alert["queueStatus"], "queued", "{test_alert}");
+    tick();
+    let test_delivery = query(
+        "SELECT id, message_state, push_state, auth_message_submissions FROM alert_outbox
+         WHERE alert_class = 'test' AND project_id = 'nostrmash' AND destination = 'marmot'",
+    );
+    assert_eq!(test_delivery[0]["id"], test_alert["alertId"]);
+    assert_eq!(test_delivery[0]["message_state"], "relay_accepted", "{test_delivery}");
+    assert_eq!(test_delivery[0]["push_state"], "relay_accepted", "{test_delivery}");
+    assert_eq!(test_delivery[0]["auth_message_submissions"], 1);
     stop_child(&mut worker.0);
 }
 

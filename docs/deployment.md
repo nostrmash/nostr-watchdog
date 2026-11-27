@@ -56,7 +56,7 @@ The shipped image supports Linux amd64. It runs as UID 10001 with `/data/watchdo
 | Private cryptographic Worker | `nostr-watchdog-marmot`, managed by `wrangler.marmot-production.toml` |
 | Private cryptographic storage | The SQLite-backed `MarmotSender` Durable Object class created by migration `v1` |
 
-The operational manifest binds `MARMOT_SENDER` to the private script by name. Leave both `workers.dev` and preview URLs disabled on the private Worker, with no route or domain. Both Workers use the Paid account CPU budget of 30 seconds. Preserve the production monitor and recipient variables already attached to the operational Worker. Set project routing flags on that Worker so they survive subsequent deployments.
+The operational manifest binds `MARMOT_SENDER` to the private script by name. Leave both `workers.dev` and preview URLs disabled on the private Worker, with no route or domain. Both Workers use the Paid account CPU budget of 30 seconds. Preserve the production monitor and recipient variables already attached to the operational Worker. Set project routing flags on that Worker so they survive subsequent deployments. `MARMOT_BOOTSTRAP_RELAYS` configures initial Marmot key-package discovery without changing the existing NIP-17 `BOOTSTRAP_RELAYS`.
 
 ### Build and deploy
 
