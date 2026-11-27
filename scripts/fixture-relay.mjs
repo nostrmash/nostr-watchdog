@@ -44,17 +44,23 @@ function matching(filters, event) {
   return filters.length === 0 || filters.some((filter) => matches(filter, event));
 }
 
-function limited(filters, found) {
-  found.sort(
-    (left, right) =>
-      right.event.created_at - left.event.created_at || right.seq - left.seq,
-  );
-  const limit = filters.reduce(
-    (bound, filter) =>
-      typeof filter.limit === "number" ? Math.min(bound, filter.limit) : bound,
-    found.length,
-  );
-  return found.slice(0, limit);
+function compareStored(left, right) {
+  return right.event.created_at - left.event.created_at ||
+    left.event.id.localeCompare(right.event.id);
+}
+
+function backlog(filters) {
+  const storedEvents = [...events.values()];
+  const selected = new Map();
+  for (const filter of filters.length ? filters : [{}]) {
+    const found = storedEvents.filter((stored) => matches(filter, stored.event));
+    found.sort(compareStored);
+    const limit = filter.limit ?? found.length;
+    for (const stored of found.slice(0, limit)) {
+      selected.set(stored.event.id, stored);
+    }
+  }
+  return [...selected.values()].sort(compareStored);
 }
 
 function hex(value, length) {
@@ -231,8 +237,7 @@ class Client {
       const sub = rest[0];
       const filters = rest.slice(1).filter((item) => item && typeof item === "object");
       this.subs.set(sub, filters);
-      const found = [...events.values()].filter((stored) => matching(filters, stored.event));
-      for (const stored of limited(filters, found)) {
+      for (const stored of backlog(filters)) {
         this.send(JSON.stringify(["EVENT", sub, stored.event]));
       }
       this.send(JSON.stringify(["EOSE", sub]));
@@ -344,7 +349,7 @@ const server = createServer(async (request, response) => {
   response.end();
 });
 
-server.on("upgrade", (request, socket) => {
+server.on("upgrade", (request, socket, head) => {
   const key = request.headers["sec-websocket-key"];
   if (!key || request.headers.upgrade?.toLowerCase() !== "websocket") {
     socket.destroy();
@@ -363,6 +368,7 @@ server.on("upgrade", (request, socket) => {
   socket.on("data", (chunk) => client.push(chunk));
   socket.on("close", () => clients.delete(client));
   socket.on("error", () => clients.delete(client));
+  if (head.length) client.push(head);
 });
 
 server.listen(port, "127.0.0.1", () => {

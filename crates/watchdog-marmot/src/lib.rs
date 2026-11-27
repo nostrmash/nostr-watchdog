@@ -80,7 +80,13 @@ pub fn open(root: &Path, relays: &[String], allow_loopback: bool) -> Result<Sess
     }
     let mut config = MarmotAppConfig::white_noise();
     if allow_loopback {
-        config = config.with_allow_loopback_relay_endpoints(true);
+        let mut deployment = marmot_app::MarmotDeployment::white_noise();
+        deployment.discovery_indexer_relays.clear();
+        deployment.recovery_operated_relays = relays.to_vec();
+        config = config
+            .with_deployment(deployment)
+            .with_directory_relay_urls(relays.to_vec())
+            .with_allow_loopback_relay_endpoints(true);
     }
     let app = MarmotApp::with_relays_and_config(root, relays.to_vec(), config);
     let boundary = root.join("outbox-boundary");

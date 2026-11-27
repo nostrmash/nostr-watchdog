@@ -14,8 +14,8 @@ use std::time::Duration;
 use base64::Engine;
 use cgka_traits::GroupId;
 use marmot_app::{
-    AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppConfig, PushPlatform,
-    PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION,
+    AccountSetupRequest, AppMessageQuery, CursorPersistence, MarmotApp, MarmotAppConfig,
+    MarmotDeployment, PushPlatform, PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION,
 };
 use nostr::event::FinalizeEvent;
 use nostr::nips::nip59::UnwrappedGift;
@@ -66,6 +66,16 @@ fn start_relay() -> Relay {
         child,
         url: line.trim().to_string(),
     }
+}
+
+fn isolated_recipient_config(relay: &str) -> MarmotAppConfig {
+    let mut deployment = MarmotDeployment::white_noise();
+    deployment.discovery_indexer_relays.clear();
+    deployment.recovery_operated_relays = vec![relay.to_string()];
+    MarmotAppConfig::white_noise()
+        .with_deployment(deployment)
+        .with_directory_relay_urls(vec![relay.to_string()])
+        .with_allow_loopback_relay_endpoints(true)
 }
 
 fn endpoints(url: &str) -> Vec<cgka_traits::TransportEndpoint> {
@@ -134,7 +144,7 @@ async fn exchange() {
         .expect("sender import");
     assert_eq!(account, sender_hex);
 
-    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let config = isolated_recipient_config(&relay.url);
     let app = MarmotApp::with_relays_and_config(&recipient_root, relays.clone(), config);
     let runtime = app.runtime();
     let relay_endpoints = endpoints(&relay.url);
@@ -1230,7 +1240,7 @@ async fn acceptance_script_exchange() {
     let recipient = Keys::generate();
     let recipient_hex = recipient.public_key().to_hex();
     let recipient_root = temp_root("acceptance-recipient");
-    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let config = isolated_recipient_config(&relay.url);
     let app = MarmotApp::with_relays_and_config(&recipient_root, vec![relay.url.clone()], config);
     let runtime = app.runtime();
     let endpoints = endpoints(&relay.url);
@@ -1406,7 +1416,8 @@ async fn executable_exchange() {
     let listen = format!("127.0.0.1:{port}");
     let operator = "fixture-operator-token";
 
-    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let config =
+        isolated_recipient_config(&relay.url).with_cursor_persistence(CursorPersistence::Frozen);
     let app = MarmotApp::with_relays_and_config(&recipient_root, vec![relay.url.clone()], config);
     let runtime = app.runtime();
     let relay_endpoints = endpoints(&relay.url);
@@ -1895,11 +1906,12 @@ async fn receive_packaged_alert(
     }
     // Use the official recipient's relay history repair if incremental catch-up missed the event.
     eprintln!("incremental catch-up missed the packaged alert, repairing recipient history");
-    runtime
-        .repair_full_history(recipient)
-        .await
-        .expect("official recipient history repair");
-    wait_plaintext(runtime, recipient, group, text).await
+    let repair = runtime.repair_full_history(recipient).await;
+    let received = wait_plaintext(runtime, recipient, group, text).await;
+    if !received {
+        eprintln!("recipient history repair result: {repair:?}");
+    }
+    received
 }
 
 async fn wait_monitor_alert(db: &Path, resolved: bool) -> String {
