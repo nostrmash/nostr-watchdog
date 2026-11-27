@@ -36,6 +36,7 @@ pub(crate) const MAX_MLS_ENTRIES: usize = 20_000;
 pub(crate) const MAX_SNAPSHOTS_PER_GROUP: usize = 32;
 pub(crate) const MAX_INGRESS_MARKERS: usize = 4_096;
 pub(crate) const MAX_JOURNAL: usize = 64;
+pub(crate) const SNAPSHOT_TOMBSTONE_LIMIT: usize = 4_096;
 
 #[derive(Clone)]
 pub(crate) struct State {
@@ -78,6 +79,13 @@ pub(crate) struct State {
     pub periodic: PeriodicMaintenancePolicy,
     pub journal: Vec<PreparedPublication>,
     pub operation_tombstones: Vec<OperationTombstone>,
+    /// Number of retired identities. A sealed snapshot may omit the rows once
+    /// they live in the Durable Object operation index.
+    pub tombstone_high_water: u64,
+    /// Set after the SQL operation index has been loaded into this process.
+    pub tombstones_indexed: bool,
+    pub observed_leaves: Vec<ObservedLeaf>,
+    pub sync_cursors: Vec<SyncCursor>,
     pub wakes: Vec<StoredWake>,
     pub server_relays: Vec<ServerRelays>,
     pub floors: HashMap<GroupId, u64>,
@@ -152,6 +160,10 @@ impl State {
             periodic: PeriodicMaintenancePolicy::Disabled,
             journal: Vec::new(),
             operation_tombstones: Vec::new(),
+            tombstone_high_water: 0,
+            tombstones_indexed: false,
+            observed_leaves: Vec::new(),
+            sync_cursors: Vec::new(),
             wakes: Vec::new(),
             server_relays: Vec::new(),
             floors: HashMap::new(),
@@ -546,7 +558,18 @@ impl State {
             periodic: self.periodic,
             mls: encode_pairs(mls),
             journal: self.journal.clone(),
-            operation_tombstones: self.operation_tombstones.clone(),
+            operation_tombstones: if self.tombstones_indexed {
+                Vec::new()
+            } else {
+                self.operation_tombstones.clone()
+            },
+            tombstone_high_water: if self.tombstones_indexed {
+                self.operation_tombstones.len() as u64
+            } else {
+                self.operation_tombstones.len() as u64
+            },
+            observed_leaves: self.observed_leaves.clone(),
+            sync_cursors: self.sync_cursors.clone(),
             wakes: self.wakes.clone(),
             server_relays: self.server_relays.clone(),
             floors: self
@@ -707,6 +730,10 @@ impl State {
         state.periodic = saved.periodic;
         state.journal = saved.journal;
         state.operation_tombstones = saved.operation_tombstones;
+        state.tombstone_high_water = saved.tombstone_high_water;
+        state.tombstones_indexed = false;
+        state.observed_leaves = saved.observed_leaves;
+        state.sync_cursors = saved.sync_cursors;
         state.wakes = saved.wakes;
         state.server_relays = saved.server_relays;
         for floor in saved.floors {
@@ -1019,6 +1046,12 @@ pub(crate) struct SavedState {
     #[serde(default)]
     pub operation_tombstones: Vec<OperationTombstone>,
     #[serde(default)]
+    pub tombstone_high_water: u64,
+    #[serde(default)]
+    pub observed_leaves: Vec<ObservedLeaf>,
+    #[serde(default)]
+    pub sync_cursors: Vec<SyncCursor>,
+    #[serde(default)]
     pub wakes: Vec<StoredWake>,
     #[serde(default)]
     pub server_relays: Vec<ServerRelays>,
@@ -1046,6 +1079,9 @@ pub struct AccountBinding {
     pub extra_recipients: Vec<String>,
     #[serde(default)]
     pub relays: Vec<String>,
+    /// Relays used for the original Welcome. Recovery republishes there.
+    #[serde(default)]
+    pub welcome_relays: Vec<String>,
     #[serde(default)]
     pub nostr_group_hex: Option<String>,
     #[serde(default)]
@@ -1109,6 +1145,14 @@ pub struct PublicationRecord {
     pub role: String,
     pub destination: String,
     pub phase: String,
+    #[serde(default)]
+    pub server: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub finished_at_ms: u64,
 }
 
 /// Compact identity kept after the ciphertext journal drops a terminal row.
@@ -1150,6 +1194,26 @@ pub struct StoredWake {
     pub encrypted_token: Vec<u8>,
     pub owner_sig: String,
     pub removed: bool,
+}
+
+/// Engine-reported device leaf. Positions are not inferred from member count.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservedLeaf {
+    pub group_id_hex: String,
+    pub member_id_hex: String,
+    pub leaf_index: u32,
+    pub epoch: u64,
+    pub removed: bool,
+}
+
+/// Catch-up checkpoint for one relay query stream.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncCursor {
+    pub stream: String,
+    pub since: u64,
+    pub until: Option<u64>,
+    pub caught_up: bool,
+    pub updated_at_ms: u64,
 }
 
 /// Kind 10050 inbox relays observed for a notification server.

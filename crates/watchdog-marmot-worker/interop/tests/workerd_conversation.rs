@@ -476,6 +476,36 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
     assert_eq!(kept["messagePhase"], "relay_accepted", "{kept}");
     assert_eq!(kept["message"], prepared["message"]);
 
+    let mut unrelated = start_relay_with(&worker_dir, Some("unrelated-only"));
+    let unrelated_guard = KillProcess(unrelated.child.id());
+    let mismatched = post(json!({
+        "op": "send",
+        "operationId": "alert-unrelated-ok",
+        "groupIdHex": group_hex,
+        "text": "unrelated ok",
+        "publish": true,
+        "relays": [unrelated.url]
+    }));
+    assert_ne!(mismatched["messagePhase"], "relay_accepted", "{mismatched}");
+    assert_eq!(mismatched["messagePhase"], "completion_unknown", "{mismatched}");
+    assert_eq!(mismatched["disposition"], "reconcile", "{mismatched}");
+    stop_child(&mut unrelated.child);
+    std::mem::forget(unrelated_guard);
+
+    let mut delayed = start_relay_with(&worker_dir, Some("unrelated-then-ok"));
+    let delayed_guard = KillProcess(delayed.child.id());
+    let matched_later = post(json!({
+        "op": "send",
+        "operationId": "alert-delayed-ok",
+        "groupIdHex": group_hex,
+        "text": "delayed ok",
+        "publish": true,
+        "relays": [delayed.url]
+    }));
+    assert_eq!(matched_later["messagePhase"], "relay_accepted", "{matched_later}");
+    stop_child(&mut delayed.child);
+    std::mem::forget(delayed_guard);
+
     let status = post(json!({"op": "status"}));
     eprintln!(
         "wasm_bytes={wasm_bytes} database_bytes={} send_ms={send_ms} revision={}",
@@ -536,12 +566,32 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
     key_event.verify().expect("key package verifies");
     publish_value(&worker_dir, &relay_url, &persist, &serde_json::to_value(&key_event).unwrap());
 
+    let interrupted = post_to(sender, json!({
+        "op": "establish",
+        "operationId": "establish-1",
+        "fault": "before_welcome_publish"
+    }));
+    assert_eq!(interrupted["ok"], true, "{interrupted}");
+    let group_hex = interrupted["groupIdHex"].as_str().unwrap().to_owned();
+    let pending = post_to(sender, json!({"op": "readiness"}));
+    assert_eq!(pending["onboarding"]["groupPersisted"], true, "{pending}");
+    assert_eq!(pending["onboarding"]["welcomeAccepted"], false, "{pending}");
+    assert_eq!(pending["onboarding"]["conversationReady"], false, "{pending}");
+    stop_child(&mut workerd);
+    assert!(port_closed(PORT));
+    workerd = start_workerd(&worker_dir, &persist);
+    workerd_guard.0 = workerd.id();
     let established = post_to(sender, json!({
         "op": "establish",
-        "operationId": "establish-1"
+        "operationId": "establish-recovered"
     }));
     assert_eq!(established["ok"], true, "{established}");
-    let group_hex = established["groupIdHex"].as_str().unwrap().to_owned();
+    assert_eq!(established["groupIdHex"], group_hex, "{established}");
+    assert_eq!(established["operationId"], "establish-1", "{established}");
+    let recovered = post_to(sender, json!({"op": "readiness"}));
+    assert_eq!(recovered["onboarding"]["welcomeAccepted"], true, "{recovered}");
+    assert_eq!(recovered["onboarding"]["conversationReady"], false, "{recovered}");
+    assert_eq!(recovered["onboarding"]["recipientParticipationObserved"], false, "{recovered}");
     let welcome: TransportMessage =
         serde_json::from_value(established["welcomes"][0].clone()).expect("welcome");
     native.join_welcome(welcome).await.expect("join discovered welcome");
@@ -818,6 +868,10 @@ struct Relay {
 }
 
 fn start_relay(worker_dir: &Path) -> Relay {
+    start_relay_with(worker_dir, None)
+}
+
+fn start_relay_with(worker_dir: &Path, fault: Option<&str>) -> Relay {
     let mut command = Command::new("node");
     command
         .current_dir(worker_dir)
@@ -825,6 +879,9 @@ fn start_relay(worker_dir: &Path) -> Relay {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if let Some(fault) = fault {
+        command.env("RELAY_FAULT", fault);
+    }
     let mut child = command.spawn().expect("fixture relay");
     let mut url = String::new();
     let stdout = child.stdout.take().unwrap();

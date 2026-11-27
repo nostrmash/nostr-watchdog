@@ -5,7 +5,11 @@
 //! the only MLS implementation. This crate does not publish to relays.
 
 pub mod clock;
+pub mod inbox;
+pub mod publication;
 pub mod push;
+
+pub use mdk_do_storage::{OperationTombstone, ServerRelays, StoredWake};
 
 use std::sync::Arc;
 
@@ -29,7 +33,6 @@ use k256::schnorr::SigningKey;
 use k256::schnorr::signature::hazmat::PrehashSigner;
 use mdk_do_storage::{
     AccountBinding, MemoryMdkStorage, PersistError, PreparedPublication, PublicationRecord, SealBinding,
-    StoredWake,
 };
 use nostr::key::{Keys, SecretKey};
 use sha2::{Digest, Sha256};
@@ -168,6 +171,7 @@ impl Session {
                     } else {
                         relays.to_vec()
                     },
+                    welcome_relays: existing.welcome_relays,
                     nostr_group_hex: existing.nostr_group_hex,
                     group_id_hex: existing.group_id_hex,
                 },
@@ -261,6 +265,7 @@ impl Session {
         let mut binding = self.binding()?;
         binding.group_id_hex = Some(hex::encode(group_id.as_slice()));
         binding.nostr_group_hex = Some(hex::encode(nostr_group_id));
+        binding.welcome_relays = relays;
         self.storage.set_binding(binding, false).map_err(map_storage)?;
         self.storage
             .put_publication(blank_publication(
@@ -312,28 +317,52 @@ impl Session {
             .map_err(map_storage)?;
         let mut chats = Vec::new();
         for event in events {
-            if let GroupEvent::MessageReceived {
-                payload,
-                group_id,
-                sender_leaf_index,
-                sender,
-                ..
-            } = event
-            {
-                if let Ok(app) = MarmotAppEvent::decode(&payload) {
-                    if app.kind == MARMOT_APP_EVENT_KIND_CHAT {
-                        chats.push(app.content.clone());
-                    }
-                    if matches!(app.kind, 447 | 448 | 449) {
-                        self.observe_gossip(
-                            &group_id,
-                            app.kind,
-                            &app.content,
-                            sender_leaf_index,
-                            &hex::encode(sender.as_slice()),
-                        )?;
+            match event {
+                GroupEvent::GroupMemberLeavesRemoved {
+                    group_id, leaves, ..
+                } => {
+                    let group_hex = hex::encode(group_id.as_slice());
+                    for leaf in leaves {
+                        self.storage
+                            .retire_leaf(&group_hex, leaf.leaf_index)
+                            .map_err(map_storage)?;
                     }
                 }
+                GroupEvent::MessageReceived {
+                    payload,
+                    group_id,
+                    sender_leaf_index,
+                    sender,
+                    epoch,
+                    ..
+                } => {
+                    let sender_hex = hex::encode(sender.as_slice());
+                    if let Some(leaf) = sender_leaf_index {
+                        self.storage
+                            .observe_leaf(
+                                &hex::encode(group_id.as_slice()),
+                                &sender_hex,
+                                leaf,
+                                epoch.0,
+                            )
+                            .map_err(map_storage)?;
+                    }
+                    if let Ok(app) = MarmotAppEvent::decode(&payload) {
+                        if app.kind == MARMOT_APP_EVENT_KIND_CHAT {
+                            chats.push(app.content.clone());
+                        }
+                        if matches!(app.kind, 447 | 448 | 449) {
+                            self.observe_gossip(
+                                &group_id,
+                                app.kind,
+                                &app.content,
+                                sender_leaf_index,
+                                &sender_hex,
+                            )?;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         self.note_epochs()?;
@@ -545,6 +574,15 @@ impl Session {
         serde_json::to_value(&event).map_err(|error| SessionError::Engine(error.to_string()))
     }
 
+    pub fn encoded_package_hex(event: &serde_json::Value) -> Result<String, SessionError> {
+        use base64::Engine as _;
+        let content = event.get("content").and_then(|value| value.as_str()).unwrap_or("");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .map_err(|error| SessionError::Engine(error.to_string()))?;
+        Ok(hex::encode(bytes))
+    }
+
     /// Accept a relay key-package event only when it is signed by the configured recipient.
     pub fn key_package_from_relay_event(
         value: &serde_json::Value,
@@ -583,6 +621,16 @@ impl Session {
 
     pub fn message_id_hex(message: &TransportMessage) -> String {
         hex::encode(message.id.as_slice())
+    }
+
+    pub fn member_ids(&self, group_id: &GroupId) -> Result<Vec<String>, SessionError> {
+        let engine = self.engine()?;
+        Ok(engine
+            .members(group_id)
+            .map_err(map_engine)?
+            .iter()
+            .map(member_hex)
+            .collect())
     }
 
     pub fn epoch(&self, group_id: &GroupId) -> Result<u64, SessionError> {
@@ -643,7 +691,6 @@ impl Session {
         existing.push_trigger = Some(trigger.to_vec());
         existing.push_phase = "prepared".into();
         existing.push_published = false;
-        existing.push_publication_attempts = existing.push_publication_attempts.saturating_add(1);
         existing.updated_at_ms = clock::unix_ms();
         self.storage.put_publication(existing).map_err(map_storage)?;
         let stored = self.storage.publication(alert_id).map_err(map_storage)?;
@@ -656,6 +703,28 @@ impl Session {
             ));
         }
         Ok(trigger.to_vec())
+    }
+
+    /// Replace the stored trigger envelope without counting a publication attempt.
+    /// Signed event bytes inside an accepted item are left to the caller.
+    pub fn replace_push_envelope(&self, alert_id: &str, trigger: &[u8]) -> Result<(), SessionError> {
+        let Some(mut existing) = self.storage.publication(alert_id).map_err(map_storage)? else {
+            return Err(SessionError::MissingPublication(alert_id.to_owned()));
+        };
+        if existing.message_phase != "relay_accepted" {
+            return Err(SessionError::PushBeforeAcceptance);
+        }
+        let message = existing.message.clone();
+        existing.push_trigger = Some(trigger.to_vec());
+        existing.updated_at_ms = clock::unix_ms();
+        self.storage.put_publication(existing).map_err(map_storage)?;
+        let stored = self.storage.publication(alert_id).map_err(map_storage)?.unwrap();
+        if stored.message != message {
+            return Err(SessionError::Engine(
+                "push staging changed the application message".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn note_push(
@@ -737,13 +806,31 @@ impl Session {
         {
             return Ok(());
         }
-        existing.publications.push(PublicationRecord {
-            attempt_id: attempt_id.to_owned(),
-            event_id: event_id.to_owned(),
-            role: existing.operation_kind.clone(),
-            destination: destination.to_owned(),
-            phase: outcome.to_owned(),
-        });
+        let now = clock::unix_ms();
+        if let Some(record) = existing
+            .publications
+            .iter_mut()
+            .find(|record| record.attempt_id == attempt_id)
+        {
+            if record.phase == outcome {
+                return Ok(());
+            }
+            record.phase = outcome.to_owned();
+            record.destination = destination.to_owned();
+            record.finished_at_ms = now;
+        } else {
+            existing.publications.push(PublicationRecord {
+                attempt_id: attempt_id.to_owned(),
+                event_id: event_id.to_owned(),
+                role: existing.operation_kind.clone(),
+                destination: destination.to_owned(),
+                phase: outcome.to_owned(),
+                server: String::new(),
+                reason: String::new(),
+                started_at_ms: now,
+                finished_at_ms: now,
+            });
+        }
         let welcome_ids = existing
             .welcomes
             .iter()
@@ -794,6 +881,159 @@ impl Session {
         Ok(())
     }
 
+    /// Persist one network attempt before any socket is opened.
+    /// Returns false when that event already has a verified acceptance.
+    pub fn begin_network_attempt(
+        &self,
+        operation_id: &str,
+        role: &str,
+        attempt_id: &str,
+        event_id: &str,
+        destination: &str,
+    ) -> Result<bool, SessionError> {
+        let Some(mut existing) = self.storage.publication(operation_id).map_err(map_storage)? else {
+            return Err(SessionError::MissingPublication(operation_id.to_owned()));
+        };
+        if existing.publications.iter().any(|record| {
+            record.event_id == event_id && record.phase == "relay_accepted"
+        }) {
+            return Ok(false);
+        }
+        if existing
+            .publications
+            .iter()
+            .any(|record| record.attempt_id == attempt_id)
+        {
+            return Ok(true);
+        }
+        let now = clock::unix_ms();
+        if role == "push" {
+            existing.push_publication_attempts =
+                existing.push_publication_attempts.saturating_add(1);
+        } else {
+            existing.message_publication_attempts =
+                existing.message_publication_attempts.saturating_add(1);
+        }
+        existing.publications.push(PublicationRecord {
+            attempt_id: attempt_id.to_owned(),
+            event_id: event_id.to_owned(),
+            role: role.to_owned(),
+            destination: destination.to_owned(),
+            phase: "publication_attempted".into(),
+            server: String::new(),
+            reason: String::new(),
+            started_at_ms: now,
+            finished_at_ms: 0,
+        });
+        existing.updated_at_ms = now;
+        self.storage.put_publication(existing).map_err(map_storage)?;
+        Ok(true)
+    }
+
+    /// Record one trigger without hiding another trigger's result.
+    pub fn note_trigger(
+        &self,
+        operation_id: &str,
+        outcome: &str,
+        event_id: &str,
+        destination: &str,
+        attempt_id: &str,
+        reason: &str,
+        server: &str,
+    ) -> Result<String, SessionError> {
+        let Some(mut existing) = self.storage.publication(operation_id).map_err(map_storage)? else {
+            return Err(SessionError::MissingPublication(operation_id.to_owned()));
+        };
+        let message = existing.message.clone();
+        let message_phase = existing.message_phase.clone();
+        if existing.publications.iter().any(|record| {
+            record.role == "push" && record.event_id == event_id && record.phase == "relay_accepted"
+        }) {
+            return Ok(aggregate_push(&existing.publications));
+        }
+        let now = clock::unix_ms();
+        let mut count_outcome = true;
+        if let Some(record) = existing
+            .publications
+            .iter_mut()
+            .find(|record| record.attempt_id == attempt_id)
+        {
+            if record.phase == outcome {
+                count_outcome = false;
+            } else {
+                record.phase = outcome.to_owned();
+                record.destination = destination.to_owned();
+                record.reason = reason.to_owned();
+                record.server = server.to_owned();
+                record.finished_at_ms = now;
+            }
+        } else {
+            existing.publications.push(PublicationRecord {
+                attempt_id: attempt_id.to_owned(),
+                event_id: event_id.to_owned(),
+                role: "push".into(),
+                destination: destination.to_owned(),
+                phase: outcome.to_owned(),
+                server: server.to_owned(),
+                reason: reason.to_owned(),
+                started_at_ms: now,
+                finished_at_ms: now,
+            });
+        }
+        if count_outcome && outcome == "unobservable" {
+            existing.unobservable_attempts = existing.unobservable_attempts.saturating_add(1);
+        }
+        if count_outcome && matches!(outcome, "relay_accepted" | "rejected" | "unobservable") {
+            existing.push_attempts = existing.push_attempts.saturating_add(1);
+        }
+        if let Some(bytes) = existing.push_trigger.clone() {
+            if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(items) = value.as_array_mut() {
+                    for item in items.iter_mut() {
+                        let id = item
+                            .pointer("/event/id")
+                            .and_then(|entry| entry.as_str())
+                            .unwrap_or("");
+                        if id == event_id {
+                            if let Some(map) = item.as_object_mut() {
+                                map.insert(
+                                    "phase".into(),
+                                    serde_json::Value::String(outcome.to_owned()),
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Ok(encoded) = serde_json::to_vec(&value) {
+                    existing.push_trigger = Some(encoded);
+                }
+            }
+        }
+        let phase = aggregate_push(&existing.publications);
+        existing.push_phase = phase.clone();
+        existing.push_published = phase == "relay_accepted";
+        let mut ids = Vec::new();
+        for record in existing.publications.iter().filter(|record| record.role == "push") {
+            if !ids.iter().any(|id| id == &record.event_id) {
+                ids.push(record.event_id.clone());
+            }
+        }
+        existing.push_event_id = if ids.len() == 1 {
+            ids.pop()
+        } else {
+            None
+        };
+        existing.updated_at_ms = now;
+        self.storage.put_publication(existing).map_err(map_storage)?;
+        let stored = self.storage.publication(operation_id).map_err(map_storage)?.unwrap();
+        if stored.message != message || stored.message_phase != message_phase {
+            return Err(SessionError::Engine(
+                "push result changed the application message".into(),
+            ));
+        }
+        Ok(phase)
+    }
+
     pub fn select_push_tokens(&self, group_id: &GroupId) -> Result<Vec<StoredWake>, SessionError> {
         let binding = self.binding()?;
         let leaves = self.active_leaves(group_id)?;
@@ -822,7 +1062,23 @@ impl Session {
     }
 
     pub fn note_token_wait(&self, alert_id: &str) -> Result<(), SessionError> {
-        self.note_push(alert_id, "token_unavailable", None)
+        let Some(mut existing) = self.storage.publication(alert_id).map_err(map_storage)? else {
+            return Err(SessionError::MissingPublication(alert_id.to_owned()));
+        };
+        if existing.push_phase == "relay_accepted" {
+            return Ok(());
+        }
+        existing.token_wait_attempts = existing.token_wait_attempts.saturating_add(1);
+        if !existing
+            .publications
+            .iter()
+            .any(|record| record.role == "push" && record.phase == "relay_accepted")
+        {
+            existing.push_phase = "token_unavailable".into();
+        }
+        existing.updated_at_ms = clock::unix_ms();
+        self.storage.put_publication(existing).map_err(map_storage)?;
+        Ok(())
     }
 
     fn observe_gossip(
@@ -857,17 +1113,222 @@ impl Session {
         let engine = self.engine()?;
         let own = engine.own_leaf_index(group_id).map_err(map_engine)?;
         let members = engine.members(group_id).map_err(map_engine)?;
+        let member_ids = members.iter().map(member_hex).collect::<Vec<_>>();
+        drop(engine);
+        let group_hex = hex::encode(group_id.as_slice());
         let mut leaves = vec![(self.public_key_hex(), own)];
-        if members.len() == 2 && own <= 1 {
-            let other = 1 - own;
-            for member in &members {
-                let hex_id = member_hex(member);
-                if hex_id != self.public_key_hex() {
-                    leaves.push((hex_id, other));
+        for observed in self.storage.observed_leaves().map_err(map_storage)? {
+            if observed.removed || observed.group_id_hex != group_hex {
+                continue;
+            }
+            if !member_ids.iter().any(|member| member == &observed.member_id_hex) {
+                continue;
+            }
+            if leaves.iter().any(|(member, leaf)| {
+                member == &observed.member_id_hex && *leaf == observed.leaf_index
+            }) {
+                continue;
+            }
+            leaves.push((observed.member_id_hex, observed.leaf_index));
+        }
+        Ok(leaves)
+    }
+
+    pub fn onboarding_view(&self) -> Result<serde_json::Value, SessionError> {
+        let binding = self.binding()?;
+        let welcome = self.storage.welcome_publication().map_err(map_storage)?;
+        let group_hex = binding.group_id_hex.clone().unwrap_or_default();
+        let recipient_seen = self
+            .storage
+            .observed_leaves()
+            .map_err(map_storage)?
+            .iter()
+            .any(|leaf| {
+                !leaf.removed
+                    && leaf.member_id_hex == binding.recipient_hex
+                    && leaf.group_id_hex == group_hex
+            });
+        let welcome_accepted = welcome
+            .as_ref()
+            .map(|row| row.message_phase == "relay_accepted")
+            .unwrap_or(false);
+        let welcome_prepared = welcome.is_some();
+        let group_persisted = !group_hex.is_empty();
+        let ready = welcome_accepted && recipient_seen;
+        let completion = if ready {
+            "ready"
+        } else if welcome_prepared && !welcome_accepted {
+            "pending"
+        } else if group_persisted {
+            "unknown"
+        } else {
+            "not_started"
+        };
+        Ok(serde_json::json!({
+            "accountInitialized": !binding.project_id.is_empty(),
+            "recipientDiscovered": binding.recipient_hex.len() == 64,
+            "groupAdmitted": welcome_prepared,
+            "groupPersisted": group_persisted,
+            "welcomePrepared": welcome_prepared,
+            "welcomePublicationPending": welcome_prepared && !welcome_accepted,
+            "welcomeAccepted": welcome_accepted,
+            "recipientParticipationObserved": recipient_seen,
+            "conversationReady": ready,
+            "completion": completion,
+            "welcomeOperationId": welcome.as_ref().map(|row| row.alert_id.clone()),
+        }))
+    }
+
+    pub fn project_operation(&self, operation_id: &str) -> Result<serde_json::Value, SessionError> {
+        let Some(row) = self.storage.publication(operation_id).map_err(map_storage)? else {
+            let Some(stone) = self.storage.tombstone(operation_id).map_err(map_storage)? else {
+                return Err(SessionError::MissingPublication(operation_id.to_owned()));
+            };
+            return Ok(serde_json::json!({
+                "operationId": operation_id,
+                "messagePhase": stone.message_phase,
+                "messageState": stone.message_phase,
+                "messageEventId": stone.message_event_id,
+                "pushPhase": stone.push_phase,
+                "pushState": stone.push_phase,
+                "pushEventId": stone.push_event_id,
+                "evidence": "retired",
+                "error": null,
+                "settled": true,
+                "disposition": "settled",
+                "retryAfterMs": 0,
+                "retryAtMs": 0,
+                "reconcileAfterMs": 0,
+                "phoneDelivery": false,
+                "resubmittable": false,
+                "pushRetryable": false,
+                "startedAtMs": stone.started_at_ms,
+                "updatedAtMs": stone.updated_at_ms,
+            }));
+        };
+        let error = push_error(&row);
+        let push_retryable = push_is_retryable(&row.push_phase, error.as_deref());
+        let message_terminal = matches!(row.message_phase.as_str(), "relay_accepted" | "rejected");
+        let push_closed = matches!(
+            row.push_phase.as_str(),
+            "relay_accepted" | "rejected" | "not_required" | "not_attempted" | "expired" | "terminal_failure"
+        );
+        let settled = message_terminal && push_closed && !push_retryable;
+        let retry_after = if settled { 0 } else { 15_000 };
+        let mut body = publication_counters(&row);
+        let map = body.as_object_mut().expect("counters");
+        map.insert("operationId".into(), serde_json::json!(operation_id));
+        map.insert("messagePhase".into(), serde_json::json!(row.message_phase));
+        map.insert("messageState".into(), serde_json::json!(row.message_phase));
+        map.insert(
+            "messageEventId".into(),
+            serde_json::json!(Self::message_id_hex(&row.message)),
+        );
+        map.insert("pushPhase".into(), serde_json::json!(row.push_phase));
+        map.insert("pushState".into(), serde_json::json!(row.push_phase));
+        map.insert("pushEventId".into(), serde_json::json!(row.push_event_id));
+        map.insert("triggers".into(), trigger_evidence(&row));
+        map.insert(
+            "evidence".into(),
+            serde_json::json!(if trigger_evidence(&row).as_array().map(|items| items.len() > 1).unwrap_or(false) {
+                "partial_push"
+            } else if settled {
+                "settled"
+            } else {
+                "reconcile"
+            }),
+        );
+        map.insert("error".into(), serde_json::json!(error));
+        map.insert("settled".into(), serde_json::json!(settled));
+        map.insert(
+            "disposition".into(),
+            serde_json::json!(if settled { "settled" } else { "reconcile" }),
+        );
+        map.insert("retryAfterMs".into(), serde_json::json!(retry_after));
+        map.insert("retryAtMs".into(), serde_json::json!(retry_after));
+        map.insert("reconcileAfterMs".into(), serde_json::json!(retry_after));
+        map.insert("phoneDelivery".into(), serde_json::json!(false));
+        map.insert("pushRetryable".into(), serde_json::json!(push_retryable));
+        map.insert("ok".into(), serde_json::json!(true));
+        Ok(body)
+    }
+
+    pub async fn ensure_key_package_event(&self) -> Result<serde_json::Value, SessionError> {
+        if let Some(existing) = self.storage.publication("key-package").map_err(map_storage)? {
+            if existing.operation_kind == "key_package" {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&existing.message.payload) {
+                    return Ok(value);
                 }
             }
         }
-        Ok(leaves)
+        let package = self.fresh_key_package().await?;
+        let event = self.signed_key_package_event(&package)?;
+        let payload = serde_json::to_vec(&event).map_err(|error| SessionError::Engine(error.to_string()))?;
+        let message = cgka_traits::TransportMessage {
+            id: cgka_traits::MessageId::new(vec![1, 2, 3, 4]),
+            payload,
+            timestamp: cgka_traits::Timestamp(unix_now()),
+            causal_deps: Vec::new(),
+            source: cgka_traits::TransportSource("nostr".into()),
+            envelope: cgka_traits::TransportEnvelope::GroupMessage {
+                transport_group_id: vec![0],
+            },
+        };
+        self.storage
+            .put_publication(blank_publication(
+                "key-package",
+                "key_package",
+                hash_text("key-package"),
+                GroupId::new(vec![0; 16]),
+                message,
+                None,
+                false,
+                Vec::new(),
+                "not_required",
+            ))
+            .map_err(map_storage)?;
+        Ok(event)
+    }
+
+    pub fn note_sync_page(
+        &self,
+        stream: &str,
+        created: &[u64],
+        page_limit: usize,
+        complete: bool,
+    ) -> Result<(), SessionError> {
+        let cursors = self.storage.sync_cursors().map_err(map_storage)?;
+        let existing = cursors.iter().find(|cursor| cursor.stream == stream);
+        let mut since = existing.map(|cursor| cursor.since).unwrap_or(0);
+        let mut until = existing.and_then(|cursor| cursor.until);
+        let mut caught_up = existing.map(|cursor| cursor.caught_up).unwrap_or(false);
+        if !complete {
+            caught_up = false;
+            if let Some(oldest) = created.iter().copied().min() {
+                until = Some(oldest);
+            }
+        } else if created.len() >= page_limit && !created.is_empty() {
+            let oldest = created.iter().copied().min().unwrap_or(0);
+            until = Some(oldest.saturating_sub(1));
+            caught_up = false;
+        } else if let Some(newest) = created.iter().copied().max() {
+            since = newest;
+            until = None;
+            caught_up = true;
+        } else if until.is_some() {
+            until = None;
+            caught_up = true;
+        }
+        self.storage
+            .put_sync_cursor(mdk_do_storage::SyncCursor {
+                stream: stream.to_owned(),
+                since,
+                until,
+                caught_up,
+                updated_at_ms: clock::unix_ms(),
+            })
+            .map_err(map_storage)?;
+        Ok(())
     }
 
     fn bind(storage: MemoryMdkStorage, secret: [u8; 32]) -> Result<Self, SessionError> {
@@ -1035,6 +1496,118 @@ fn wakes_from_directory(directory: &push::PushDirectory) -> Vec<StoredWake> {
         .collect()
 }
 
+fn aggregate_push(records: &[PublicationRecord]) -> String {
+    let mut by_event: Vec<(String, String)> = Vec::new();
+    for record in records.iter().filter(|record| record.role == "push") {
+        if let Some(slot) = by_event.iter_mut().find(|(id, _)| id == &record.event_id) {
+            if slot.1 != "relay_accepted" {
+                slot.1 = record.phase.clone();
+            }
+        } else {
+            by_event.push((record.event_id.clone(), record.phase.clone()));
+        }
+    }
+    if by_event.is_empty() {
+        return "not_attempted".into();
+    }
+    let phases = by_event
+        .iter()
+        .map(|(_, phase)| phase.as_str())
+        .collect::<Vec<_>>();
+    if phases.iter().all(|phase| *phase == "relay_accepted") {
+        return "relay_accepted".into();
+    }
+    if phases.iter().any(|phase| *phase == "unobservable") {
+        return "unobservable".into();
+    }
+    if phases
+        .iter()
+        .any(|phase| *phase == "rejected")
+        && phases.iter().all(|phase| *phase == "rejected")
+    {
+        return "rejected".into();
+    }
+    if phases.iter().any(|phase| {
+        matches!(
+            *phase,
+            "publication_attempted" | "prepared" | "pending" | "rejected" | "token_unavailable"
+        )
+    }) {
+        return "publication_attempted".into();
+    }
+    "publication_attempted".into()
+}
+
+fn trigger_evidence(row: &PreparedPublication) -> serde_json::Value {
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut seen = Vec::new();
+    for record in row.publications.iter().filter(|record| record.role == "push") {
+        if seen.iter().any(|id| id == &record.event_id) {
+            if let Some(item) = items.iter_mut().find(|item| {
+                item.get("eventId").and_then(|value| value.as_str()) == Some(record.event_id.as_str())
+            }) {
+                if item.get("phase").and_then(|value| value.as_str()) != Some("relay_accepted") {
+                    *item = trigger_item(record);
+                }
+            }
+            continue;
+        }
+        seen.push(record.event_id.clone());
+        items.push(trigger_item(record));
+    }
+    serde_json::Value::Array(items)
+}
+
+fn trigger_item(record: &PublicationRecord) -> serde_json::Value {
+    serde_json::json!({
+        "eventId": record.event_id,
+        "phase": record.phase,
+        "relay": record.destination,
+        "server": record.server,
+        "attemptId": record.attempt_id,
+        "retryable": record.phase != "relay_accepted" && record.phase != "rejected" && record.phase != "retired",
+    })
+}
+
+fn push_error(row: &PreparedPublication) -> Option<String> {
+    let mut timeout = false;
+    let mut permanent = false;
+    for record in row.publications.iter().filter(|record| record.role == "push") {
+        if record.phase == "relay_accepted" {
+            continue;
+        }
+        if record.reason == "publication_timeout" {
+            timeout = true;
+        }
+        if record.reason == "push_unobservable" {
+            permanent = true;
+        }
+    }
+    if timeout {
+        Some("publication_timeout".into())
+    } else if permanent {
+        Some("push_unobservable".into())
+    } else {
+        None
+    }
+}
+
+fn push_is_retryable(phase: &str, error: Option<&str>) -> bool {
+    if error == Some("push_unobservable") {
+        return false;
+    }
+    matches!(
+        phase,
+        "unobservable"
+            | "publication_attempted"
+            | "prepared"
+            | "pending"
+            | "token_unavailable"
+            | "accepted_pending"
+            | "completion_unknown"
+    )
+}
+
 pub fn publication_counters(row: &PreparedPublication) -> serde_json::Value {
     serde_json::json!({
         "messageAttempts": row.message_attempts,
@@ -1144,5 +1717,144 @@ mod tests {
         assert_eq!(restored.public_key_hex(), session.public_key_hex());
         let again = restored.fresh_key_package().await.unwrap();
         assert!(!again.bytes.is_empty());
+    }
+
+    fn stored_chat(id: &str, event_id: &str) -> mdk_do_storage::PreparedPublication {
+        use cgka_traits::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
+        mdk_do_storage::PreparedPublication {
+            alert_id: id.to_owned(),
+            operation_kind: "chat".into(),
+            payload_sha256: [7u8; 32],
+            group_id: cgka_traits::GroupId::new(vec![1, 2, 3, 4]),
+            message: TransportMessage {
+                id: cgka_traits::MessageId::new(b"message-id".to_vec()),
+                payload: format!(r#"{{"id":"{event_id}"}}"#).into_bytes(),
+                timestamp: Timestamp(1),
+                causal_deps: Vec::new(),
+                source: TransportSource("nostr".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![1],
+                },
+            },
+            confirmed: true,
+            message_phase: "relay_accepted".into(),
+            pending_ref: None,
+            needs_mdk_confirm: false,
+            welcomes: Vec::new(),
+            push_trigger: None,
+            push_published: false,
+            push_phase: "not_attempted".into(),
+            push_event_id: None,
+            started_at_ms: 10,
+            updated_at_ms: 10,
+            message_attempts: 1,
+            message_publication_attempts: 1,
+            message_reconcile_attempts: 1,
+            unknown_attempts: 0,
+            token_wait_attempts: 0,
+            push_publication_attempts: 0,
+            unobservable_attempts: 0,
+            push_attempts: 0,
+            publications: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_success_is_not_erased_by_a_stale_acknowledgement() {
+        let session = Session::generate().unwrap();
+        session
+            .storage()
+            .put_publication(stored_chat("alert-1", "event-1"))
+            .unwrap();
+        session
+            .note_message_outcome("alert-1", "relay_accepted", "event-1", "wss://later.example", "attempt-2")
+            .await
+            .unwrap();
+        session
+            .note_message_outcome(
+                "alert-1",
+                "completion_unknown",
+                "event-1",
+                "wss://earlier.example",
+                "attempt-1",
+            )
+            .await
+            .unwrap();
+        let row = session.storage().publication("alert-1").unwrap().unwrap();
+        assert_eq!(row.message_phase, "relay_accepted");
+        assert!(session
+            .note_message_outcome("alert-1", "relay_accepted", "other-event", "wss://x.example", "attempt-3")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn one_accepted_trigger_does_not_hide_an_unresolved_trigger() {
+        let session = Session::generate().unwrap();
+        let mut row = stored_chat("alert-1", "event-1");
+        row.push_trigger = Some(
+            serde_json::to_vec(&serde_json::json!([
+                {"event": {"id": "trigger-a"}, "relays": ["wss://a.example"], "server": "s1", "fingerprints": ["sha256:aaa"], "phase": "prepared"},
+                {"event": {"id": "trigger-b"}, "relays": ["wss://b.example"], "server": "s2", "fingerprints": ["sha256:bbb"], "phase": "prepared"}
+            ]))
+            .unwrap(),
+        );
+        session.storage().put_publication(row).unwrap();
+        let before = session.storage().publication("alert-1").unwrap().unwrap().push_publication_attempts;
+        session
+            .stage_push("alert-1", br#"{"id":"ignored"}"#)
+            .unwrap();
+        let staged = session.storage().publication("alert-1").unwrap().unwrap();
+        assert_eq!(staged.push_publication_attempts, before);
+        session
+            .note_trigger("alert-1", "relay_accepted", "trigger-a", "wss://a.example", "a1", "", "s1")
+            .unwrap();
+        let phase = session
+            .note_trigger(
+                "alert-1",
+                "unobservable",
+                "trigger-b",
+                "wss://b.example",
+                "b1",
+                "publication_timeout",
+                "s2",
+            )
+            .unwrap();
+        assert_eq!(phase, "unobservable");
+        let view = session.project_operation("alert-1").unwrap();
+        assert_eq!(view["disposition"], "reconcile");
+        assert_eq!(view["pushRetryable"], true);
+        assert_eq!(view["error"], "publication_timeout");
+        assert_eq!(view["messageAttempts"], 1);
+        let triggers = view["triggers"].as_array().unwrap();
+        assert_eq!(triggers.len(), 2);
+        assert!(triggers.iter().any(|item| item["phase"] == "relay_accepted"));
+        assert!(triggers.iter().any(|item| item["phase"] == "unobservable"));
+        session
+            .note_token_wait("alert-1")
+            .unwrap();
+        session
+            .note_token_wait("alert-1")
+            .unwrap();
+        let waits = session.storage().publication("alert-1").unwrap().unwrap().token_wait_attempts;
+        assert_eq!(waits, 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_key_package_publication_is_reused() {
+        let session = Session::generate().unwrap();
+        let first = session.ensure_key_package_event().await.unwrap();
+        session
+            .note_message_outcome(
+                "key-package",
+                "rejected",
+                first["id"].as_str().unwrap(),
+                "wss://relay.example",
+                "attempt-1",
+            )
+            .await
+            .unwrap();
+        let second = session.ensure_key_package_event().await.unwrap();
+        assert_eq!(first["id"], second["id"]);
     }
 }
