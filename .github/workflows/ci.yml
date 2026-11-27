@@ -193,8 +193,8 @@ jobs:
 
       - name: Test and build the helper
         run: |
-          cargo test --locked --manifest-path crates/watchdog-marmot/Cargo.toml --lib
           cargo build --locked --release --manifest-path crates/watchdog-marmot/Cargo.toml
+          cargo test --locked --release --manifest-path crates/watchdog-marmot/Cargo.toml --lib
           test -x crates/watchdog-marmot/target/release/watchdog-marmot
 
       - name: Build the optimized watchdog executable

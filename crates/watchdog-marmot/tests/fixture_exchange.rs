@@ -55,6 +55,8 @@ impl Drop for Relay {
             if let Ok(trace) = Command::new("curl")
                 .args([
                     "-fsS",
+                    "--noproxy",
+                    "*",
                     "--max-time",
                     "3",
                     &format!("{}/trace", http_base(&self.url)),
@@ -81,6 +83,7 @@ fn start_relay() -> Relay {
     let script = repository.join("scripts/fixture-relay.mjs");
     let mut child = Command::new("node")
         .arg(script)
+        .env_remove("PORT")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -121,6 +124,7 @@ fn sync_error_kind(error: &marmot_app::AppError) -> &'static str {
             .find(|code| message.contains(code))
             .unwrap_or("account_catch_up_failed")
         }
+        AppError::AccountWorkerBusy => "account_worker_busy",
         AppError::UnknownGroup(_) => "unknown_group",
         AppError::GroupCatchingUp(_) => "group_catching_up",
         AppError::Transport(_) => "transport",
@@ -267,6 +271,8 @@ async fn exchange() {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    let signed_welcome = relay_has_signed_welcome(&relay.url, &recipient_keys, &sender_keys);
+    assert!(signed_welcome, "the relay did not store the signed Welcome");
     assert!(welcomed, "recipient welcome: {last_welcome}");
 
     let server = Keys::generate();
@@ -767,6 +773,17 @@ fn fixture_events(url: &str, kind: u64) -> Vec<(u64, Event)> {
             Some((seq, event))
         })
         .collect()
+}
+
+fn relay_has_signed_welcome(url: &str, recipient: &Keys, sender: &Keys) -> bool {
+    let recipient_hex = recipient.public_key().to_hex();
+    gift_wraps(url).iter().any(|(_, event)| {
+        p_tag(event) == recipient_hex
+            && event.verify().is_ok()
+            && UnwrappedGift::from_gift_wrap(recipient, event).is_ok_and(|welcome| {
+                welcome.sender == sender.public_key() && welcome.rumor.kind == Kind::Custom(444)
+            })
+    })
 }
 
 fn p_tag(event: &Event) -> String {
@@ -1495,6 +1512,7 @@ async fn executable_exchange() {
         .await
         .expect("recipient import");
     assert_eq!(imported.account.account_id_hex, recipient_hex);
+    assert!(imported.key_package_bytes.unwrap_or(0) > 0);
 
     let mut helper = start_fixture_helper(None, &helper_bin, &root, &socket, &relay.url);
     wait_health(&root.join("health.sock"));
@@ -1562,19 +1580,21 @@ async fn executable_exchange() {
     );
     let group_id = GroupId::new(hex::decode(&group).expect("group hex"));
     let mut welcomed = false;
+    let mut last_welcome = "no_attempt";
     for _ in 0..20 {
         sync_recipient(&runtime).await;
-        if runtime
-            .group_members(&recipient_hex, &group_id)
-            .await
-            .is_ok()
-        {
-            welcomed = true;
-            break;
+        match runtime.group_members(&recipient_hex, &group_id).await {
+            Ok(_) => {
+                welcomed = true;
+                break;
+            }
+            Err(error) => last_welcome = sync_error_kind(&error),
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
-    assert!(welcomed, "recipient did not join the packaged conversation");
+    let signed_welcome = relay_has_signed_welcome(&relay.url, &recipient_keys, &sender_keys);
+    assert!(signed_welcome, "the packaged helper's signed Welcome did not reach the relay");
+    assert!(welcomed, "recipient did not join the packaged conversation: {last_welcome}");
 
     let server = Keys::generate();
     let server_hex = server.public_key().to_hex();

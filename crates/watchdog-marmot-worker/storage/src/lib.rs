@@ -170,10 +170,6 @@ impl MemoryMdkStorage {
         ])
     }
 
-    pub fn retired_operation_count(&self) -> StorageResult<u64> {
-        Ok(self.lock()?.state.tombstone_high_water)
-    }
-
     pub fn account_secret(&self) -> Option<[u8; 32]> {
         self.lock().ok().and_then(|bag| {
             bag.state.account_secret.as_ref().and_then(|secret| {

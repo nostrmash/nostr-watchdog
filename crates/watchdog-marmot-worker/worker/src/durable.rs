@@ -809,9 +809,7 @@ fn storage_capacity(sql: &AccountSql, session: &Session, row: Option<&Row>) -> s
         output.insert(name.into(), json!(reading));
     }
     output.insert("warnings".into(), json!(warnings));
-    output.insert("retiredOperations".into(), json!(
-        session.storage().retired_operation_count().map_err(|error| error.to_string())?
-    ));
+    output.insert("retiredOperations".into(), json!(count_operations(sql)?));
     Ok(Value::Object(output))
 }
 

@@ -47,7 +47,7 @@ A legacy snapshot without authenticated history metadata requires recovery or de
 
 ### Cloudflare account capacity
 
-The authenticated Marmot readiness response reports `authority.storageCapacity` with live used and limit counters. It lists a warning once a counter reaches 80% of its limit. The sealed account supplies the committed plaintext byte count after authenticated decompression. The sealed row length includes a 34-byte envelope and authentication tag for format 2. The largest SQL history bucket is reported separately from the authenticated retired-operation high-water count. The capacity query leaves state unchanged.
+The authenticated Marmot readiness response reports `authority.storageCapacity` with live used and limit counters. It lists a warning once a counter reaches 80% of its limit. The sealed account supplies the committed plaintext byte count after authenticated decompression. The sealed row length includes a 34-byte envelope and authentication tag for format 2. The response reports the largest history bucket and total retired operations from SQLite. These counts describe capacity. Operation lookups still verify the bucket commitment and record MAC. The capacity query leaves state unchanged.
 
 | Limit | Current bound |
 | --- | ---: |
