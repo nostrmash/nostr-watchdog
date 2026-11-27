@@ -9,7 +9,9 @@ pub mod inbox;
 pub mod publication;
 pub mod push;
 
-pub use mdk_do_storage::{OperationTombstone, ServerRelays, StoredWake};
+pub use mdk_do_storage::{
+    history_authoritative, stamp_tombstone, OperationTombstone, ServerRelays, StoredWake,
+};
 
 use std::sync::Arc;
 
@@ -1115,10 +1117,11 @@ impl Session {
         let members = engine.members(group_id).map_err(map_engine)?;
         let member_ids = members.iter().map(member_hex).collect::<Vec<_>>();
         drop(engine);
+        let current_epoch = self.storage.get_group(group_id).map_err(map_storage)?.epoch.0;
         let group_hex = hex::encode(group_id.as_slice());
         let mut leaves = vec![(self.public_key_hex(), own)];
         for observed in self.storage.observed_leaves().map_err(map_storage)? {
-            if observed.removed || observed.group_id_hex != group_hex {
+            if observed.removed || observed.group_id_hex != group_hex || observed.epoch < current_epoch {
                 continue;
             }
             if !member_ids.iter().any(|member| member == &observed.member_id_hex) {
@@ -1184,7 +1187,9 @@ impl Session {
             let Some(stone) = self.storage.tombstone(operation_id).map_err(map_storage)? else {
                 return Err(SessionError::MissingPublication(operation_id.to_owned()));
             };
+            let project_id = self.binding().map(|binding| binding.project_id).unwrap_or_default();
             return Ok(serde_json::json!({
+                "projectId": project_id,
                 "operationId": operation_id,
                 "messagePhase": stone.message_phase,
                 "messageState": stone.message_phase,
@@ -1209,14 +1214,13 @@ impl Session {
         let error = push_error(&row);
         let push_retryable = push_is_retryable(&row.push_phase, error.as_deref());
         let message_terminal = matches!(row.message_phase.as_str(), "relay_accepted" | "rejected");
-        let push_closed = matches!(
-            row.push_phase.as_str(),
-            "relay_accepted" | "rejected" | "not_required" | "not_attempted" | "expired" | "terminal_failure"
-        );
+        let push_closed = push_terminally_closed(&row);
         let settled = message_terminal && push_closed && !push_retryable;
         let retry_after = if settled { 0 } else { 15_000 };
         let mut body = publication_counters(&row);
         let map = body.as_object_mut().expect("counters");
+        let project_id = self.binding().map(|binding| binding.project_id).unwrap_or_default();
+        map.insert("projectId".into(), serde_json::json!(project_id));
         map.insert("operationId".into(), serde_json::json!(operation_id));
         map.insert("messagePhase".into(), serde_json::json!(row.message_phase));
         map.insert("messageState".into(), serde_json::json!(row.message_phase));
@@ -1228,6 +1232,7 @@ impl Session {
         map.insert("pushState".into(), serde_json::json!(row.push_phase));
         map.insert("pushEventId".into(), serde_json::json!(row.push_event_id));
         map.insert("triggers".into(), trigger_evidence(&row));
+        map.insert("targets".into(), target_evidence(&row));
         map.insert(
             "evidence".into(),
             serde_json::json!(if trigger_evidence(&row).as_array().map(|items| items.len() > 1).unwrap_or(false) {
@@ -1293,7 +1298,7 @@ impl Session {
     pub fn note_sync_page(
         &self,
         stream: &str,
-        created: &[u64],
+        events: &[(u64, String)],
         page_limit: usize,
         complete: bool,
     ) -> Result<(), SessionError> {
@@ -1302,21 +1307,37 @@ impl Session {
         let mut since = existing.map(|cursor| cursor.since).unwrap_or(0);
         let mut until = existing.and_then(|cursor| cursor.until);
         let mut caught_up = existing.map(|cursor| cursor.caught_up).unwrap_or(false);
+        let mut boundary = existing
+            .map(|cursor| cursor.boundary_ids.clone())
+            .unwrap_or_default();
         if !complete {
             caught_up = false;
-            if let Some(oldest) = created.iter().copied().min() {
+            if let Some(oldest) = events.iter().map(|(created, _)| *created).min() {
                 until = Some(oldest);
             }
-        } else if created.len() >= page_limit && !created.is_empty() {
-            let oldest = created.iter().copied().min().unwrap_or(0);
-            until = Some(oldest.saturating_sub(1));
+        } else if events.len() >= page_limit && !events.is_empty() {
+            let oldest = events.iter().map(|(created, _)| *created).min().unwrap_or(0);
+            let at_oldest = events.iter().filter(|(created, _)| *created == oldest).count();
+            if at_oldest < page_limit {
+                until = Some(oldest.saturating_sub(1));
+                boundary.clear();
+            } else {
+                until = Some(oldest);
+                boundary = events
+                    .iter()
+                    .filter(|(created, _)| *created == oldest)
+                    .map(|(_, id)| id.clone())
+                    .collect();
+            }
             caught_up = false;
-        } else if let Some(newest) = created.iter().copied().max() {
-            since = newest;
+        } else if let Some(newest) = events.iter().map(|(created, _)| *created).max() {
+            since = newest.max(since);
             until = None;
+            boundary.clear();
             caught_up = true;
         } else if until.is_some() {
             until = None;
+            boundary.clear();
             caught_up = true;
         }
         self.storage
@@ -1326,8 +1347,67 @@ impl Session {
                 until,
                 caught_up,
                 updated_at_ms: clock::unix_ms(),
+                boundary_ids: boundary,
             })
             .map_err(map_storage)?;
+        Ok(())
+    }
+
+    /// Record a notification server that has authorized devices and no usable inbox.
+    /// This is not a publication attempt.
+    pub fn note_destination_gap(&self, operation_id: &str, server: &str) -> Result<(), SessionError> {
+        self.write_gap(operation_id, server, "unobservable", "push_unobservable")
+    }
+
+    /// Drop a destination gap once a real trigger exists for that server.
+    pub fn retire_destination_gap(&self, operation_id: &str, server: &str) -> Result<(), SessionError> {
+        self.write_gap(operation_id, server, "retired", "destination_resolved")
+    }
+
+    fn write_gap(
+        &self,
+        operation_id: &str,
+        server: &str,
+        phase: &str,
+        reason: &str,
+    ) -> Result<(), SessionError> {
+        let Some(mut existing) = self.storage.publication(operation_id).map_err(map_storage)? else {
+            return Err(SessionError::MissingPublication(operation_id.to_owned()));
+        };
+        let event_id = format!("gap:{server}");
+        let now = clock::unix_ms();
+        if let Some(record) = existing
+            .publications
+            .iter_mut()
+            .find(|record| record.role == "push" && record.event_id == event_id)
+        {
+            if record.phase == "relay_accepted" {
+                return Ok(());
+            }
+            record.phase = phase.to_owned();
+            record.reason = reason.to_owned();
+            record.server = server.to_owned();
+            record.finished_at_ms = now;
+        } else if phase != "retired" {
+            existing.publications.push(PublicationRecord {
+                attempt_id: event_id.clone(),
+                event_id,
+                role: "push".into(),
+                destination: String::new(),
+                phase: phase.to_owned(),
+                server: server.to_owned(),
+                reason: reason.to_owned(),
+                started_at_ms: now,
+                finished_at_ms: now,
+            });
+        }
+        let aggregate = aggregate_push(&existing.publications);
+        if aggregate != "not_attempted" {
+            existing.push_phase = aggregate;
+            existing.push_published = existing.push_phase == "relay_accepted";
+        }
+        existing.updated_at_ms = now;
+        self.storage.put_publication(existing).map_err(map_storage)?;
         Ok(())
     }
 
@@ -1496,9 +1576,54 @@ fn wakes_from_directory(directory: &push::PushDirectory) -> Vec<StoredWake> {
         .collect()
 }
 
+fn push_terminally_closed(row: &PreparedPublication) -> bool {
+    match row.push_phase.as_str() {
+        "relay_accepted" | "rejected" | "not_required" | "not_attempted" | "expired"
+        | "terminal_failure" | "token_unavailable" => true,
+        "unobservable" => {
+            let active = row
+                .publications
+                .iter()
+                .filter(|record| record.role == "push" && record.phase != "retired")
+                .collect::<Vec<_>>();
+            !active.is_empty()
+                && active.iter().all(|record| {
+                    record.phase == "relay_accepted"
+                        || record.phase == "rejected"
+                        || (record.phase == "unobservable" && record.reason == "push_unobservable")
+                })
+                && active.iter().any(|record| record.reason == "push_unobservable" || record.phase == "rejected")
+        }
+        _ => false,
+    }
+}
+
+fn target_evidence(row: &PreparedPublication) -> serde_json::Value {
+    let mut items = Vec::new();
+    let mut seen = Vec::new();
+    for record in row.publications.iter().filter(|record| record.role == "push") {
+        if seen.iter().any(|id| id == &record.event_id) {
+            continue;
+        }
+        seen.push(record.event_id.clone());
+        let retryable = record.phase != "relay_accepted"
+            && record.phase != "rejected"
+            && record.phase != "retired"
+            && record.reason != "push_unobservable";
+        items.push(serde_json::json!({
+            "eventId": record.event_id,
+            "server": record.server,
+            "phase": record.phase,
+            "reason": record.reason,
+            "retryable": retryable,
+        }));
+    }
+    serde_json::Value::Array(items)
+}
+
 fn aggregate_push(records: &[PublicationRecord]) -> String {
     let mut by_event: Vec<(String, String)> = Vec::new();
-    for record in records.iter().filter(|record| record.role == "push") {
+    for record in records.iter().filter(|record| record.role == "push" && record.phase != "retired") {
         if let Some(slot) = by_event.iter_mut().find(|(id, _)| id == &record.event_id) {
             if slot.1 != "relay_accepted" {
                 slot.1 = record.phase.clone();
@@ -1838,6 +1963,63 @@ mod tests {
             .unwrap();
         let waits = session.storage().publication("alert-1").unwrap().unwrap().token_wait_attempts;
         assert_eq!(waits, 2);
+        let attempts = session
+            .storage()
+            .publication("alert-1")
+            .unwrap()
+            .unwrap()
+            .push_publication_attempts;
+        session.note_destination_gap("alert-1", "server-c").unwrap();
+        let after_gap = session.storage().publication("alert-1").unwrap().unwrap();
+        assert_eq!(after_gap.push_publication_attempts, attempts);
+        let gap = session.project_operation("alert-1").unwrap();
+        assert_eq!(gap["disposition"], "reconcile");
+        assert!(gap["targets"].as_array().unwrap().iter().any(|item| item["eventId"] == "gap:server-c"));
+    }
+
+    #[tokio::test]
+    async fn a_terminal_gap_is_visible_and_a_full_same_timestamp_page_is_not_skipped() {
+        let session = Session::generate().unwrap();
+        session.storage().put_publication(stored_chat("alert-1", "event-1")).unwrap();
+        session
+            .note_trigger("alert-1", "relay_accepted", "trigger-a", "wss://a.example", "a1", "", "s1")
+            .unwrap();
+        session.note_destination_gap("alert-1", "server-b").unwrap();
+        let view = session.project_operation("alert-1").unwrap();
+        assert_eq!(view["disposition"], "settled");
+        assert_eq!(view["pushRetryable"], false);
+        assert_eq!(view["error"], "push_unobservable");
+        assert_eq!(view["evidence"], "partial_push");
+        assert!(view["targets"].as_array().unwrap().iter().any(|item| {
+            item["server"] == "server-b" && item["retryable"] == false
+        }));
+        session
+            .note_trigger("alert-1", "unobservable", "trigger-a", "wss://a.example", "a2", "publication_timeout", "s1")
+            .unwrap();
+        let kept = session.project_operation("alert-1").unwrap();
+        assert_eq!(kept["triggers"][0]["phase"], "relay_accepted");
+
+        let page = vec![(20u64, "e1".into()), (20, "e2".into())];
+        session.note_sync_page("group-445", &page, 2, true).unwrap();
+        let cursor = session.storage().sync_cursors().unwrap();
+        assert_eq!(cursor[0].until, Some(20));
+        assert!(!cursor[0].caught_up);
+        session.note_sync_page("group-445", &page, 2, true).unwrap();
+        let again = session.storage().sync_cursors().unwrap();
+        assert_eq!(again[0].until, Some(20));
+        session
+            .note_sync_page("group-445", &[(20, "e1".into()), (21, "e3".into())], 2, false)
+            .unwrap();
+        let failed = session.storage().sync_cursors().unwrap();
+        assert!(!failed[0].caught_up);
+        assert_eq!(failed[0].until, Some(20));
+        session
+            .note_sync_page("group-445", &[(30, "e4".into())], 2, true)
+            .unwrap();
+        let done = session.storage().sync_cursors().unwrap();
+        assert!(done[0].caught_up);
+        assert_eq!(done[0].since, 30);
+        assert!(done[0].until.is_none());
     }
 
     #[tokio::test]

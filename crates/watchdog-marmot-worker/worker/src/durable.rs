@@ -1,11 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use cgka_traits::storage::GroupStorage;
 use cgka_traits::{GroupId, KeyPackage, KeyPackageSource, MessageId, TransportMessage};
 use marmot_worker_runtime::inbox::{self, InboxChoice};
 use marmot_worker_runtime::publication::{self, revalidate_trigger_envelope};
-use marmot_worker_runtime::push::notification_gift_wrap;
-use marmot_worker_runtime::{OperationTombstone, ServerRelays, Session};
+use marmot_worker_runtime::push::{capability_identity, notification_gift_wrap, CapabilityId, Platform, TokenRecord};
+use marmot_worker_runtime::{
+    history_authoritative, stamp_tombstone, OperationTombstone, ServerRelays, Session, StoredWake,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use worker::*;
@@ -568,6 +570,8 @@ fn overlay_projection(response: &mut Value, projected: Value) {
         "evidence",
         "phoneDelivery",
         "pushRetryable",
+        "projectId",
+        "targets",
         "triggers",
         "messageAttempts",
         "messagePublicationAttempts",
@@ -646,12 +650,47 @@ async fn execute(
     if fault.is_some() && !allow_loopback {
         return Err("fault injection is test-only".into());
     }
-    let (session, created) = open_session(sql, &loaded, storage_key, project, &command)?;
+    let (session, created) = open_session(&loaded, storage_key, project, &command)?;
     if let Some(row) = &loaded {
         let declared = parse_floors(&row.floors)?;
         if declared != floor_map(&session)? {
             return Err("epoch floor metadata is corrupt".into());
         }
+    }
+    let account_hex = loaded
+        .as_ref()
+        .map(|row| row.account_hex.clone())
+        .unwrap_or_else(|| session.public_key_hex());
+    let stored_revision = loaded.as_ref().map(|row| row.revision as u64).unwrap_or(0);
+    let stored_writer = loaded
+        .as_ref()
+        .map(|row| row.writer.clone())
+        .unwrap_or_default();
+    if let Some(operation_id) = command
+        .operation_id
+        .clone()
+        .or(command.operation_id_camel.clone())
+    {
+        consult_operation(
+            sql,
+            &session,
+            project,
+            &account_hex,
+            stored_revision,
+            &stored_writer,
+            &operation_id,
+        )?;
+    }
+    if matches!(command.op.as_str(), "key_package" | "maintain") {
+        consult_operation(
+            sql,
+            &session,
+            project,
+            &account_hex,
+            stored_revision,
+            &stored_writer,
+            "key-package",
+        )?;
     }
     let body = dispatch(&session, project, allow_loopback, &command).await?;
     if fault.as_deref() == Some("before_store") {
@@ -770,6 +809,15 @@ async fn establish_from(
         }
     }
     let package = package.ok_or("recipient key package was not found")?;
+    consult_operation(
+        sql,
+        &session,
+        project,
+        &row.account_hex,
+        row.revision as u64,
+        &row.writer,
+        operation_id,
+    )?;
     let (group_id, welcomes) = session
         .create_group(operation_id, "watchdog", vec![package], relays.clone())
         .await
@@ -870,20 +918,27 @@ async fn ingest_pulled(
 ) -> std::result::Result<Value, String> {
     let (session, row) = open_account(sql, storage_key, project)?;
     let mut chats = Vec::new();
-    let mut created = Vec::new();
+    let mut processed = Vec::new();
     let mut failed = false;
     for event in events {
         let stamp = event.get("created_at").and_then(|value| value.as_u64()).unwrap_or(0);
+        let event_id = event.get("id").and_then(|value| value.as_str()).unwrap_or("").to_owned();
+        if event_id.is_empty() {
+            failed = true;
+        }
         match session.ingest_event(event).await {
             Ok(mut found) => {
                 chats.append(&mut found);
-                created.push(stamp);
+                processed.push((stamp, event_id));
             }
-            Err(_) => failed = true,
+            Err(_) => {
+                failed = true;
+                processed.push((stamp, event_id));
+            }
         }
     }
     session
-        .note_sync_page(stream, &created, 20, !failed)
+        .note_sync_page(stream, &processed, 20, !failed)
         .map_err(|error| error.to_string())?;
     commit_account(sql, storage_key, project, &session, Some(row.revision as u64))?;
     Ok(json!({
@@ -932,7 +987,6 @@ fn cursor_filter(mut filter: Value, since: u64, until: Option<u64>) -> Value {
 }
 
 fn open_session(
-    sql: &SqlStorage,
     loaded: &Option<Row>,
     storage_key: [u8; 32],
     project: &str,
@@ -947,7 +1001,7 @@ fn open_session(
                 return Err("sender_identity_mismatch".into());
             }
         }
-        hydrate(sql, &session)?;
+        hydrate(&session)?;
         return Ok((session, false));
     }
     if command.op != "onboard" && command.op != "init" {
@@ -957,7 +1011,7 @@ fn open_session(
         Some(secret) => Session::import(parse_secret(secret)?).map_err(|error| error.to_string())?,
         None => Session::generate().map_err(|error| error.to_string())?,
     };
-    hydrate(sql, &session)?;
+    hydrate(&session)?;
     Ok((session, true))
 }
 
@@ -1440,6 +1494,7 @@ async fn acknowledge(
         } else {
             publication.reason.as_str()
         };
+        let mut server = String::new();
         if let Some(stored) = session
             .storage()
             .publication(operation_id)
@@ -1453,6 +1508,7 @@ async fn acknowledge(
                 {
                     return Err("push acknowledgement does not match the prepared trigger".into());
                 }
+                server = server_for_event(bytes, &publication.event_id);
             }
         }
         session
@@ -1463,7 +1519,7 @@ async fn acknowledge(
                 &publication.relay,
                 &publication.attempt_id,
                 reason,
-                "",
+                &server,
             )
             .map_err(|error| error.to_string())?
     } else {
@@ -1514,6 +1570,25 @@ fn push_event_ids(bytes: &[u8]) -> Vec<String> {
     ids
 }
 
+fn server_for_event(bytes: &[u8], event_id: &str) -> String {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return String::new();
+    };
+    let Some(items) = value.as_array() else {
+        return String::new();
+    };
+    for item in items {
+        if item.pointer("/event/id").and_then(|value| value.as_str()) == Some(event_id) {
+            return item
+                .get("server")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_owned();
+        }
+    }
+    String::new()
+}
+
 fn persist_session(
     sql: &SqlStorage,
     storage_key: [u8; 32],
@@ -1531,29 +1606,32 @@ fn commit_account(
     session: &Session,
     expected: Option<u64>,
 ) -> std::result::Result<(), String> {
-    let indexed = read_operation_index(sql)?;
-    session
+    remember_consistent(session)?;
+    let pending = session
         .storage()
-        .install_indexed_tombstones(indexed)
+        .take_pending_tombstones()
         .map_err(|error| error.to_string())?;
-    let stones = session
-        .storage()
-        .export_tombstones()
-        .map_err(|error| error.to_string())?;
-    write_operation_index(sql, &stones)?;
     let next = advance(session, expected)?;
-    let floors = floor_map(session)?;
-    let sealed = session.seal(&storage_key, project).map_err(|error| error.to_string())?;
     let writer = writer_id()?;
-    store(
-        sql,
-        expected,
-        next,
-        &writer,
-        &session.public_key_hex(),
-        &floors,
-        &sealed,
-    )?;
+    let account = session.public_key_hex();
+    let stamped = pending
+        .into_iter()
+        .map(|stone| stamp_tombstone(stone, project, &account, next, &writer))
+        .collect::<Vec<_>>();
+    let stored_writer = load(sql)?.map(|row| row.writer).unwrap_or_default();
+    let written = write_pending_operations(sql, &stamped, expected.unwrap_or(0), &stored_writer)?;
+    let floors = floor_map(session)?;
+    let sealed = match session.seal(&storage_key, project) {
+        Ok(sealed) => sealed,
+        Err(error) => {
+            delete_staged(sql, &written);
+            return Err(error.to_string());
+        }
+    };
+    if let Err(error) = store(sql, expected, next, &writer, &account, &floors, &sealed) {
+        delete_staged(sql, &written);
+        return Err(error);
+    }
     for hook in session.take_commit_hooks() {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
     }
@@ -1642,69 +1720,17 @@ async fn prepare_push(
         persist_session(sql, storage_key, project, &session, row.revision as u64)?;
         return Ok(empty_push(Some("token_unavailable".into())));
     }
-    let mut jobs = Vec::new();
-    let mut envelope = Vec::new();
-    let mut discover = Vec::new();
-    let mut grouped: HashMap<String, Vec<(Vec<u8>, String)>> = HashMap::new();
-    let mut hints: HashMap<String, Vec<String>> = HashMap::new();
-    let mut order = Vec::new();
-    for wake in &tokens {
-        if !grouped.contains_key(&wake.server_pubkey_hex) {
-            order.push(wake.server_pubkey_hex.clone());
-        }
-        if let Some(hint) = wake.relay_hint.clone() {
-            if relay::validate_relay(&hint, allow_loopback).is_ok() {
-                let entry = hints.entry(wake.server_pubkey_hex.clone()).or_default();
-                if !entry.contains(&hint) {
-                    entry.push(hint);
-                }
-            }
-        }
-        grouped
-            .entry(wake.server_pubkey_hex.clone())
-            .or_default()
-            .push((wake.encrypted_token.clone(), wake.token_fingerprint.clone()));
+    let (jobs, envelope, discover, terminal) =
+        build_trigger_batches(&tokens, &directories, allow_loopback, now, rediscovery).await?;
+    if !envelope.is_empty() {
+        let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
+        session
+            .stage_push(operation_id, &bytes)
+            .map_err(|error| error.to_string())?;
     }
-    for server in order {
-        let mut relays = hints.remove(&server).unwrap_or_default();
-        if relays.is_empty() {
-            match cached_inbox(&directories, &server, now, allow_loopback) {
-                Some(found) if !found.is_empty() => relays = found,
-                Some(_) => continue,
-                None => {
-                    discover.push(server);
-                    continue;
-                }
-            }
-        }
-        let batch = grouped.remove(&server).unwrap_or_default();
-        let mut offset = 0;
-        while offset < batch.len() {
-            let end = (offset + 18).min(batch.len());
-            let slice = &batch[offset..end];
-            let ciphertexts = slice.iter().map(|(token, _)| token.clone()).collect::<Vec<_>>();
-            let fingerprints = slice.iter().map(|(_, fingerprint)| fingerprint.clone()).collect::<Vec<_>>();
-            let event = notification_gift_wrap(&server, &ciphertexts)
-                .await
-                .map_err(|error| error.to_string())?;
-            let event = serde_json::to_value(&event).map_err(|error| error.to_string())?;
-            envelope.push(json!({
-                "event": event,
-                "relays": relays,
-                "server": server,
-                "fingerprints": fingerprints,
-                "phase": "prepared"
-            }));
-            jobs.push((event, relays.clone()));
-            offset = end;
-        }
-    }
+    record_push_targets(&session, operation_id, &envelope, &terminal)?;
     if !discover.is_empty() && !rediscovery {
-        if !envelope.is_empty() {
-            let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
-            session
-                .stage_push(operation_id, &bytes)
-                .map_err(|error| error.to_string())?;
+        if !envelope.is_empty() || !terminal.is_empty() {
             persist_session(sql, storage_key, project, &session, row.revision as u64)?;
         }
         return Ok(PushWork {
@@ -1715,16 +1741,14 @@ async fn prepare_push(
         });
     }
     if jobs.is_empty() {
-        session
-            .note_push(operation_id, "unobservable", None)
-            .map_err(|error| error.to_string())?;
+        if terminal.is_empty() {
+            session
+                .note_push(operation_id, "unobservable", None)
+                .map_err(|error| error.to_string())?;
+        }
         persist_session(sql, storage_key, project, &session, row.revision as u64)?;
         return Ok(empty_push(Some("unobservable".into())));
     }
-    let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
-    session
-        .stage_push(operation_id, &bytes)
-        .map_err(|error| error.to_string())?;
     persist_session(sql, storage_key, project, &session, row.revision as u64)?;
     Ok(PushWork {
         jobs,
@@ -1772,11 +1796,11 @@ async fn retry_stored_push(
     envelope: Value,
     now: u64,
 ) -> std::result::Result<PushWork, String> {
-    let authorized = tokens
-        .iter()
-        .map(|wake| wake.token_fingerprint.clone())
-        .collect::<HashSet<_>>();
-    let (updated, jobs, _uncovered) = revalidate_trigger_envelope(&envelope, &authorized);
+    let mut authorized = Vec::new();
+    for wake in tokens {
+        authorized.push(wake_capability(wake)?);
+    }
+    let (updated, _jobs, _uncovered) = revalidate_trigger_envelope(&envelope, &authorized);
     let mut publish = Vec::new();
     let mut discover = Vec::new();
     let mut updated = updated;
@@ -1829,21 +1853,24 @@ async fn retry_stored_push(
                 }
                 continue;
             }
-            let _ = jobs;
             publish.push((event, relays));
         }
     }
-    let covered = fingerprint_set(&updated);
-    let missing = tokens
-        .iter()
-        .filter(|wake| !covered.contains(&wake.token_fingerprint))
-        .cloned()
-        .collect::<Vec<_>>();
+    let covered = covered_capabilities(&updated);
+    let mut missing = Vec::new();
+    for wake in tokens {
+        let capability = wake_capability(wake)?;
+        if !covered.iter().any(|item| item == &capability) {
+            missing.push(wake.clone());
+        }
+    }
+    let mut terminal = Vec::new();
     if !missing.is_empty() {
-        let (extra_jobs, extra_items, extra_discover) =
+        let (extra_jobs, extra_items, extra_discover, extra_terminal) =
             build_trigger_batches(&missing, directories, allow_loopback, now, rediscovery).await?;
         publish.extend(extra_jobs);
         discover.extend(extra_discover);
+        terminal.extend(extra_terminal);
         if let Some(items) = updated.as_array_mut() {
             items.extend(extra_items);
         }
@@ -1852,6 +1879,7 @@ async fn retry_stored_push(
     session
         .replace_push_envelope(operation_id, &bytes)
         .map_err(|error| error.to_string())?;
+    record_push_targets(&session, operation_id, updated.as_array().map(Vec::as_slice).unwrap_or(&[]), &terminal)?;
     persist_session(sql, storage_key, project, &session, revision)?;
     if !discover.is_empty() && !rediscovery {
         return Ok(PushWork {
@@ -1872,8 +1900,8 @@ async fn retry_stored_push(
     })
 }
 
-fn fingerprint_set(envelope: &Value) -> HashSet<String> {
-    let mut covered = HashSet::new();
+fn covered_capabilities(envelope: &Value) -> Vec<CapabilityId> {
+    let mut covered = Vec::new();
     let Some(items) = envelope.as_array() else {
         return covered;
     };
@@ -1882,10 +1910,15 @@ fn fingerprint_set(envelope: &Value) -> HashSet<String> {
         if phase == "retired" {
             continue;
         }
-        if let Some(values) = item.get("fingerprints").and_then(|value| value.as_array()) {
-            for value in values {
-                if let Some(fingerprint) = value.as_str() {
-                    covered.insert(fingerprint.to_owned());
+        if let Ok(capabilities) = item
+            .get("capabilities")
+            .cloned()
+            .map(serde_json::from_value::<Vec<CapabilityId>>)
+            .transpose()
+        {
+            for capability in capabilities.unwrap_or_default() {
+                if !covered.iter().any(|item| item == &capability) {
+                    covered.push(capability);
                 }
             }
         }
@@ -1893,20 +1926,60 @@ fn fingerprint_set(envelope: &Value) -> HashSet<String> {
     covered
 }
 
+fn wake_capability(wake: &StoredWake) -> std::result::Result<CapabilityId, String> {
+    let platform = Platform::from_name(&wake.platform)?;
+    capability_identity(&TokenRecord {
+        group_id_hex: wake.group_id_hex.clone(),
+        member_id_hex: wake.member_id_hex.clone(),
+        leaf_index: wake.leaf_index,
+        platform,
+        token_fingerprint: wake.token_fingerprint.clone(),
+        server_pubkey_hex: wake.server_pubkey_hex.clone(),
+        relay_hint: wake.relay_hint.clone(),
+        owner_ts: wake.owner_ts,
+        encrypted_token: wake.encrypted_token.clone(),
+        owner_sig: wake.owner_sig.clone(),
+        removed: wake.removed,
+    })
+}
+
+fn record_push_targets(
+    session: &Session,
+    operation_id: &str,
+    envelope: &[Value],
+    terminal: &[String],
+) -> std::result::Result<(), String> {
+    for item in envelope {
+        if let Some(server) = item.get("server").and_then(|value| value.as_str()) {
+            session
+                .retire_destination_gap(operation_id, server)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    for server in terminal {
+        session
+            .note_destination_gap(operation_id, server)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 async fn build_trigger_batches(
-    tokens: &[marmot_worker_runtime::StoredWake],
+    tokens: &[StoredWake],
     directories: &[ServerRelays],
     allow_loopback: bool,
     now: u64,
     rediscovery: bool,
-) -> std::result::Result<(Vec<(Value, Vec<String>)>, Vec<Value>, Vec<String>), String> {
+) -> std::result::Result<(Vec<(Value, Vec<String>)>, Vec<Value>, Vec<String>, Vec<String>), String> {
     let mut jobs = Vec::new();
     let mut envelope = Vec::new();
     let mut discover = Vec::new();
-    let mut grouped: HashMap<String, Vec<(Vec<u8>, String)>> = HashMap::new();
+    let mut terminal = Vec::new();
+    let mut grouped: HashMap<String, Vec<(Vec<u8>, CapabilityId)>> = HashMap::new();
     let mut hints: HashMap<String, Vec<String>> = HashMap::new();
     let mut order = Vec::new();
     for wake in tokens {
+        let capability = wake_capability(wake)?;
         if !grouped.contains_key(&wake.server_pubkey_hex) {
             order.push(wake.server_pubkey_hex.clone());
         }
@@ -1921,19 +1994,25 @@ async fn build_trigger_batches(
         grouped
             .entry(wake.server_pubkey_hex.clone())
             .or_default()
-            .push((wake.encrypted_token.clone(), wake.token_fingerprint.clone()));
+            .push((wake.encrypted_token.clone(), capability));
     }
     for server in order {
         let mut relays = hints.remove(&server).unwrap_or_default();
         if relays.is_empty() {
             match cached_inbox(directories, &server, now, allow_loopback) {
                 Some(found) if !found.is_empty() => relays = found,
-                Some(_) => continue,
+                Some(_) => {
+                    terminal.push(server);
+                    continue;
+                }
                 None if !rediscovery => {
                     discover.push(server);
                     continue;
                 }
-                None => continue,
+                None => {
+                    terminal.push(server);
+                    continue;
+                }
             }
         }
         let batch = grouped.remove(&server).unwrap_or_default();
@@ -1942,9 +2021,9 @@ async fn build_trigger_batches(
             let end = (offset + 18).min(batch.len());
             let slice = &batch[offset..end];
             let ciphertexts = slice.iter().map(|(token, _)| token.clone()).collect::<Vec<_>>();
-            let fingerprints = slice
+            let capabilities = slice
                 .iter()
-                .map(|(_, fingerprint)| fingerprint.clone())
+                .map(|(_, capability)| capability.clone())
                 .collect::<Vec<_>>();
             let event = notification_gift_wrap(&server, &ciphertexts)
                 .await
@@ -1954,14 +2033,14 @@ async fn build_trigger_batches(
                 "event": event,
                 "relays": relays,
                 "server": server,
-                "fingerprints": fingerprints,
+                "capabilities": capabilities,
                 "phase": "prepared"
             }));
             jobs.push((event, relays.clone()));
             offset = end;
         }
     }
-    Ok((jobs, envelope, discover))
+    Ok((jobs, envelope, discover, terminal))
 }
 
 fn open_account(
@@ -1972,15 +2051,39 @@ fn open_account(
     let row = load(sql)?.ok_or_else(|| "account is not initialized".to_owned())?;
     let session = Session::open(&storage_key, project, &row.account_hex, &row.sealed)
         .map_err(|error| error.to_string())?;
-    hydrate(sql, &session)?;
+    hydrate(&session)?;
     Ok((session, row))
 }
 
-fn hydrate(sql: &SqlStorage, session: &Session) -> std::result::Result<(), String> {
-    let rows = read_operation_index(sql)?;
+fn hydrate(session: &Session) -> std::result::Result<(), String> {
     session
         .storage()
-        .install_indexed_tombstones(rows)
+        .enable_incremental_history()
+        .map_err(|error| error.to_string())
+}
+
+fn consult_operation(
+    sql: &SqlStorage,
+    session: &Session,
+    project: &str,
+    account_hex: &str,
+    revision: u64,
+    writer: &str,
+    operation_id: &str,
+) -> std::result::Result<(), String> {
+    let found = match lookup_operation(sql, operation_id)? {
+        None => None,
+        Some(stone) => {
+            match history_authoritative(&stone, revision, writer, project, account_hex) {
+                Ok(true) => Some(stone),
+                Ok(false) => None,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    };
+    session
+        .storage()
+        .consult_history(operation_id, found)
         .map_err(|error| error.to_string())
 }
 
@@ -2072,32 +2175,90 @@ async fn admit_inboxes(
     Ok(())
 }
 
-fn read_operation_index(sql: &SqlStorage) -> std::result::Result<Vec<OperationTombstone>, String> {
+fn lookup_operation(
+    sql: &SqlStorage,
+    alert_id: &str,
+) -> std::result::Result<Option<OperationTombstone>, String> {
     let cursor = sql
-        .exec("SELECT record FROM marmot_operation", None)
+        .exec(
+            "SELECT record FROM marmot_operation WHERE alert_id = ?",
+            vec![alert_id.into()],
+        )
         .map_err(|error| error.to_string())?;
     let mut raw = cursor.raw();
-    let mut rows = Vec::new();
-    while let Some(values) = raw.next() {
-        let values = values.map_err(|error| error.to_string())?;
-        let record = sql_string(values.first().ok_or("deduplication state is corrupt")?)?;
-        let stone = serde_json::from_str::<OperationTombstone>(&record)
-            .map_err(|_| "deduplication state is corrupt".to_owned())?;
-        rows.push(stone);
-    }
-    Ok(rows)
+    let Some(values) = raw.next() else {
+        return Ok(None);
+    };
+    let values = values.map_err(|error| error.to_string())?;
+    let record = sql_string(values.first().ok_or("deduplication state is corrupt")?)?;
+    let stone = serde_json::from_str::<OperationTombstone>(&record)
+        .map_err(|_| "corrupted historical record".to_owned())?;
+    Ok(Some(stone))
 }
 
-fn write_operation_index(sql: &SqlStorage, stones: &[OperationTombstone]) -> std::result::Result<(), String> {
+fn count_operations(sql: &SqlStorage) -> std::result::Result<i64, String> {
+    let cursor = sql
+        .exec("SELECT COUNT(*) FROM marmot_operation", None)
+        .map_err(|error| error.to_string())?;
+    let mut raw = cursor.raw();
+    let Some(values) = raw.next() else {
+        return Ok(0);
+    };
+    let values = values.map_err(|error| error.to_string())?;
+    sql_i64(values.first().ok_or("operation count is missing")?)
+}
+
+fn write_pending_operations(
+    sql: &SqlStorage,
+    stones: &[OperationTombstone],
+    stored_revision: u64,
+    stored_writer: &str,
+) -> std::result::Result<Vec<(String, String)>, String> {
+    let mut written = Vec::new();
     for stone in stones {
+        if let Some(existing) = lookup_operation(sql, &stone.alert_id)? {
+            match history_authoritative(
+                &existing,
+                stored_revision,
+                stored_writer,
+                &stone.project_id,
+                &stone.account_hex,
+            ) {
+                Ok(true) => {
+                    if existing.payload_sha256 != stone.payload_sha256
+                        || existing.group_id != stone.group_id
+                        || existing.operation_kind != stone.operation_kind
+                    {
+                        delete_staged(sql, &written);
+                        return Err("conflicting historical record".into());
+                    }
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    delete_staged(sql, &written);
+                    return Err(error.to_string());
+                }
+            }
+        }
         let record = serde_json::to_string(stone).map_err(|error| error.to_string())?;
         sql.exec(
             "INSERT OR REPLACE INTO marmot_operation (alert_id, record) VALUES (?, ?)",
-            vec![stone.alert_id.clone().into(), record.into()],
+            vec![stone.alert_id.clone().into(), record.clone().into()],
         )
         .map_err(|error| error.to_string())?;
+        written.push((stone.alert_id.clone(), record));
     }
-    Ok(())
+    Ok(written)
+}
+
+fn delete_staged(sql: &SqlStorage, written: &[(String, String)]) {
+    for (alert_id, record) in written {
+        let _ = sql.exec(
+            "DELETE FROM marmot_operation WHERE alert_id = ? AND record = ?",
+            vec![alert_id.clone().into(), record.clone().into()],
+        );
+    }
 }
 
 async fn read_limited(req: &mut Request) -> Result<Vec<u8>> {
@@ -2198,7 +2359,8 @@ fn status(sql: &SqlStorage, storage_key: [u8; 32], project: &str) -> std::result
     let groups = session.storage().list_groups().map_err(|error| error.to_string())?.len();
     let binding = session.binding().map_err(|error| error.to_string())?;
     let onboarding = session.onboarding_view().map_err(|error| error.to_string())?;
-    let (used, remaining) = session.storage().tombstone_status().map_err(|error| error.to_string())?;
+    let (_used, remaining) = session.storage().tombstone_status().map_err(|error| error.to_string())?;
+    let historical = count_operations(sql)?;
     Ok(json!({
         "ready": true,
         "revision": row.revision,
@@ -2207,7 +2369,7 @@ fn status(sql: &SqlStorage, storage_key: [u8; 32], project: &str) -> std::result
         "projectId": binding.project_id,
         "recipient": binding.recipient_hex,
         "onboarding": onboarding,
-        "historicalOperations": used,
+        "historicalOperations": historical,
         "historicalCapacityRemaining": remaining,
         "databaseBytes": sql.database_size()
     }))

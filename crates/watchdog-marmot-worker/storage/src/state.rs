@@ -84,6 +84,10 @@ pub(crate) struct State {
     pub tombstone_high_water: u64,
     /// Set after the SQL operation index has been loaded into this process.
     pub tombstones_indexed: bool,
+    /// Operation ids whose historical row was looked up for this process.
+    pub history_consulted: Vec<String>,
+    /// Tombstones created in this process and not yet committed.
+    pub pending_tombstones: Vec<OperationTombstone>,
     pub observed_leaves: Vec<ObservedLeaf>,
     pub sync_cursors: Vec<SyncCursor>,
     pub wakes: Vec<StoredWake>,
@@ -162,6 +166,8 @@ impl State {
             operation_tombstones: Vec::new(),
             tombstone_high_water: 0,
             tombstones_indexed: false,
+            history_consulted: Vec::new(),
+            pending_tombstones: Vec::new(),
             observed_leaves: Vec::new(),
             sync_cursors: Vec::new(),
             wakes: Vec::new(),
@@ -1177,6 +1183,16 @@ pub struct OperationTombstone {
     pub push_publication_attempts: u64,
     pub unobservable_attempts: u64,
     pub push_attempts: u64,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub account_hex: String,
+    #[serde(default)]
+    pub bound_revision: u64,
+    #[serde(default)]
+    pub bound_writer: String,
+    #[serde(default)]
+    pub authenticator: String,
 }
 
 /// Encrypted wake capability. The raw device token is not stored.
@@ -1214,6 +1230,10 @@ pub struct SyncCursor {
     pub until: Option<u64>,
     pub caught_up: bool,
     pub updated_at_ms: u64,
+    /// Event ids at the inclusive `until` boundary. A full page that shares
+    /// one timestamp stays on that timestamp instead of skipping the rest.
+    #[serde(default)]
+    pub boundary_ids: Vec<String>,
 }
 
 /// Kind 10050 inbox relays observed for a notification server.

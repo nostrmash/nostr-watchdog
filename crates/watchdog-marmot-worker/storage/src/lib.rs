@@ -15,6 +15,8 @@ mod state;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use sha2::{Digest, Sha256};
+
 use cgka_traits::app_event::PendingAppMessageAuthority;
 use cgka_traits::convergence_pass::DurableConvergencePass;
 use cgka_traits::engine::GroupEvent;
@@ -191,6 +193,19 @@ impl MemoryMdkStorage {
                     "operation is retired and cannot be encrypted again".into(),
                 ));
             }
+            let in_journal = state
+                .journal
+                .iter()
+                .any(|row| row.alert_id == publication.alert_id);
+            let consulted = state
+                .history_consulted
+                .iter()
+                .any(|id| id == &publication.alert_id);
+            if state.tombstones_indexed && !in_journal && !consulted {
+                return Err(StorageError::Backend(
+                    "deduplication state was not consulted".into(),
+                ));
+            }
             if let Some(existing) = state
                 .journal
                 .iter()
@@ -258,8 +273,67 @@ impl MemoryMdkStorage {
             state.tombstone_high_water = merged.len() as u64;
             state.operation_tombstones = merged;
             state.tombstones_indexed = true;
+            for row in &state.operation_tombstones {
+                if !state.history_consulted.iter().any(|id| id == &row.alert_id) {
+                    state.history_consulted.push(row.alert_id.clone());
+                }
+            }
             Ok(())
         })
+    }
+
+    /// Use per-operation lookups. Existing snapshot tombstones are staged once.
+    pub fn enable_incremental_history(&self) -> StorageResult<()> {
+        self.mutate(|state| {
+            if state.tombstones_indexed {
+                return Ok(());
+            }
+            state.pending_tombstones = state.operation_tombstones.clone();
+            state.tombstones_indexed = true;
+            Ok(())
+        })
+    }
+
+    /// Record the result of one indexed lookup. `None` means the id is absent.
+    pub fn consult_history(
+        &self,
+        alert_id: &str,
+        found: Option<OperationTombstone>,
+    ) -> StorageResult<()> {
+        self.mutate(|state| {
+            if !state.history_consulted.iter().any(|id| id == alert_id) {
+                state.history_consulted.push(alert_id.to_owned());
+            }
+            let Some(found) = found else {
+                return Ok(());
+            };
+            if found.alert_id != alert_id {
+                return Err(StorageError::Backend(
+                    "historical record does not match the requested operation".into(),
+                ));
+            }
+            if let Some(existing) = state
+                .operation_tombstones
+                .iter()
+                .find(|row| row.alert_id == alert_id)
+            {
+                if existing.payload_sha256 != found.payload_sha256
+                    || existing.group_id != found.group_id
+                    || existing.operation_kind != found.operation_kind
+                {
+                    return Err(StorageError::Backend(
+                        "conflicting historical record".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            state.operation_tombstones.push(found);
+            Ok(())
+        })
+    }
+
+    pub fn take_pending_tombstones(&self) -> StorageResult<Vec<OperationTombstone>> {
+        self.mutate(|state| Ok(std::mem::take(&mut state.pending_tombstones)))
     }
 
     pub fn tombstone_status(&self) -> StorageResult<(u64, Option<u64>)> {
@@ -1868,6 +1942,63 @@ fn trim_journal(state: &mut state::State) -> StorageResult<()> {
     Ok(())
 }
 
+/// Bind a tombstone to the account revision that will commit it.
+pub fn stamp_tombstone(
+    mut stone: OperationTombstone,
+    project_id: &str,
+    account_hex: &str,
+    revision: u64,
+    writer: &str,
+) -> OperationTombstone {
+    stone.project_id = project_id.to_owned();
+    stone.account_hex = account_hex.to_owned();
+    stone.bound_revision = revision;
+    stone.bound_writer = writer.to_owned();
+    stone.authenticator = tombstone_authenticator(&stone);
+    stone
+}
+
+/// A historical row is authoritative only after the account commit that names
+/// the same revision and writer. A higher revision is an uncommitted attempt.
+pub fn history_authoritative(
+    stone: &OperationTombstone,
+    account_revision: u64,
+    account_writer: &str,
+    project_id: &str,
+    account_hex: &str,
+) -> StorageResult<bool> {
+    if stone.authenticator.is_empty() || stone.authenticator != tombstone_authenticator(stone) {
+        return Err(StorageError::Backend("corrupted historical record".into()));
+    }
+    if stone.project_id != project_id || stone.account_hex != account_hex {
+        return Err(StorageError::Backend(
+            "historical record is bound to a different account".into(),
+        ));
+    }
+    if stone.bound_revision > account_revision {
+        return Ok(false);
+    }
+    if stone.bound_revision == account_revision && stone.bound_writer != account_writer {
+        return Err(StorageError::Backend("conflicting historical record".into()));
+    }
+    Ok(true)
+}
+
+fn tombstone_authenticator(stone: &OperationTombstone) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-operation-v1");
+    hasher.update(stone.project_id.as_bytes());
+    hasher.update(stone.account_hex.as_bytes());
+    hasher.update(stone.alert_id.as_bytes());
+    hasher.update(stone.payload_sha256);
+    hasher.update(stone.operation_kind.as_bytes());
+    hasher.update(stone.group_id.as_slice());
+    hasher.update(stone.message_phase.as_bytes());
+    hasher.update(stone.bound_revision.to_le_bytes());
+    hasher.update(stone.bound_writer.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 fn remember_tombstone(state: &mut state::State, row: &PreparedPublication) {
     let tombstone = OperationTombstone {
         alert_id: row.alert_id.clone(),
@@ -1888,7 +2019,23 @@ fn remember_tombstone(state: &mut state::State, row: &PreparedPublication) {
         push_publication_attempts: row.push_publication_attempts,
         unobservable_attempts: row.unobservable_attempts,
         push_attempts: row.push_attempts,
+        project_id: state.binding.project_id.clone(),
+        account_hex: String::new(),
+        bound_revision: 0,
+        bound_writer: String::new(),
+        authenticator: String::new(),
     };
+    if state.tombstones_indexed {
+        if let Some(existing) = state
+            .pending_tombstones
+            .iter_mut()
+            .find(|item| item.alert_id == tombstone.alert_id)
+        {
+            *existing = tombstone.clone();
+        } else {
+            state.pending_tombstones.push(tombstone.clone());
+        }
+    }
     if let Some(existing) = state
         .operation_tombstones
         .iter_mut()
@@ -2064,32 +2211,87 @@ mod tests {
             state: saved,
         };
         let restored = MemoryMdkStorage::from_document(document).expect("reload");
+        restored.enable_incremental_history().unwrap();
         let error = restored
             .put_publication(wide_publication(9_999))
-            .expect_err("missing index fails closed");
-        assert!(error.to_string().contains("not loaded"), "{error}");
-        let short = restored
-            .install_indexed_tombstones(vec![exported[0].clone()])
-            .expect_err("short index fails closed");
-        assert!(short.to_string().contains("incomplete"), "{short}");
+            .expect_err("a new id without a lookup fails closed");
+        assert!(error.to_string().contains("not consulted"), "{error}");
         restored
-            .install_indexed_tombstones(exported)
-            .expect("load the operation index");
+            .consult_history("alert-1", Some(exported[1].clone()))
+            .unwrap();
         let retired = restored
             .put_publication(wide_publication(1))
             .expect_err("retired identity");
         assert!(retired.to_string().contains("retired"), "{retired}");
+        restored.consult_history("alert-9999", None).unwrap();
         restored
             .put_publication(wide_publication(9_999))
-            .expect("a new operation is still admitted");
+            .expect("a looked-up new operation is admitted");
         let again = MemoryMdkStorage::from_document(restored.to_document().unwrap()).unwrap();
+        again.enable_incremental_history().unwrap();
         let missing = again
             .put_publication(wide_publication(1))
-            .expect_err("a restart without the index fails closed");
-        assert!(missing.to_string().contains("not loaded"), "{missing}");
-        again
-            .install_indexed_tombstones(again.export_tombstones().unwrap())
-            .expect_err("the snapshot no longer carries the identities");
+            .expect_err("a restart without the lookup fails closed");
+        assert!(missing.to_string().contains("not consulted"), "{missing}");
+    }
+
+    #[test]
+    fn historical_authority_follows_the_committed_revision() {
+        let sample = remember_sample();
+        let staged = stamp_tombstone(sample.clone(), "project", "aa", 6, "writer-a");
+        assert!(!history_authoritative(&staged, 5, "writer-a", "project", "aa").unwrap());
+        assert!(history_authoritative(&staged, 6, "writer-a", "project", "aa").unwrap());
+        assert!(history_authoritative(&staged, 7, "writer-b", "project", "aa").unwrap());
+        let conflict = history_authoritative(&staged, 6, "writer-b", "project", "aa");
+        assert!(conflict.unwrap_err().to_string().contains("conflicting"));
+        let mut corrupt = staged.clone();
+        corrupt.authenticator = "00".into();
+        assert!(history_authoritative(&corrupt, 6, "writer-a", "project", "aa")
+            .unwrap_err()
+            .to_string()
+            .contains("corrupt"));
+        assert!(history_authoritative(&staged, 6, "writer-a", "other", "aa")
+            .unwrap_err()
+            .to_string()
+            .contains("different account"));
+    }
+
+    #[test]
+    fn ordinary_admission_does_not_scan_the_historical_index() {
+        let storage = MemoryMdkStorage::empty();
+        storage.enable_incremental_history().unwrap();
+        let mut external = Vec::new();
+        let mut previous = 1u128;
+        for history in [100usize, 1_000, 10_000] {
+            while external.len() < history {
+                external.push(format!("old-{}", external.len()));
+            }
+            let started = std::time::Instant::now();
+            for index in 0..40 {
+                let id = format!("fresh-{history}-{index}");
+                storage.consult_history(&id, None).unwrap();
+                let mut row = wide_publication(index as u32);
+                row.alert_id = id;
+                storage.put_publication(row).unwrap();
+            }
+            let elapsed = started.elapsed().as_micros();
+            let scan_started = std::time::Instant::now();
+            for _ in 0..40 {
+                let _ = external.iter().find(|item| item.as_str() == "missing");
+            }
+            let scan = scan_started.elapsed().as_micros();
+            eprintln!("history={history} admission_us={elapsed} full_scan_us={scan}");
+            assert!(elapsed < previous.saturating_mul(8).max(20_000), "{elapsed} after {history}");
+            previous = elapsed.max(1);
+        }
+        assert_eq!(external.len(), 10_000);
+        assert!(storage.tombstone("old-1").unwrap().is_none());
+    }
+
+    fn remember_sample() -> OperationTombstone {
+        let mut live = state::State::new();
+        remember_tombstone(&mut live, &wide_publication(1));
+        live.operation_tombstones.pop().unwrap()
     }
 
     fn wide_publication(id: u32) -> PreparedPublication {

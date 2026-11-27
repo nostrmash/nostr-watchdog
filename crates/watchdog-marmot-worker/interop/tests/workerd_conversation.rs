@@ -747,6 +747,146 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
     std::mem::forget(relay_guard);
 }
 
+#[tokio::test]
+#[ignore = "publishes a disposable sender and recipient through WhiteNoise relays"]
+async fn public_network_marmot_exchange_survives_restart() {
+    let worker_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../worker");
+    let shim = worker_dir.join("build/worker/shim.mjs");
+    assert!(shim.is_file(), "worker bundle is missing at {}", shim.display());
+    write_dev_vars(&worker_dir);
+    let persist = worker_dir.join(".wrangler/public-network");
+    let _ = fs::remove_dir_all(&persist);
+    fs::create_dir_all(&persist).expect("persist dir");
+    free_port(PORT);
+    let relays = [
+        "wss://relay.eu.whitenoise.chat",
+        "wss://relay.us.whitenoise.chat",
+    ];
+    let mut workerd = start_workerd(&worker_dir, &persist);
+    let mut workerd_guard = KillProcess(workerd.id());
+    let sender = "public-probe";
+    let native = OfficialRecipient::generate().expect("recipient");
+    let recipient = native.public_key_hex();
+
+    let onboard = post_to(sender, json!({
+        "op": "onboard",
+        "projectId": sender,
+        "operationId": "public-onboard",
+        "recipient": recipient,
+        "relays": relays
+    }));
+    assert_eq!(onboard["ok"], true, "onboard failed: {onboard}");
+    let mut package = native.fresh_key_package().await.expect("key package");
+    package.source = None;
+    let digest = hex::encode(sha2::Sha256::digest(&package.bytes));
+    let key_event = EventBuilder::new(
+        Kind::Custom(30443),
+        base64::engine::general_purpose::STANDARD.encode(&package.bytes),
+    )
+    .tags([
+        Tag::custom("d", ["watchdog".to_owned()]),
+        Tag::custom("client", ["nostr-watchdog".to_owned()]),
+        Tag::custom("mls_protocol_version", ["1.0".to_owned()]),
+        Tag::custom("i", [digest]),
+    ])
+    .custom_created_at(Timestamp::now())
+    .finalize(native.keys())
+    .expect("sign key package");
+    key_event.verify().expect("key package verifies");
+    publish_value(
+        &worker_dir,
+        relays[0],
+        &persist,
+        &serde_json::to_value(&key_event).unwrap(),
+    );
+
+    let established = post_to(sender, json!({
+        "op": "establish",
+        "operationId": "public-establish"
+    }));
+    assert_eq!(established["ok"], true, "establish failed: {established}");
+    assert!(
+        established["onboarding"]["welcomeAccepted"] == true
+            || established["messagePhase"] == "relay_accepted",
+        "welcome publication failed: {established}"
+    );
+    let group_hex = established["groupIdHex"].as_str().expect("group").to_owned();
+    let welcome: TransportMessage =
+        serde_json::from_value(established["welcomes"][0].clone()).expect("welcome");
+    native.join_welcome(welcome).await.expect("recipient join");
+    let group = group_from_hex(&group_hex);
+    let reply = native
+        .send_chat(&group, "public-reply")
+        .await
+        .expect("recipient chat");
+    publish_value(
+        &worker_dir,
+        relays[0],
+        &persist,
+        &serde_json::to_value(&reply).unwrap(),
+    );
+    let synced = post_to(sender, json!({"op": "sync"}));
+    let chats = synced["chats"].as_array().cloned().unwrap_or_default();
+    assert!(
+        chats.iter().any(|chat| chat == "public-reply"),
+        "sync did not receive the public reply: {synced}"
+    );
+
+    let leaf = native.own_leaf(&group).expect("leaf");
+    let server_keys = Keys::generate();
+    let server_hex = hex::encode(server_keys.public_key().to_bytes());
+    let encrypted = push::encrypt_token(Platform::Fcm, b"public-probe-token", &server_hex).expect("encrypt");
+    let mut record = token_record(&group_hex, &recipient, leaf, &server_hex, relays[0], b"public-probe-token", &encrypted);
+    record.owner_sig = push::sign_owner_proof(native.keys(), &record, false).expect("owner proof");
+    publish_gossip(
+        &worker_dir,
+        relays[0],
+        &persist,
+        &native,
+        &group,
+        447,
+        &json!({"v": "marmot-push-v1", "tokens": [gossip_entry(&record)]}).to_string(),
+    )
+    .await;
+    let _gossip = post_to(sender, json!({"op": "sync"}));
+    let delivered = post_to(sender, json!({
+        "op": "deliver",
+        "operationId": "public-alert",
+        "text": "public-alert",
+        "publish": true
+    }));
+    assert_eq!(delivered["messagePhase"], "relay_accepted", "message publication failed: {delivered}");
+    assert_eq!(delivered["pushPhase"], "relay_accepted", "trigger publication failed: {delivered}");
+    assert_eq!(delivered["projectId"], sender, "{delivered}");
+    let message_id = delivered["messageEventId"].clone();
+
+    stop_child(&mut workerd);
+    assert!(port_closed(PORT));
+    workerd = start_workerd(&worker_dir, &persist);
+    workerd_guard.0 = workerd.id();
+    let reconciled = post_to(sender, json!({
+        "op": "reconcile",
+        "operationId": "public-alert",
+        "publish": true
+    }));
+    assert_eq!(reconciled["messageEventId"], message_id, "restart changed the message: {reconciled}");
+    assert_eq!(reconciled["messagePhase"], "relay_accepted", "{reconciled}");
+    let second = post_to(sender, json!({
+        "op": "deliver",
+        "operationId": "public-alert-2",
+        "text": "public-alert-2",
+        "publish": true
+    }));
+    assert_eq!(second["messagePhase"], "relay_accepted", "second message failed: {second}");
+    assert_ne!(second["messageEventId"], message_id, "{second}");
+    eprintln!(
+        "public_relay={} message={} push={} second={}",
+        relays[0], delivered["messageEventId"], delivered["pushEventId"], second["messageEventId"]
+    );
+    stop_child(&mut workerd);
+    std::mem::forget(workerd_guard);
+}
+
 fn post_to(sender: &str, body: Value) -> Value {
     let bytes = serde_json::to_vec(&body).unwrap();
     let (status, text) = post_raw(PORT, sender, &bytes, true);
