@@ -13,6 +13,17 @@ use watchdog_marmot::Session;
 
 fn main() {
     tighten_umask();
+    let preview: Vec<String> = std::env::args().skip(1).collect();
+    let identity_only = preview
+        .iter()
+        .any(|arg| arg == "--write-identity" || arg == "--normalize-pubkey");
+    if !identity_only {
+        let allow_loopback = preview.iter().any(|arg| arg == "--allow-loopback");
+        if let Err(error) = watchdog_marmot::install_egress(allow_loopback) {
+            eprintln!("watchdog-marmot egress failed: {error}");
+            std::process::exit(1);
+        }
+    }
     // MDK futures are deep. Upstream integration tests use an 8 MiB worker stack.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -223,7 +234,14 @@ async fn dispatch(session: &Session, request: Value) -> Value {
             let body = text(&request, "text");
             let allow = strings(request.get("allow"));
             session
-                .send_in_project(&alert, &text(&request, "project"), &account, &group, &body, &allow)
+                .send_in_project(
+                    &alert,
+                    &text(&request, "project"),
+                    &account,
+                    &group,
+                    &body,
+                    &allow,
+                )
                 .await
         }
         "onboard" => {
@@ -231,7 +249,10 @@ async fn dispatch(session: &Session, request: Value) -> Value {
             let nsec = text(&request, "nsec");
             let recipient = text(&request, "recipient");
             let relays = strings(request.get("relays"));
-            let replace = request.get("replace").and_then(Value::as_bool).unwrap_or(false);
+            let replace = request
+                .get("replace")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if nsec.is_empty() {
                 Err("sender_missing".to_string())
             } else {

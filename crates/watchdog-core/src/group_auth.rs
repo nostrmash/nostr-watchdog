@@ -3,7 +3,9 @@
 //! MDK reports one record per account, including when that account has several
 //! MLS leaves. A sender-only group must not pass. An extra account must not
 //! pass. Extra leaves of the sender or the configured recipient are the same
-//! account id and stay allowed.
+//! account id and stay allowed. A passing result is the roster observed at
+//! this call. It is not a lock held across MDK's later encryption. The next
+//! call can refuse a recipient the previous call allowed.
 
 pub fn authorize_group_members(
     members: &[String],
@@ -69,6 +71,27 @@ mod tests {
         assert_eq!(
             authorize_group_members(&extra_leaf, &sender, &recipient),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn a_later_roster_that_removes_the_recipient_does_not_keep_the_earlier_allowance() {
+        let sender = "aa".repeat(32);
+        let recipient = "bb".repeat(32);
+        let present = vec![sender.clone(), recipient.clone()];
+        let removed = vec![sender.clone()];
+        let empty = Vec::<String>::new();
+        assert_eq!(
+            authorize_group_members(&present, &sender, &recipient),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_group_members(&removed, &sender, &recipient),
+            Err("recipient_absent")
+        );
+        assert_eq!(
+            authorize_group_members(&empty, &sender, &recipient),
+            Err("membership_unknown")
         );
     }
 }

@@ -2,10 +2,9 @@
 //!
 //! Official MDK's `RelaySafetyPolicy` drops discovered private literals,
 //! localhost, and plaintext public endpoints before dialing. A domain is
-//! still accepted without a DNS lookup, and nostr-sdk resolves it later.
-//! This module checks the relays the operator configured. It does not sit on
-//! that dial path. Resolving a name here and letting MDK resolve it again is
-//! not a pin. Native deployment needs a process egress rule for that gap.
+//! still accepted without a DNS lookup. The dial itself goes through the
+//! SOCKS filter in `egress`. A lookup in this module is only a preflight for
+//! the operator's configured URLs. It is not the pin.
 
 use std::net::ToSocketAddrs;
 use std::time::Duration;
