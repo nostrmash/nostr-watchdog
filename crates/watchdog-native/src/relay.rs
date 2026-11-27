@@ -107,7 +107,7 @@ pub async fn query_inbox(
     let read = timeout_until(deadline, read).await;
     let _ = send_text(&mut socket, &format!("[\"CLOSE\",\"{sub}\"]"), deadline).await;
     let _ = timeout_until(deadline, socket.close(None)).await;
-    read?;
+    read??;
     Ok(InboxFrames { events, eose })
 }
 
@@ -182,7 +182,7 @@ pub async fn publish(
     };
     let read = timeout_until(deadline, read).await;
     let _ = timeout_until(deadline, socket.close(None)).await;
-    read?;
+    read??;
     Ok(accepted)
 }
 

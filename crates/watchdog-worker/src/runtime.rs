@@ -280,6 +280,7 @@ async fn cloudflare_onboard(
             }
             response
         }
+        MarmotCall::Response(401, _) => onboard_note(response, "marmot_unauthorized", false),
         MarmotCall::Timeout => onboard_note(response, "marmot_timeout", false),
         MarmotCall::Malformed => onboard_note(response, "marmot_response_invalid", false),
         MarmotCall::Transport | MarmotCall::Response(_, _) => {
@@ -662,12 +663,17 @@ impl Notifier for WorkerNotifier {
             return terminal("telegram_unavailable");
         }
         let get = |key| self.vars.get(key).map(String::as_str).unwrap_or_default();
-        let url = watchdog_core::settings::telegram_fixture_url(
-            get("ENVIRONMENT"),
-            get("WATCHDOG_TEST_TELEGRAM_ENDPOINT"),
-        )
-        .map(|url| url.to_string())
-        .unwrap_or_else(|| format!("https://api.telegram.org/bot{token}/sendMessage"));
+        let url = if get("ENVIRONMENT") == "test" {
+            let Some(url) = watchdog_core::settings::telegram_fixture_url(
+                "test",
+                get("WATCHDOG_TEST_TELEGRAM_ENDPOINT"),
+            ) else {
+                return terminal("telegram_fixture_unavailable");
+            };
+            url.to_string()
+        } else {
+            format!("https://api.telegram.org/bot{token}/sendMessage")
+        };
         let body = serde_json::json!({
             "chat_id": chat,
             "text": row.payload_text,
@@ -910,15 +916,8 @@ fn cloudflare_outcome(
     if !(200..300).contains(&status) {
         return marmot_hold("marmot_transport_error");
     }
-    if value.get("ok") == Some(&serde_json::Value::Bool(false)) {
-        let error = value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("marmot_rejected");
-        if error.contains("retired operation") {
-            return marmot_hold("retired_operation_unrecorded");
-        }
-        return marmot_hold(error);
+    if value["ok"] != true {
+        return marmot_hold("marmot_response_invalid");
     }
     let operation = watchdog_core::delivery::operation_from_transport(
         value,

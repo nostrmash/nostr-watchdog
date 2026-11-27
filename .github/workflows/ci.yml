@@ -196,6 +196,8 @@ jobs:
           cargo build --locked -p watchdog-native
           export WATCHDOG_TEST_BINARY="$PWD/target/debug/nostr-watchdog"
           cargo test --locked --manifest-path crates/watchdog-marmot/Cargo.toml --test fixture_exchange -- --test-threads=1
+          cargo test --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
+            --test fixture_exchange whitenoise_script_onboards_and_reuses_the_conversation -- --ignored --exact
 
   cloudflare-marmot:
     runs-on: ubuntu-latest

@@ -858,15 +858,7 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
         .to_string(),
     )
     .await;
-    let mut revoked = false;
-    for _ in 0..8 {
-        post_to(sender, json!({"op": "sync", "relays": [relay_url]}));
-        if post_to(sender, json!({"op": "readiness"}))["recipientTokenCount"] == 0 {
-            revoked = true;
-            break;
-        }
-    }
-    assert!(revoked, "recipient revocation was not observed");
+    wait_for_recipient_tokens(sender, &relay_url, 0);
     let after_revoke = post_to(
         sender,
         json!({
@@ -913,7 +905,7 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
         .to_string(),
     )
     .await;
-    let _dead_sync = post_to(sender, json!({"op": "sync", "relays": [relay_url]}));
+    wait_for_recipient_tokens(sender, &relay_url, 1);
     let failed = post_to(
         sender,
         json!({
@@ -1200,6 +1192,16 @@ async fn public_network_marmot_exchange_survives_restart() {
     );
     stop_child(&mut workerd);
     std::mem::forget(workerd_guard);
+}
+
+fn wait_for_recipient_tokens(sender: &str, relay: &str, count: u64) {
+    for _ in 0..12 {
+        post_to(sender, json!({"op": "sync", "relays": [relay]}));
+        if post_to(sender, json!({"op": "readiness"}))["recipientTokenCount"] == count {
+            return;
+        }
+    }
+    panic!("recipient token directory did not converge to {count}");
 }
 
 fn retrieve_public_event(worker_dir: &Path, relays: &[&str], filter: Value) -> Value {

@@ -414,7 +414,7 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
                 .finish_with_fallback(
                     &row.id,
                     &token,
-                    DeliveryState::Failed,
+                    terminal_delivery_state(row),
                     row.attempt_count,
                     now,
                     Some("transport_disabled"),
@@ -694,6 +694,21 @@ fn availability_for(get: &impl Fn(&str) -> String, destination: &str) -> Transpo
     }
 }
 
+fn terminal_delivery_state(row: &OutboxRow) -> DeliveryState {
+    use watchdog_core::delivery::MessageState;
+    if row
+        .message_state
+        .as_deref()
+        .or(row.message_phase.as_deref())
+        .and_then(MessageState::parse)
+        == Some(MessageState::RelayAccepted)
+    {
+        DeliveryState::RelayAccepted
+    } else {
+        DeliveryState::Failed
+    }
+}
+
 async fn finish_terminal<S: OperationalStore>(
     store: &S,
     row: &OutboxRow,
@@ -705,7 +720,7 @@ async fn finish_terminal<S: OperationalStore>(
         .finish_delivery(
             &row.id,
             token,
-            DeliveryState::Failed,
+            terminal_delivery_state(row),
             row.attempt_count,
             now,
             Some(error),

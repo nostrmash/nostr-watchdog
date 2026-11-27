@@ -1785,6 +1785,35 @@ impl SqliteStore {
         Ok((pending, recent))
     }
 
+    pub fn complete_marmot_onboarding(
+        &self,
+        project: &str,
+        operation: &str,
+        account: &str,
+        recipient: &str,
+        group: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE marmot_projects SET engine_status = 'mdk_helper', pubkey = ?3, peer_pubkey = ?4,
+             group_id_hex = ?5, conversation_id = ?5, updated_at = MAX(updated_at, ?6)
+             WHERE project_id = ?1 AND onboard_idempotency_key = ?2",
+            params![project, operation, account, recipient, group, now],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE marmot_onboard_history SET engine_status = 'mdk_helper'
+             WHERE project_id = ?1 AND operation_id = ?2",
+            params![project, operation],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn record_onboarding(
         &self,
         project_id: &str,

@@ -192,7 +192,7 @@ pub async fn deliver(
     .await
     {
         Ok(value) => value,
-        Err(error) => return pending(&error),
+        Err(error) => return pending_phase(&error, "completion_unknown", "not_attempted"),
     };
     if sent.get("ok") != Some(&Value::Bool(true)) {
         remember(
@@ -516,6 +516,7 @@ async fn ensure_onboard(
     recipient: &str,
     setup: &OnboardRequest,
 ) -> Result<(String, String), DeliveryOutcome> {
+    let expected = public_key_hex(nsec).map_err(|_| failed("sender_key_invalid"))?;
     let status = call(
         socket,
         json!({"op": "onboard_status", "operation_id": setup.operation_id}),
@@ -525,6 +526,9 @@ async fn ensure_onboard(
     .map_err(|error| pending(&error))?;
     if status.get("ok") != Some(&Value::Bool(true)) {
         return Err(outcome_from_error(&status, false));
+    }
+    if status["operation_id"].as_str() != Some(setup.operation_id.as_str()) {
+        return Err(failed("operation_identity_mismatch"));
     }
     let established = status.get("phase").and_then(Value::as_str) == Some("established")
         && status.get("recipient").and_then(Value::as_str) == Some(recipient)
@@ -540,6 +544,9 @@ async fn ensure_onboard(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        if account != expected {
+            return Err(failed("sender_identity_mismatch"));
+        }
         if account.is_empty() || group.is_empty() {
             return Err(pending("marmot_group_missing"));
         }
@@ -561,6 +568,13 @@ async fn ensure_onboard(
     .map_err(|error| pending(&error))?;
     if created.get("ok") != Some(&Value::Bool(true)) {
         return Err(outcome_from_error(&created, true));
+    }
+    if created["operation_id"].as_str() != Some(setup.operation_id.as_str())
+        || created["recipient"].as_str() != Some(recipient)
+        || created["replace"].as_bool() != Some(setup.replace)
+        || created["account"].as_str() != Some(expected.as_str())
+    {
+        return Err(failed("operation_identity_mismatch"));
     }
     let account = created
         .get("account")
@@ -804,6 +818,10 @@ fn error_code(value: &Value) -> Option<&str> {
     value.get("error").and_then(Value::as_str)
 }
 
+pub fn ambiguous_timeout() -> DeliveryOutcome {
+    pending_phase("marmot_timeout", "completion_unknown", "not_attempted")
+}
+
 fn pending(error: &str) -> DeliveryOutcome {
     pending_phase(error, "not_submitted", "not_attempted")
 }
@@ -901,6 +919,8 @@ pub async fn operator_onboard(
         "ok": true,
         "operationId": operation_id,
         "phase": "established",
+        "pubkey": account,
+        "recipient": recipient,
         "accountPrefix": &account[..account.len().min(8)],
         "group": group,
         "replace": replace

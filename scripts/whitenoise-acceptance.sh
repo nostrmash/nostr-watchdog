@@ -5,12 +5,24 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-helper="$root/crates/watchdog-marmot/target/release/watchdog-marmot"
-watchdog="$root/target/release/nostr-watchdog"
+helper="${WATCHDOG_ACCEPTANCE_HELPER:-$root/crates/watchdog-marmot/target/release/watchdog-marmot}"
+watchdog="${WATCHDOG_ACCEPTANCE_WATCHDOG:-$root/target/release/nostr-watchdog}"
 odin="${ODIN:-$HOME/.local/odin-dev-2026-10/odin}"
 state="${WATCHDOG_ACCEPTANCE_ROOT:-$root/data/whitenoise-acceptance}"
 listen="${WATCHDOG_ACCEPTANCE_ADDR:-127.0.0.1:8791}"
 relays="wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat"
+fixture_relay="${WATCHDOG_ACCEPTANCE_LOOPBACK_RELAY:-}"
+if [ -n "$fixture_relay" ]; then
+  python3 - "$fixture_relay" <<'PYURL'
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+assert url.scheme == "ws" and url.hostname == "127.0.0.1" and url.port
+assert url.username is None and url.password is None
+assert url.path in ("", "/") and not url.query and not url.fragment
+PYURL
+  relays="$fixture_relay"
+fi
 project="smartflowsocial"
 operation="initial:${project}"
 
@@ -39,10 +51,6 @@ EOF
 }
 
 require_binaries() {
-  if [ ! -x "$odin" ]; then
-    echo "Odin dev-2026-10 revision 84bc3fc is required at $odin" >&2
-    exit 1
-  fi
   if [ ! -x "$helper" ] || [ ! -x "$watchdog" ]; then
     echo "Build both executables first:" >&2
     echo "  ODIN=$odin cargo build --locked --manifest-path crates/watchdog-marmot/Cargo.toml --release" >&2
@@ -144,8 +152,11 @@ start_helper() {
   fi
   mkdir -p "$state/marmot"
   chmod 700 "$state/marmot"
-  # The watchdog spawns this process on the first delivery. Init and status
-  # need it earlier. No --allow-loopback: these are the public WhiteNoise relays.
+  if [ -n "$fixture_relay" ]; then
+    set -- --allow-loopback --relay "$fixture_relay"
+  else
+    set -- --relay "wss://relay.eu.whitenoise.chat" --relay "wss://relay.us.whitenoise.chat"
+  fi
   env -i \
     PATH="$PATH" \
     HOME="$HOME" \
@@ -153,8 +164,7 @@ start_helper() {
     "$helper" \
     --root "$state/marmot" \
     --socket "$state/marmot/watchdog.sock" \
-    --relay "wss://relay.eu.whitenoise.chat" \
-    --relay "wss://relay.us.whitenoise.chat" \
+    "$@" \
     >> "$state/helper.log" 2>&1 &
   echo $! > "$state/helper.pid"
   i=0
@@ -309,6 +319,7 @@ if mode == "onboard":
         "replace": False,
     })
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(120)
 sock.connect(path)
 sock.sendall((json.dumps(request) + "\n").encode())
 data = b""
@@ -375,7 +386,7 @@ onboard() {
 
 send_alert() {
   load_state alert
-  curl -sS -X POST "http://$listen/v1/diagnostics/test-alert" \
+  curl --fail-with-body -sS --max-time 120 -X POST "http://$listen/v1/diagnostics/test-alert" \
     -H "authorization: Bearer $operator" \
     -H "content-type: application/json" \
     -d "{\"projectId\":\"$project\",\"transport\":\"marmot\"}"
@@ -412,6 +423,7 @@ request = {
     "group": group,
 }
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(120)
 sock.connect(path)
 sock.sendall((json.dumps(request) + "\n").encode())
 data = b""

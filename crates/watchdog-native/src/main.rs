@@ -131,17 +131,35 @@ struct NativeNotifier {
     vars: HashMap<String, String>,
     store: SqliteStore,
     timeout_ms: i64,
+    deadline_ms: Option<i64>,
+}
+
+impl NativeNotifier {
+    fn remaining_ms(&self) -> i64 {
+        self.deadline_ms.map_or(self.timeout_ms, |deadline| {
+            deadline.saturating_sub(now_ms()).clamp(1, self.timeout_ms)
+        })
+    }
 }
 
 impl Notifier for NativeNotifier {
     async fn deliver_nostr(&self, row: &OutboxRow, claim: &str) -> DeliveryOutcome {
-        deliver_nostr(&self.store, &self.vars, row, claim, self.timeout_ms).await
+        deliver_nostr(&self.store, &self.vars, row, claim, self.remaining_ms()).await
     }
+
     async fn deliver_telegram(&self, row: &OutboxRow) -> DeliveryOutcome {
-        deliver_telegram(&self.vars, row, self.timeout_ms).await
+        deliver_telegram(&self.vars, row, self.remaining_ms()).await
     }
+
     async fn deliver_marmot(&self, row: &OutboxRow, claim: &str) -> DeliveryOutcome {
-        marmot::deliver(&self.store, &self.vars, row, claim).await
+        let delivery = marmot::deliver(&self.store, &self.vars, row, claim);
+        let Some(deadline) = self.deadline_ms else {
+            return delivery.await;
+        };
+        let remaining = deadline.saturating_sub(now_ms()).max(0) as u64;
+        tokio::time::timeout(Duration::from_millis(remaining), delivery)
+            .await
+            .unwrap_or_else(|_| marmot::ambiguous_timeout())
     }
 }
 
@@ -321,8 +339,9 @@ async fn transport_loop(
         }
         let settings = load_settings(|key| state.vars.get(key).cloned().unwrap_or_default());
         let get = |key: &str| state.vars.get(key).cloned().unwrap_or_default();
-        let notifier = native_notifier(&state, settings.timeout_ms);
         let deadline = now_ms() + 10_000;
+        let mut notifier = native_notifier(&state, settings.timeout_ms);
+        notifier.deadline_ms = Some(deadline);
         if let Err(error) = watchdog_engine::dispatch_transport(
             &state.store,
             &settings,
@@ -360,7 +379,9 @@ async fn push_loop(
         }
         let settings = load_settings(|key| state.vars.get(key).cloned().unwrap_or_default());
         let get = |key: &str| state.vars.get(key).cloned().unwrap_or_default();
-        let notifier = native_notifier(&state, settings.timeout_ms);
+        let deadline = now_ms() + 8_000;
+        let mut notifier = native_notifier(&state, settings.timeout_ms);
+        notifier.deadline_ms = Some(deadline);
         if let Err(error) = watchdog_engine::dispatch_transport(
             &state.store,
             &settings,
@@ -370,7 +391,7 @@ async fn push_loop(
             "marmot",
             1,
             0,
-            now_ms() + 8_000,
+            deadline,
             "push",
             &runtime_id,
         )
@@ -409,6 +430,7 @@ fn native_notifier(state: &AppState, timeout_ms: i64) -> NativeNotifier {
         vars: state.vars.clone(),
         store: state.store.clone(),
         timeout_ms,
+        deadline_ms: None,
     }
 }
 
@@ -638,6 +660,7 @@ async fn onboard(
         .unwrap_or("");
     let operation = request
         .get("operationId")
+        .or_else(|| request.get("idempotencyKey"))
         .and_then(Value::as_str)
         .unwrap_or("");
     let replace = request
@@ -647,6 +670,22 @@ async fn onboard(
     let mut recorded = response.body;
     match marmot::operator_onboard(&state.vars, project, operation, replace).await {
         Ok(transport) => {
+            let persisted = state.store.complete_marmot_onboarding(
+                project,
+                operation,
+                transport["pubkey"].as_str().unwrap_or_default(),
+                transport["recipient"].as_str().unwrap_or_default(),
+                transport["group"].as_str().unwrap_or_default(),
+                now_ms(),
+            );
+            if !matches!(persisted, Ok(true)) {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "connected": false, "error": "onboarding_persistence_failed"
+                    })),
+                );
+            }
             if let Some(object) = recorded.as_object_mut() {
                 object.insert("status".to_string(), json!("accepted"));
                 object.insert("connected".to_string(), json!(true));
@@ -758,6 +797,7 @@ async fn dispatch(state: &AppState, request: ApiRequest, _body: Option<Bytes>) -
         vars: state.vars.clone(),
         store: state.store.clone(),
         timeout_ms: settings.timeout_ms,
+        deadline_ms: None,
     };
     handle(
         &state.store,
@@ -877,14 +917,16 @@ async fn deliver_telegram(
     }
     let budget = Duration::from_millis(timeout_ms.max(1) as u64);
     let started = std::time::Instant::now();
-    let fixture = watchdog_core::settings::telegram_fixture_url(
-        &get("ENVIRONMENT"),
-        &get("WATCHDOG_TEST_TELEGRAM_ENDPOINT"),
-    );
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy();
-    let url = if let Some(fixture) = fixture {
+    let url = if get("ENVIRONMENT") == "test" {
+        let Some(fixture) = watchdog_core::settings::telegram_fixture_url(
+            "test",
+            &get("WATCHDOG_TEST_TELEGRAM_ENDPOINT"),
+        ) else {
+            return terminal("telegram_fixture_unavailable");
+        };
         fixture.to_string()
     } else {
         let Ok(address) = net::resolve_pinned("api.telegram.org", 443, false, budget).await else {
@@ -906,17 +948,23 @@ async fn deliver_telegram(
         .json(&json!({"chat_id": chat, "text": row.payload_text, "disable_web_page_preview": true}))
         .send()
         .await;
-    let Ok(response) = response else {
+    let Ok(mut response) = response else {
         return retry_error("telegram_failed");
     };
-    if !response.status().is_success() {
+    if !response.status().is_success()
+        || response.content_length().is_some_and(|size| size > 65_536)
+    {
         return retry_error("telegram_failed");
     }
-    let Ok(bytes) = response.bytes().await else {
-        return retry_error("telegram_failed");
-    };
-    if bytes.len() > 65_536 {
-        return retry_error("telegram_failed");
+    let mut bytes = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if bytes.len().saturating_add(chunk.len()) <= 65_536 => {
+                bytes.extend_from_slice(&chunk)
+            }
+            Ok(None) => break,
+            _ => return retry_error("telegram_failed"),
+        }
     }
     let Ok(body) = serde_json::from_slice::<Value>(&bytes) else {
         return retry_error("telegram_failed");

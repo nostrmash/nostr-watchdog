@@ -1201,6 +1201,166 @@ fn endpoints_of(relays: &[String]) -> Vec<cgka_traits::TransportEndpoint> {
 }
 
 #[test]
+#[ignore = "runs the owner acceptance script against a controlled recipient and relay"]
+fn whitenoise_script_onboards_and_reuses_the_conversation() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(acceptance_script_exchange());
+}
+
+async fn acceptance_script_exchange() {
+    let _guard = exclusive_fixture();
+    let relay = start_relay();
+    let recipient = Keys::generate();
+    let recipient_hex = recipient.public_key().to_hex();
+    let recipient_root = temp_root("acceptance-recipient");
+    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let app = MarmotApp::with_relays_and_config(&recipient_root, vec![relay.url.clone()], config);
+    let runtime = app.runtime();
+    let endpoints = endpoints(&relay.url);
+    runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(Zeroizing::new(recipient.secret_key().to_bech32().unwrap())),
+            default_relays: endpoints.clone(),
+            bootstrap_relays: endpoints.clone(),
+            inbox_relays: endpoints,
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let fixture = AcceptanceScript {
+        script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/whitenoise-acceptance.sh"),
+        state: Path::new("/tmp").join(temp_root("acceptance").file_name().unwrap()),
+        watchdog: watchdog_binary(),
+        listen: format!("127.0.0.1:{}", free_port()),
+        relay: relay.url.clone(),
+    };
+    fixture.run(&["prepare", &recipient_hex]);
+    fixture.run(&["start"]);
+    let onboarding: Value = serde_json::from_str(&fixture.run(&["conversation"])).unwrap();
+    assert_eq!(onboarding["ok"], true, "script onboarding failed");
+    let group = onboarding["group"].as_str().expect("test conversation");
+    let group_id = GroupId::new(hex::decode(group).unwrap());
+    for _ in 0..20 {
+        let _ = runtime.catch_up_accounts().await;
+        if runtime
+            .group_members(&recipient_hex, &group_id)
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    runtime
+        .set_native_push_enabled(&recipient_hex, true)
+        .await
+        .unwrap();
+    runtime
+        .upsert_push_registration(
+            &recipient_hex,
+            PushPlatform::Fcm,
+            "acceptance-fixture",
+            &Keys::generate().public_key().to_hex(),
+            Some(relay.url.clone()),
+        )
+        .await
+        .unwrap();
+    let mut ready = false;
+    for _ in 0..75 {
+        let _ = runtime.catch_up_accounts().await;
+        let status = fixture.run(&["status"]);
+        let readiness: Value = serde_json::from_str(status.lines().last().unwrap()).unwrap();
+        if readiness["active_recipient_tokens"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(ready, "the script did not observe an eligible test token");
+
+    for index in 0..2 {
+        if index == 1 {
+            fixture.run(&["restart"]);
+            let resumed: Value = serde_json::from_str(&fixture.run(&["conversation"])).unwrap();
+            assert_eq!(resumed["group"].as_str(), Some(group));
+        }
+        let sent = fixture.run(&["alert-foreground"]);
+        let result: Value = serde_json::from_str(sent.lines().next().unwrap()).unwrap();
+        let alert = result["alertId"].as_str().expect("script outbox id");
+        let db = fixture.state.join("db/watchdog.sqlite");
+        wait_outbox_settled(&db, alert).await;
+        let text = sql_value(
+            &db,
+            &format!(
+                "SELECT payload_text FROM alert_outbox WHERE id = '{}'",
+                sql_id(alert)
+            ),
+        );
+        assert!(wait_plaintext(&runtime, &recipient_hex, group, &text).await);
+    }
+    let _ = runtime.shutdown_and_close().await;
+    let _ = std::fs::remove_dir_all(&recipient_root);
+}
+
+struct AcceptanceScript {
+    script: PathBuf,
+    state: PathBuf,
+    watchdog: PathBuf,
+    listen: String,
+    relay: String,
+}
+
+impl AcceptanceScript {
+    fn command(&self) -> Command {
+        let mut command = Command::new("sh");
+        command
+            .arg(&self.script)
+            .env("WATCHDOG_ACCEPTANCE_ROOT", &self.state)
+            .env("WATCHDOG_ACCEPTANCE_WATCHDOG", &self.watchdog)
+            .env(
+                "WATCHDOG_ACCEPTANCE_HELPER",
+                env!("CARGO_BIN_EXE_watchdog-marmot"),
+            )
+            .env("WATCHDOG_ACCEPTANCE_ADDR", &self.listen)
+            .env("WATCHDOG_ACCEPTANCE_LOOPBACK_RELAY", &self.relay);
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> String {
+        let result = self.command().args(args).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{} failed: {}",
+            args[0],
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap()
+    }
+}
+
+impl Drop for AcceptanceScript {
+    fn drop(&mut self) {
+        if self.state.exists() {
+            let _ = self.command().arg("stop").output();
+            if !std::thread::panicking() {
+                let _ = std::fs::remove_dir_all(&self.state);
+            }
+        }
+    }
+}
+
+#[test]
 fn packaged_binaries_deliver_monitor_incident_reconcile_and_send_recovery() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1405,6 +1565,37 @@ async fn executable_exchange() {
         &log,
     );
     wait_http(&format!("http://{listen}/healthz"));
+    let onboard = Command::new("curl")
+        .args([
+            "--fail-with-body",
+            "-sS",
+            "--max-time",
+            "15",
+            "-H",
+            &format!("authorization: Bearer {operator}"),
+            "-H",
+            "content-type: application/json",
+            "--data",
+            r#"{"projectId":"smartflowsocial","idempotencyKey":"initial:smartflowsocial"}"#,
+            &format!("http://{listen}/v1/diagnostics/marmot/onboard"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        onboard.status.success(),
+        "watchdog onboarding API rejected the established identity"
+    );
+    let onboard: Value = serde_json::from_slice(&onboard.stdout).unwrap();
+    assert_eq!(onboard["connected"], true, "{onboard}");
+    assert_eq!(onboard["group"], group);
+    assert_eq!(
+        sql_value(
+            &db,
+            "SELECT group_id_hex FROM marmot_projects WHERE project_id = 'smartflowsocial'"
+        ),
+        group,
+    );
+
     let alert = wait_monitor_alert(&db, false).await;
     wait_outbox_settled(&db, &alert).await;
     let text = sql_value(

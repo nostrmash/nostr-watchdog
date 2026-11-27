@@ -140,6 +140,7 @@ impl Session {
             return Err("operation_id_invalid".to_string());
         }
         let recipient = account_hex(recipient)?;
+        let expected = public_key_hex(&nsec)?;
         let existing = self.read_onboard(operation_id)?;
         if let Some(record) = existing.as_ref() {
             if record.get("recipient").and_then(Value::as_str) != Some(recipient.as_str())
@@ -153,6 +154,9 @@ impl Session {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                if account != expected {
+                    return Err("operation_identity_mismatch".to_string());
+                }
                 if !self.account_in_storage(&account) {
                     return Err("mdk_storage_missing".to_string());
                 }
@@ -163,7 +167,6 @@ impl Session {
                 return Ok(value);
             }
         }
-        let expected = public_key_hex(&nsec)?;
         let saved_account = existing
             .as_ref()
             .and_then(|value| value.get("account"))
