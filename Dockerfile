@@ -30,8 +30,8 @@ RUN cargo build --release --locked -p watchdog-native \
 FROM build AS image-test-driver
 RUN mkdir -p /out \
     && cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
-         --test fixture_exchange --no-run \
-    && driver="$(find crates/watchdog-marmot/target/release/deps -maxdepth 1 -type f -name 'fixture_exchange-*' -perm /111)" \
+         --test fixture_exchange --no-run --message-format=json > /tmp/test-artifacts.jsonl \
+    && driver="$(sed -n 's@.*"executable":"\([^"]*/fixture_exchange-[^"]*\)".*@\1@p' /tmp/test-artifacts.jsonl)" \
     && test -x "$driver" \
     && cp "$driver" /out/fixture_exchange
 
