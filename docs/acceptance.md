@@ -1,91 +1,43 @@
 # WhiteNoise acceptance
 
-This procedure is for a person with a test phone. It is not something CI can pass. Do not run it against the production sender keys or the operator's existing WhiteNoise account. Automated tests in this repository do not prove that an iPhone displayed a notification.
+Use a dedicated WhiteNoise account on the test iPhone and a dedicated watchdog sender. Open WhiteNoise, enable its notifications, and allow the test account to publish an eligible key package. Leave the test account connected to the same relay set as the watchdog. An existing eligible key package and an active notification registration are prerequisites for the complete sequence.
 
-Status: the helper has exchanged encrypted alerts with an official `MarmotApp` runtime on the loopback fixture and on `wss://relay.eu.whitenoise.chat` plus `wss://relay.us.whitenoise.chat`. The loopback run also observed a kind-1059 gift wrap addressed to a throwaway notification server. A physical device test has not been performed. Do not mark that test passed from either relay result.
+## Native
 
-## Build
-
-The helper is a second executable with its own Cargo workspace. It links official `marmot-app` at `ca52a04718628f08ed76b777df9c444594074182`. The watchdog operational database stays plaintext SQLite in a different process. `marmot-markdown` is a hard dependency of `marmot-app`. Its build script requires Odin `dev-2026-10` revision `84bc3fc`.
+Build both release executables as described in [deployment.md](deployment.md). The script creates isolated operational and MDK state under `data/whitenoise-acceptance` by default. Use `WATCHDOG_ACCEPTANCE_ROOT` for a new test directory and `WATCHDOG_ACCEPTANCE_ADDR` to avoid a local port collision.
 
 ```bash
-export ODIN="$HOME/.local/odin-dev-2026-10/odin"
-"$ODIN" version
-cargo build --manifest-path crates/watchdog-marmot/Cargo.toml --release
-cargo build --release -p watchdog-native
-```
-
-Expected binaries:
-
-- `crates/watchdog-marmot/target/release/watchdog-marmot`
-- `target/release/nostr-watchdog`
-
-The helper process uses an 8 MiB Tokio worker stack. MDK futures overflow the default 2 MiB worker stack.
-
-## Identities
-
-Use a new sender and a WhiteNoise account that is not a daily driver. Do not reuse production `SFS_BOT_NSEC` or `NOSTRMASH_BOT_NSEC`.
-
-`scripts/whitenoise-acceptance.sh` creates the isolated directory. The native process reads `DATABASE_PATH`. The script does not export `WATCHDOG_DB`, does not read the parent shell's secrets, and does not send an alert until you run an alert command.
-
-```bash
-scripts/whitenoise-acceptance.sh prepare <test phone hex or npub>
+scripts/whitenoise-acceptance.sh prepare <test-recipient-npub>
 scripts/whitenoise-acceptance.sh start
 scripts/whitenoise-acceptance.sh init
 scripts/whitenoise-acceptance.sh conversation
 scripts/whitenoise-acceptance.sh status
 scripts/whitenoise-acceptance.sh alert-foreground
+scripts/whitenoise-acceptance.sh alert-background
 scripts/whitenoise-acceptance.sh alert-locked
 scripts/whitenoise-acceptance.sh restart
+scripts/whitenoise-acceptance.sh status
+scripts/whitenoise-acceptance.sh alert-locked
 scripts/whitenoise-acceptance.sh stop
 ```
 
-`start` listens on `127.0.0.1:8791` with a fresh database, a fresh MDK directory, the generated sender, and the two WhiteNoise relays. Set `WATCHDOG_ACCEPTANCE_ADDR` only when that port is already taken by another program. Inherited Telegram credentials, production sender keys, monitor settings, and `WATCHDOG_CONFIG` are not passed in.
+Wait for the test conversation and an active recipient token before sending. Keep WhiteNoise on screen for the foreground alert. Put it in the background for the second alert, then lock the phone for the third. The background and locked commands ask before sending. After restart, verify that the follow-up alert appears in the same conversation and observe the locked screen again.
 
-The watchdog starts the helper, clears the helper environment, and checks health with an IPC ping. A socket file left behind by an exited helper is not treated as healthy.
+If `conversation` reports an unavailable conversation index, leave the helper running and retry the same command. If the recipient has no active token, open the test account and verify notification permissions before polling `status` again. The helper can confirm application-message relay acceptance while reporting native push acceptance as `unobservable`.
 
-## Onboarding and one message
+## Cloudflare
 
-1. The first Marmot alert imports the project sender and publishes its key package through official account setup.
-2. Group creation asks MDK for an existing reusable direct conversation before creating one, and stores the group id in the helper journal.
-3. Send one test alert:
+Use the isolated Worker pair from [deployment.md](deployment.md) after staging deployment is authorized. Onboard the dedicated sender using `POST /v1/diagnostics/marmot/onboard`. Wait for the authenticated `GET /v1/diagnostics/marmot?project=<id>` response to show Welcome acceptance, recipient participation and token readiness. Enable alerts only for the configured staging project. For each phone state, send one `POST /v1/diagnostics/test-alert` with the same project and `transport=marmot`. Record the outbox ID and observe the phone before moving to the next state. Rehearse a deployment restart against the same Durable Object and D1 state, then repeat the locked-screen alert in the same conversation.
 
-```bash
-curl -sS -X POST http://127.0.0.1:8791/v1/diagnostics/test-alert \
-  -H "authorization: Bearer $OPERATOR_TOKEN" \
-  -H "content-type: application/json" \
-  -d '{"projectId":"smartflowsocial","transport":"marmot"}'
-```
+## What to record
 
-Expected queue state after dispatch is `relay_accepted` only when a relay accepted the group message. `accepted_pending` means MDK still owns publication. `completion_unknown` means the helper must not encrypt that alert id again. None of those states means the phone displayed a notification.
+| Observation | Evidence |
+| --- | --- |
+| Group message published | A relay accepted its exact signed event ID and the recipient decrypted the message. |
+| Trigger published | A relay accepted the kind-1059 gift wrap for the notification server, and the server key opened the kind-446 rumor. |
+| Server processed the trigger | The notification server recorded processing for the test alert. |
+| Physical notification | The owner saw the notification on the test iPhone and recorded the time and phone state. |
 
-4. Open WhiteNoise and confirm the ciphertext is in the test conversation.
-5. Lock the iPhone, send a second alert, and record whether a push appears. This step is pending until the device owner runs it.
-6. Restart both processes and send again. The stored group id must be reused. A second conversation is a failure.
+Record elapsed time from the send to observation. A phone notification is the physical acceptance criterion. Automated relay and decryption tests are supporting evidence.
 
-## Troubleshooting
-
-- `marmot_helper_unavailable`: the helper did not answer a ping. Check `MARMOT_HELPER`, `MARMOT_ROOT` mode `0700`, and that Odin was present at build time.
-- `marmot_helper_busy`: the helper process is alive and a command is in progress. That is not a dead process. Do not start a second helper against the same root.
-- `--allow-loopback` exists only for a loopback fixture relay. The watchdog does not pass it. WhiteNoise onboarding uses public `wss` relays.
-- `sender_identity_mismatch`, `recipient_identity_mismatch`, or `recipient_identity_unbound`: the saved project row does not match the current keys. Set `MARMOT_ONBOARD_OPERATION` to a new id such as `reonboard:smartflowsocial` and `MARMOT_ONBOARD_REPLACE=true` for a deliberate rotation. `MARMOT_REONBOARD=smartflowsocial` is the same stable operation id, so leaving it set does not onboard again on the next alert.
-- `push_unobservable` or `recipient_push_token_unavailable` after repeated retries: reconciliation stopped. The group message is not sent again. A phone notification was not confirmed.
-- `recipient_absent` or `sender_absent`: the group does not contain both configured accounts. Do not send.
-- `membership_rejected`: an account other than the sender and recipient is in the group.
-- `recipient_push_token_unavailable`: MDK has no active push-token record for a current member. The group message can still be accepted. Push was not attempted.
-- `push_unobservable`: the group message can be `relay_accepted` while the helper has no alert-specific push attempt or relay answer. Token presence is not a publication attempt. A gift wrap on a fixture relay is separate evidence and is not phone delivery.
-- `DirectConversationIndexNotReady`: MDK has not finished its conversation index. Retry after the helper stays up; do not create a second group by hand.
-- Relay `AUTH` that the sender cannot satisfy is an error, not an empty inbox.
-
-## Targets, not guarantees
-
-These are the bars for calling the transport ready. They are not a claim about this branch.
-
-- At least 100 controlled sends under ordinary connectivity.
-- At least 99 of those observed on the device.
-- Median time under 5 seconds and 95th percentile under 15 seconds, measured on the device.
-- No duplicate notification for one stored publication during normal operation.
-- No MLS state that fails to open after a restart.
-- No manual repair between the sends after the initial join.
-
-Foreground, background, locked-screen, and force-quit are four different results. Relay `OK` alone is not a pass. A pass still does not mean v1.0.0.
+After the first successful physical test, request separate authorization for the 100-send qualification. Targets are at least 99 observed deliveries under normal connectivity, median observed latency below 5 seconds, 95th-percentile latency below 15 seconds, zero unexplained duplicates, and intact cryptographic state across restart.

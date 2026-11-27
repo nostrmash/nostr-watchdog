@@ -26,25 +26,25 @@ Transports are independent. One failure does not cancel the others.
 | Transport | Role in this branch |
 | --- | --- |
 | Marmot | Preferred on the native process when `ENABLE_MARMOT=true`. The helper calls `marmot-app` create, send, and catch-up. Membership that is not the sender plus the configured recipient fails closed. The operational Worker calls Durable Object class `MarmotSender` through the `MARMOT_SENDER` binding on the dedicated Marmot Worker. Staging names that script `nostr-watchdog-marmot-staging`. `ENABLE_MARMOT` stays false until a deliberate activation. Production wrangler is untouched. |
-| NIP-17 | Default compatibility transport. The native process stores the gift wrap and retries that event. The Worker currently publishes a new wrap to the first bootstrap relay only. |
+| NIP-17 | Default compatibility transport. The native process stores the gift wrap and retries that event. The operational Worker also persists the signed gift wrap and retries the original bytes. |
 | Telegram | Optional. `dual` sends it with the Nostr alert for critical open, remind, and close. `nostr_fallback` sends one Telegram after the first critical NIP-17 or Marmot failure. |
 
 NIP-04 is not implemented.
 
-Canonical message and push states are defined in [agent-c-integration.md](agent-c-integration.md). This branch does not publish MLS messages. When an adapter supplies a known phase, the outbox stores that canonical name. An unknown name is not stored as `rejected`.
+Canonical message and push states are defined in [agent-c-integration.md](agent-c-integration.md). When an adapter supplies a known phase, the outbox stores that canonical name. An unknown name is not stored as `rejected`.
 
 ## State
 
-SQLite (native) and D1 use migrations `0001` through `0011`. `0006` is left as it was. `0007` adds the push-record identity `(group, member, leaf, platform, server)` and does not treat a fingerprint as a primary key. `0008` through `0011` are additive and are described in [hardening.md](hardening.md). The application database is plaintext, mode `0600` on Unix. It stores operational rows and Marmot metadata. MLS private keys stay in the helper's SQLCipher database. Push-token plaintext is not stored here.
+SQLite (native) and D1 use migrations `0001` through `0012`. `0006` is left as it was. `0007` adds the push-record identity `(group, member, leaf, platform, server)` and does not treat a fingerprint as a primary key. `0008` through `0012` are additive and are described in [hardening.md](hardening.md). The application database is plaintext, mode `0600` on Unix. It stores operational rows and Marmot metadata. MLS private keys stay in the helper's SQLCipher database. Push-token plaintext is not stored here.
 
 Claim tokens fence outbox updates. A stale claimant cannot finish or replace an envelope. Gift-wrap JSON is written only while `envelope_json` is null. Delivery is at least once. It is not exactly once. A lost response after a relay accepted an event can be retried and the relay may see a duplicate of the same event id.
 
 ## Scheduling
 
-The native process wakes about once a minute, runs due monitors with the configured concurrency, and attempts delivery even when the check lease is already held. The check lease grows with the number of probe waves and stays between 50 and 180 seconds. Vendor checks run when the last update attempt is missing or older than one hour. When Marmot is enabled, the same loop asks the helper to catch up on `MARMOT_SYNC_SECONDS`. A sync failure does not stop monitoring.
+The native process wakes about once a minute, runs due monitors with the configured concurrency, and attempts delivery even when the check lease is already held. The check lease grows with the number of probe waves and stays between 50 and 180 seconds. Vendor checks run when the last update attempt is missing or older than one hour. A separate native loop asks the helper to catch up on `MARMOT_SYNC_SECONDS` when an effective project route enables Marmot. A sync failure does not stop monitoring.
 
 ## Cloudflare
 
-The Worker scheduled handler calls the same check and update functions, then dispatches notifications after the monitoring lease is released. Fetch serves the operator routes. `storage-sqlite` does not build for `wasm32-unknown-unknown`, so the watchdog Worker still has no MDK session. `probes/mls-durable` has created an OpenMLS group inside a SQLite Durable Object and restored it after workerd restarted. See [mdk-compatibility.md](mdk-compatibility.md). The watchdog bundle has been loaded under local workerd. Health, readiness, scheduled monitoring, delivery fallback, and the D1 completion fence are covered by `tests/runtime/worker-scheduled.sh`.
+The operational Worker separates monitoring and delivery from per-project Marmot synchronization and maintenance. The cryptographic Worker runs the official MDK engine with a synchronous storage provider and stores a sealed account per SQLite Durable Object. Each retirement commits the sealed account and authenticated history index in one SQLite transaction. Relay I/O happens after cryptographic admission. The operational Worker keeps only sanitized evidence.
 
-The staging Worker name is `nostr-watchdog-rust-staging`. It must not be given the production D1 id.
+`tests/runtime/worker-scheduled.sh` covers the operational D1 adapter in workerd. The paired workerd suite exercises the private binding from a scheduled incident to an independent MDK recipient, including trigger reconciliation and restart. Staging uses a separate namespace and D1 database. [Local and staging procedures](deployment.md)

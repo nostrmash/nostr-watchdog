@@ -12,7 +12,7 @@ Nostr Watchdog sends operational alerts. Treat the sender keys, operator token, 
 - Operator and status tokens are compared by hashing both sides and comparing the digests. The status body can be signed with `STATUS_SIGNING_SECRET`.
 - Logs go through the existing redaction idea for token-like fields. Private keys, MLS secrets, and push tokens are not written by this code because it does not hold the latter two. Do not add debug prints of `nsec`, `TELEGRAM_BOT_TOKEN`, `GITHUB_TOKEN`, or authorization headers.
 - The SQLite file is created mode `0600` on Unix. That is filesystem permissions, not encryption. Anyone who can read the file can read alert text and the stored NIP-17 gift wrap.
-- There is no `unsafe` block in the watchdog crates.
+- The native helper configures its process-local SOCKS5 proxy before the MDK relay client and runtime start. The proxy bounds handshakes, DNS lookups, and connections separately from established forwarding.
 
 ## What it does not protect
 
@@ -22,7 +22,7 @@ Nostr Watchdog sends operational alerts. Treat the sender keys, operator token, 
 - Native HTTP, Telegram, and relay sockets resolve once, reject private answers unless the monitor explicitly allows them, and connect to that address while TLS still checks the original name. DNS, TCP, TLS, and the body share one deadline. The Worker `fetch` API cannot pin DNS. Its URL policy rejects literal private hosts before the request, which is weaker than the native pin.
 - Discovery relays never receive a signed NIP-42 identity. Publication relays are signed only after they require authentication, and the original event is resent once with the same id.
 - Operator routes require the operator token. The status reader token can read status and cannot acknowledge, silence, or onboard.
-- Marmot push tokens, if they are stored later, are wake capabilities. `0006` has a column for the encrypted token. This build does not write it. Diagnostics must never return it.
+- Marmot device tokens are wake capabilities. The cryptographic authority handles them. The operational stores retain sanitized delivery evidence and keep the legacy encrypted-token column unused. External diagnostics expose readiness and relay evidence.
 
 ## Dependencies
 

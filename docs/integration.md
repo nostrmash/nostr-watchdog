@@ -21,105 +21,106 @@ No newer commit was on either agent branch at the last fetch. Those four merges 
 
 The files touched by the three snapshots do not overlap. Git reported no conflicts.
 
-## Behavioural resolution
+## Qualification
 
-Agent A's claim test called `extend_claim` with a deadline in the past and expected that write to expire the claim. Production hardening refuses a deadline that is not strictly in the future and inside five minutes, so a rejected write leaves the live claim in place. `crates/watchdog-native/src/marmot.rs` now asserts that refusal. Expiry of an already elapsed claim remains covered by the store test `an_expired_claim_cannot_be_renewed`.
+Implementation under qualification: `7c038ff7f1ba2d998ff2ed1a9b28cac5e131e569`.
 
-## Shared transport result
+The reviewed integration baseline was `3ef57fac5c3ae6f7525705e5595d1c2982337b24`. The fetched integration branch contained all three handoff tips and matched GitHub before changes. The TypeScript behavioral reference is `a236b35a9dda14aa6f1a96dc37fc2daccc838ed8`. Further handoff details and prior experiments remain in [native Marmot](agent-a-integration.md), [Cloudflare Marmot](agent-b-integration.md), and [production hardening](agent-c-integration.md).
 
-`watchdog_core::delivery::OperationResult` is the projection both adapters copy into `DeliveryOutcome.operation`. `operation_from_transport` is the only parser.
+| Development change | Evidence |
+| --- | --- |
+| Native relay lifetime | Separate handshake, DNS, and TCP connection deadlines. The proxy caps active clients and outstanding DNS work. Tests exercised established forwarding past the handshake deadline, saturation, timeout, and shutdown. |
+| Cloudflare history | `transactionSync` covers operation retirement, index writes, and the sealed account revision CAS. Per-bucket commitments are inside the sealed snapshot. Workerd exercised exceptions before and after index insertion, a losing CAS, a later unrelated revision, retired-operation recovery after restart, and refusal of new encryption after an indexed row was removed. |
+| Historical authentication | Versioned HMAC-SHA256 over the full canonical record. HKDF derives the history authentication key separately from snapshot encryption. Authenticated fields include the project, account, recipient, group, payload digest, terminal message and push evidence, event IDs, revision, and writer. |
+| Transport identity and evidence | The Worker normalized an `nsec`/`npub` pair for SmartFlowSocial and hex keys for NostrMash. Onboarding requires matching project, operation, and sender evidence. The shared engine merges persisted acceptance before deciding lifecycle. Both operational stores fence completion and keep the original message event ID. |
+| Partial trigger recovery | The authority tracks each trigger independently. Accepted events remain accepted when another trigger fails. Temporary failures get bounded per-trigger retries. The operational store follows the authority's disposition and keeps aggregate acceptance data and counters. |
+| D1 fallback | A durable fallback insert precedes fenced completion. Local workerd exercised both interruption directions, including a persisted fallback followed by a failed completion and convergence on retry. SQLite completes both records in one transaction. |
+| Scheduling and readiness | Separate bounded operational and synchronization work, effective project routing and emergency stops, interval leases, and bounded Marmot response reads. Authenticated Worker diagnostics expose actual account, membership, Welcome, recipient and token observations. |
 
-- Native counters come from the nested `operation` object: `messageSubmissions`, `messagePublications`, `messageReconciles`, `ambiguousReconciles`, `tokenWaits`, `pushPublications`, `pushReconciles`. Flat `message_attempts` is not a submission count and is not copied.
-- Cloudflare counters: `messageAttempts` is a new ciphertext, `messagePublicationAttempts` and `pushPublicationAttempts` are network publications, and `unobservableAttempts` is push reconciliation. `pushAttempts` counts recorded outcomes and is not a publication count.
-- A negative or overflowing counter is rejected and stays null. An explicit zero is kept. A missing key stays null.
-- `retryAtMs`, `retryAfterMs`, and `reconcileAfterMs` are relative delays. A value outside 1–300000 ms is ignored, so a Unix timestamp is not added to the clock.
-- Unknown message or push names stay unknown. They are not stored as `rejected`.
-- A settled native `unobservable` push, with `relay_accepted`, stops polling. A Cloudflare `unobservable` push with disposition `reconcile` stays open and keeps the accepted message.
-- NIP-17 and Telegram failures use `LifecycleDecision::Retry` and the TypeScript budget: eight attempts, backoff `min(1h, 30s * 2^(attempt-1))`. Marmot `Reconcile` does not consume that counter.
+### History and retention
 
-The engine reads the typed result when the adapter supplies one. Ordinary transports still use `accepted` and `terminal`.
+An operation is absent only when the sealed snapshot's commitment and the bounded SQL bucket agree, and there is no corresponding historical row. An indexed entry requires an exact record digest and a valid record MAC. A missing or modified required record latches an integrity failure on detection. An ordinary request reads one bucket and uses the operation ID primary key. Full-history scans are reserved for operator diagnostics or offline recovery. [Cloudflare synchronous SQLite transactions](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#transactionsync)
 
-## Worker boundary
+The active journal retains unresolved operations. Compaction excludes the current mutation and the Welcome needed for onboarding evidence. Version 2 snapshots use bounded compression before authenticated encryption, which allowed the runtime test to reach the journal retirement threshold. The history retains operation identities for as long as a replay can arrive. The per-bucket and snapshot limits are fail-closed capacity limits. Monitor long-lived account size before rollout.
 
-`WorkerNotifier::deliver_marmot` calls Durable Object namespace `MARMOT_SENDER`. The object name is the project id. The request is `POST https://marmot-sender.internal/marmot?sender=<projectId>` with `Authorization: Bearer <MARMOT_OPERATOR_TOKEN>`. A new alert sends `op: deliver`. An admitted operation sends `op: reconcile` and does not include text. The project character set is `[A-Za-z0-9_:-]`, length 1–128. A response whose `operationId` or `projectId` does not match the request is discarded. A timeout or malformed body does not replace an accepted message with `not_submitted`. The fetch is bounded by the configured check timeout. No MLS state, token, ciphertext, or storage key is written to D1. `MARMOT_OPERATOR_TOKEN` is loaded. `MARMOT_STORAGE_KEY` is not a key of the operational Worker.
+A legacy snapshot without authenticated history metadata requires recovery or deliberate re-onboarding. Preserve the full state and its history together. A complete point-in-time rollback can restore mutually consistent old records and snapshots. Treat a known restore as an operator recovery event and follow the fencing procedure in [deployment.md](deployment.md). The service has no independent witness for a complete rollback.
 
-`wrangler.staging.toml` binds `MARMOT_SENDER` to script `nostr-watchdog-marmot-staging`. `wrangler.marmot-staging.toml` exports class `MarmotSender`. Local counterparts are `wrangler.rust-local.toml` and `wrangler.marmot-local.toml`. `ENABLE_MARMOT` stays false. A missing binding or a missing operator token finishes the row as terminal `marmot_engine_unavailable` or `marmot_unauthorized`. The scheduled tick calls `establish`, then `sync`, and `maintain` on the six-hour boundary, only when Marmot is enabled, the binding exists, and the operator token is set.
+### Executed tests
 
-The operator onboard route records the operation id, then asks the helper or the Durable Object. The shared handler still describes the transport as unconnected until that call returns. A configured `nsec1` secret is not sent to the Durable Object, because that object accepts 32-byte hex and must not be given a freshly generated identity in place of the configured sender. An empty sender secret is the isolated generated-identity path.
-
-## D1 completion
-
-Local D1 does not undo an earlier statement when a later statement errors. A required Telegram row is inserted first, and only while the claim or the settlement predicate still matches. The completion update then requires that Telegram `logical_id` and writes a fresh `completion_token`.
-
-- If the insert fails, the completion matches nothing and the claim stays.
-- If the insert lands and the completion matches nothing, the Telegram row remains and the original claim stays. The next attempt sees the existing logical row, inserts nothing, and completes when the claim still matches.
-- A second logical notification does not insert another Telegram row.
-- SQLite does the insert after the winning update inside one transaction and rolls that update back when the insert changes nothing.
-
-That is recoverability on D1, and a real transaction on SQLite. The workerd suite that demonstrated the first failure direction ran on Agent C's branch, run https://github.com/nostrmash/nostr-watchdog/actions/runs/45889582901. It has not been re-executed on this combined tree.
-
-Migration `0012_transport_evidence.sql` adds `push_event_id`, `evidence`, `transport_disposition`, and `transport_updated_at`. Existing migrations are unchanged. A later incomplete response does not clear `relay_accepted`, the message event id, or a stored push event id. `operation_started_at` is written once from `startedAtMs` and is not moved by a later response. Critical `nostr_fallback` creates the Telegram row on the first unsuccessful Marmot or NIP-17 attempt, including while the Marmot operation stays reconcilable. The logical id still prevents a second Telegram row. An aggregate push label of `relay_accepted` does not settle the operation while the disposition is `reconcile`.
-
-## What was executed on this tree
-
-- `cargo test -p watchdog-core --lib`: 51 passed. The fixture parser, the forbidden `message_attempts` mapping, the `pushAttempts` distinction, and the reconcile-versus-aggregate-push decision are in that run.
-- `cargo test -p watchdog-engine --lib`: 3 passed.
-- `cargo test -p watchdog-store --features sqlite --lib`: 16 passed, including monotonic evidence and the interrupted `0012` rollback.
-- `cargo test -p watchdog-native --bin nostr-watchdog`: 5 passed.
-- `cargo check -p watchdog-worker --target wasm32-unknown-unknown`.
-- `cargo fmt --all -- --check` and clippy on the edited crates.
-- `cargo test --manifest-path crates/watchdog-marmot/Cargo.toml --offline --lib` with Odin `dev-2026-10` revision `84bc3fc`: 23 passed, including the checkpoint tests that keep an updated operation when a checkpoint is interrupted.
-- `cargo build --manifest-path crates/watchdog-marmot/Cargo.toml --offline --release` produced `crates/watchdog-marmot/target/release/watchdog-marmot`.
-
-## Not executed
-
-- Integrated native incident through both executables to an independent recipient, including restart and a second alert in the same conversation.
-- Integrated workerd incident through `WorkerNotifier::deliver_marmot`, including partial triggers, restart, and a second alert. A standalone Durable Object test is not that path.
-- The operational workerd suite on this combined commit.
-- Docker image build and container replacement with a recovered conversation. A marker file is not that proof.
-- Staging deploy, remote D1, bundle size on the combined tree, or a physical WhiteNoise notification.
-- Bulk public-relay sends.
-
-## Physical acceptance
-
-Native procedure, from Agent A, not run in this integration:
+- Native controlled test used the actual watchdog and helper, a real HTTP monitor, an independent official MarmotApp recipient, and isolated relays and state. The recipient decrypted the outage and the recovery alert in the same conversation. The original outbox kept its event ID and `relay_accepted` message state. Native push evidence remained `unobservable`. The configured critical fallback reached an isolated Telegram-compatible endpoint. Representative helper crash boundaries were exercised.
+- Workerd controlled test ran the actual operational and cryptographic Worker bundles together through `MARMOT_SENDER`. An independently retrieved Welcome established the group. A scheduled SmartFlowSocial outage generated a D1 outbox row and a relay-accepted message, which the official SQLite MDK recipient decrypted. An independent test key opened the notification gift wrap and verified kind 446. One target failed temporarily, the local fallback accepted the critical alert, and restart recovery published the remaining trigger while retaining one application encryption. A subsequent scheduled recovery alert decrypted in the same conversation.
+- The opt-in public Workerd test completed in 32.68 seconds using disposable identities and the WhiteNoise EU and US relays. The official recipient independently retrieved and joined the Welcome and decrypted both alerts, including the alert after restart. The fixture server key opened the relay-retrieved notification gift wrap. It used a synthetic token and public relay traffic was limited to this qualification.
+- The operational workerd suite applied all D1 migrations, exercised fallback deduplication and interrupted completion, checked scheduler bounds and the signed `watchdog-status-v1` response, and passed. Remote D1 behavior remains a staging measurement.
 
 ```bash
-scripts/whitenoise-acceptance.sh prepare <test-recipient>
-scripts/whitenoise-acceptance.sh start
-scripts/whitenoise-acceptance.sh init
-scripts/whitenoise-acceptance.sh conversation
-scripts/whitenoise-acceptance.sh alert-foreground
+cargo fmt --all -- --check
+cargo test --locked --workspace --exclude watchdog-worker
+cargo test --locked -p watchdog-store --features sqlite --lib
+cargo test --locked --manifest-path crates/watchdog-marmot/Cargo.toml --lib
+cargo test --locked --manifest-path crates/watchdog-marmot/Cargo.toml --test fixture_exchange -- --test-threads=1
+npm ci --prefix crates/watchdog-marmot-worker/worker
+worker-build --release crates/watchdog-worker -- --locked
+sh crates/watchdog-marmot-worker/worker/build-release.sh
+cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml --workspace --lib
+cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml -p marmot-worker-interop --test workerd_conversation -- --ignored --test-threads=1 --skip public
+sh tests/runtime/worker-scheduled.sh
 ```
 
-`alert-locked` asks before sending. `restart` stops both processes and starts them again without sending. The script uses an isolated database and ignores inherited production secrets. A notification counts only after the phone owner sees it.
+Local Cargo runs used Rust 1.100.0 and locked dependencies. Native helper builds used Odin `dev-2026-10-nightly:84bc3fc`. Local Wrangler came from the npm lock at 4.166.0.
 
-Cloudflare physical acceptance waits for an authorized deploy of `nostr-watchdog-rust-staging` with a dedicated D1 database, a dedicated `MARMOT_SENDER` namespace, a dedicated sender, a dedicated recipient, and `MARMOT_OPERATOR_TOKEN` plus `MARMOT_STORAGE_KEY` stored as secrets. `ENABLE_MARMOT` and `ALERTS_ENABLED` stay false until that rehearsal. Do not reuse production ids or keys.
+- The owner acceptance script also ran against an eligible independent MarmotApp recipient on a local relay. It established the conversation, observed the test token, sent two explicit alerts across process restart, and the recipient decrypted both in the original group. The test completed in 80.74 seconds.
 
-After the first observed notification, the qualification targets remain 100 controlled sends, 99 percent observed under normal connectivity, median latency under 5 seconds, 95th percentile under 15 seconds, no unexplained duplicates, and no cryptographic state corruption. Those are targets, not a service level.
+### Deployment artifacts
 
-## Acceptance gates
+Both staging manifests passed Wrangler dry-run bundling.
 
-| Gate | Result |
+| Artifact | Total upload | Gzipped upload |
+| --- | ---: | ---: |
+| Operational Worker | 3,986.16 KiB | 2,054.23 KiB |
+| Marmot Durable Object Worker | 10,752.50 KiB | 4,126.50 KiB |
+
+The sizes above are local bundle measurements. Staging resource setup, secret installation, deployment order, onboarding, activation, and rollback are in [deployment.md](deployment.md). Native and staging phone procedures are in [acceptance.md](acceptance.md).
+
+### Migration manifest
+
+| State | Manifest |
 | --- | --- |
-| I1 Latest A and B handoffs | Incorporated through `61dbbda` and `2c45627`. No newer commit was on either branch at the last fetch. |
-| I2 Checkpoint regression | `61dbbda` is in the branch. The helper journal tests passed, including `process_stop_during_checkpoint_keeps_the_updated_operation`. |
-| I3 Private cross-Worker binding | Declared in the local and staging configs. Not exercised by a running workerd pair. |
-| I4 Autonomous deliver and reconcile | Implemented and covered by parser and command tests. Not exercised against a live Durable Object. |
-| I5 Onboarding and readiness | The operator route calls the helper or the Durable Object after the operation id is stored. Readiness treats a missing binding or operator token as unavailable, and an unobserved conversation as unknown. A live conversation was not established. |
-| I6 Counters, evidence, and retry timing | Store test keeps acceptance, the push event id, and the original start time across a later timeout. |
-| I7 Partial push | A reconcile disposition does not settle only because the aggregate push label is `relay_accepted`. |
-| I8 Critical fallback and ordinary retries | Fallback is created while Marmot is still reconcilable. Ordinary NIP-17 and Telegram stay on eight attempts. |
-| I9 Native incident | Not run. |
-| I10 Cloudflare incident | Not run. |
-| I11 D1 and scheduling | The fence implementation is on this tree. The workerd suite was not re-run here. |
-| I12 Integrated CI | Jobs `native-marmot` and `cloudflare-marmot` are in the workflow. The previous integration run https://github.com/nostrmash/nostr-watchdog/actions/runs/45897828350 failed in `image` because the helper exited with `relay_missing`. The image job now starts it with `--allow-loopback --relay ws://127.0.0.1/`. That socket check is not conversation recovery. No run of the current commit has finished. |
-| I13 Docker conversation persistence | Not run. |
-| I14 Staging configuration | Both Worker configs are prepared. Nothing was deployed. |
-| I15 Native security limitations | Still deployment-blocking. The pinned MDK build does not correlate push, and membership and network-policy limits remain. |
-| I16 Physical native notification | Pending observation. |
-| I17 Physical Cloudflare notification | Pending an authorized staging deploy and observation. |
+| Operational SQLite and D1 | Apply the ordered `migrations/0001_init.sql` through `migrations/0012_transport_evidence.sql`. No new operational SQL migration was needed. |
+| Marmot Durable Object | The `v1` Wrangler class migration creates the SQLite class. The class initializes its account, operation, and history-bucket tables. Snapshot version 2 records the sealed index commitments. |
+| Native helper | Keep SQLCipher state and the operation journal together. The helper uses its upstream migrations. |
 
-## Release readiness
+### CI and Docker
 
-The branch is not a release candidate. The operational adapter, the counter contract, and the staging binding are in the tree. No monitoring incident has been delivered through the combined Cloudflare watchdog to an independent recipient, and no phone notification has been observed.
+The expanded workflow was enabled at implementation commit `7922c5243aa67519a3e0fe84ec9d00cf2d0915f3`. Later corrections validate native onboarding identity and persistence, bound delivery calls, and exercise the owner acceptance script on the controlled relay.
+
+The six baseline jobs passed on `3ef57fa`, including the original Docker startup smoke test. The expanded workflow runs local-only conversation and restart tests, operational D1 runtime tests, dependency checks for the shipped Rust workspaces, and an image fixture that creates a real conversation and replaces the container against the same mounted data. [Baseline run](https://github.com/nostrmash/nostr-watchdog/actions/runs/45967372076) · [Expanded workflow](https://github.com/nostrmash/nostr-watchdog/actions/runs/45975386938)
+
+### Release gates
+
+| Gate | Status | Evidence or remaining condition |
+| --- | --- | --- |
+| G1 Integration and handoffs | Passed | All three reviewed tips are ancestors and the integration branch was fetched and preserved. |
+| G2 Historical atomicity | Passed | Workerd transaction rollback, losing CAS, interrupted retirement, later unrelated revision, and restart. |
+| G3 Historical identity and retention | Partial | Canonical MAC, per-bucket completeness proof, and missing-row halt passed. Full rollback requires the operator recovery procedure. Long-lived account capacity is still unmeasured. |
+| G4 Standard Nostr key formats | Passed | Both project configurations ran through the private Worker binding with the two formats. Invalid key unit coverage passed. |
+| G5 Monotonic message evidence | Passed | Actual SQLite and workerd D1 store tests and integrated restart evidence. |
+| G6 Multi-trigger reconciliation | Passed | First target accepted, second temporarily interrupted, third publication recovered, and the first trigger stayed at one send. |
+| G7 Native egress | Passed | Actual loopback fixture, stalled handshakes, capacity limits, shutdown, and long-lived forwarding checks. |
+| G8 Onboarding and readiness | Partial | Both project identities initialized, and a full working SmartFlowSocial conversation reached observed participation and token readiness. Equivalent live NostrMash participation and token readiness remain untested. |
+| G9 Scheduling and fallback | Partial | Configured local critical fallback and bounded workerd scheduling passed. The pinned native helper still synchronizes its hosted accounts through a shared upstream catch-up call. |
+| G10 Native incident delivery | Passed | Actual executables, monitor outage and recovery, independent recipient, persisted evidence and fallback. |
+| G11 Paired Cloudflare incident | Passed | Actual workerd and cross-script binding, scheduled incident and subsequent recovery alert. |
+| G12 Independent recipient and trigger | Passed | Local paired Worker and opt-in public recipient decryption and trigger validation. |
+| G13 Restart and duplicate prevention | Passed | Both runtimes recovered persisted conversations and kept the original application event. |
+| G14 D1 and parity | Partial | Local migrations, fences, interrupted fallback completion, heartbeat and signed status passed. Remote D1 and the broader concurrency rehearsal remain open. |
+| G15 Integrated CI | Partial | Expanded run submitted. See the CI results below. |
+| G16 Docker conversation persistence | Partial | Functional container replacement fixture is wired to CI. See the image job conclusion below. |
+| G17 Isolated staging procedure | Passed | Both build and dry-run bundle paths verified. Authorization is required for provisioning and deployment. |
+| G18 Native physical WhiteNoise | Untested | Requires an observed test iPhone notification. |
+| G19 Cloudflare physical WhiteNoise | Blocked | Requires authorized isolated staging and an observed test iPhone notification. |
+
+### Release assessment
+
+The decisive incident path is working locally in both deployment shapes. The native MDK API can acknowledge the group message without exposing alert-specific push acknowledgement. The native helper also checks canonical membership before calling the upstream kind-9 send. A membership change between those operations remains possible because the pinned native API has no atomic guarded send. These upstream limitations remain visible in deployment and acceptance decisions.
+
+Release qualification remains open until the expanded CI, container persistence, remote staging measurements, and physical notification gates are resolved.
