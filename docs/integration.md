@@ -113,7 +113,7 @@ After the first observed notification, the qualification targets remain 100 cont
 | I9 Native incident | Not run. |
 | I10 Cloudflare incident | Not run. |
 | I11 D1 and scheduling | The fence implementation is on this tree. The workerd suite was not re-run here. |
-| I12 Integrated CI | Jobs `native-marmot` and `cloudflare-marmot` are in the workflow. No run of this commit exists yet. |
+| I12 Integrated CI | Jobs `native-marmot` and `cloudflare-marmot` are in the workflow. The previous integration run https://github.com/nostrmash/nostr-watchdog/actions/runs/45897828350 failed in `image` because the helper exited with `relay_missing`. The image job now starts it with `--allow-loopback --relay ws://127.0.0.1/`. That socket check is not conversation recovery. No run of the current commit has finished. |
 | I13 Docker conversation persistence | Not run. |
 | I14 Staging configuration | Both Worker configs are prepared. Nothing was deployed. |
 | I15 Native security limitations | Still deployment-blocking. The pinned MDK build does not correlate push, and membership and network-policy limits remain. |

@@ -95,7 +95,7 @@ jobs:
           docker exec watchdog test -x /usr/local/bin/nostr-watchdog
           docker exec watchdog test -x /usr/local/bin/watchdog-marmot
           docker exec watchdog test -d /data/marmot
-          docker exec -d watchdog sh -c '/usr/local/bin/watchdog-marmot --root /data/marmot --socket /data/marmot/helper.sock >/data/marmot/helper.log 2>&1'
+          docker exec -d watchdog sh -c '/usr/local/bin/watchdog-marmot --root /data/marmot --socket /data/marmot/helper.sock --allow-loopback --relay ws://127.0.0.1/ >/data/marmot/helper.log 2>&1'
           sleep 2
           if ! docker exec watchdog test -S /data/marmot/helper.sock; then
             docker exec watchdog cat /data/marmot/helper.log || true
