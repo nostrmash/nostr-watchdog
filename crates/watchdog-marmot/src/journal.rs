@@ -170,8 +170,7 @@ fn durability_point(name: &str) -> Result<(), String> {
         return Ok(());
     }
     if std::env::var("WATCHDOG_MARMOT_CRASH_EXIT").ok().as_deref() == Some("1") {
-        eprintln!("watchdog-marmot stopped at {name}");
-        std::process::exit(75);
+        crate::exit_at_crash_point(name);
     }
     if std::env::var("WATCHDOG_JOURNAL_FAIL").ok().as_deref() == Some("1") {
         return Err(format!("boundary_injected:{name}"));

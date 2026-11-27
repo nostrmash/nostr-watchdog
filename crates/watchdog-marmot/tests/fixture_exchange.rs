@@ -1846,7 +1846,7 @@ async fn executable_exchange() {
     assert_eq!(
         status.code(),
         Some(75),
-        "the helper did not exit at the crash boundary"
+        "the helper did not exit at the crash boundary: {status}"
     );
     let recovered_helper = start_helper(&helper_bin, &root, &socket, &relay.url);
     wait_health(&root.join("health.sock"));
@@ -2754,7 +2754,7 @@ async fn crash_and_reconcile(
     assert_eq!(
         status.code(),
         Some(75),
-        "{point} did not exit at the boundary"
+        "{point} did not exit at the boundary: {status}"
     );
     let helper = start_helper(helper_bin, root, socket, relay);
     wait_health(&root.join("health.sock"));

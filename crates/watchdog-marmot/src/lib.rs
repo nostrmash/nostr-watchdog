@@ -1586,10 +1586,20 @@ fn crash_after(point: &str) -> Result<(), String> {
         return Ok(());
     }
     if std::env::var("WATCHDOG_MARMOT_CRASH_EXIT").ok().as_deref() == Some("1") {
-        eprintln!("watchdog-marmot stopped at {point}");
-        std::process::exit(75);
+        exit_at_crash_point(point);
     }
     Err(format!("crash_injected:{point}"))
+}
+
+fn exit_at_crash_point(point: &str) -> ! {
+    eprintln!("watchdog-marmot stopped at {point}");
+    unsafe extern "C" {
+        fn _exit(status: std::ffi::c_int) -> !;
+    }
+    // A process crash skips C exit handlers. Those handlers can dismantle
+    // OpenSSL while MDK workers still use SQLCipher.
+    // SAFETY: POSIX _exit terminates the current process without those handlers.
+    unsafe { _exit(75) }
 }
 
 fn safe_error(error: impl ToString) -> String {
