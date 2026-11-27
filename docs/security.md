@@ -26,8 +26,10 @@ Nostr Watchdog sends operational alerts. Treat the sender keys, operator token, 
 
 ## Dependencies
 
-`deny.toml` allows common permissive licenses and denies unknown ones. `cargo audit` belongs in CI. Neither check proves the MDK pin is free of protocol bugs. The pin is an unpublished git revision and should be moved to a release tag when WhiteNoise publishes one.
+CI runs `cargo deny` and `cargo audit` across the operational workspace and both Marmot lockfiles. The MDK revision still requires the `libsqlite3-sys` 0.38 interface through rusqlite. A local compatibility crate re-exports upstream `libsqlite3-sys` 0.40.0, which links SQLCipher 4.20.0 and SQLite 3.54.1. The native acceptance suite verifies both linked versions directly. The production Cloudflare Worker uses Durable Object SQLite and does not link SQLCipher. The independent Rust recipient in the Cloudflare qualification suite uses the same patched library. [RustSec binding advisory](https://rustsec.org/advisories/RUSTSEC-2026-0459.html) · [RustSec SQLCipher advisory](https://rustsec.org/advisories/RUSTSEC-2026-0502.html)
+
+The upstream MDK, binding, and SQLCipher notices are in `LICENSES/` and installed in the native image.
 
 ## Cloudflare staging
 
-`wrangler.staging.toml` uses a placeholder D1 id and the Worker name `nostr-watchdog-rust-staging`. Do not replace that id with `fbb00d08-4cd1-40a3-a4c5-437a439c1a09`. Do not put production secrets in the staging Worker.
+`wrangler.staging.toml` leaves the D1 binding for a dedicated staging database. Use the isolated Worker names and separate credentials described in [deployment.md](deployment.md).

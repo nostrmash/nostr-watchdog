@@ -4,7 +4,7 @@ Marmot is the preferred transport because device tests of ordinary NIP-17 client
 
 ## What the protocol requires
 
-The adopted note is [features/push-notifications.md](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md) in `marmot-protocol/marmot`. The implementation that WhiteNoise runs is the code in MDK `marmot-app`, not a summary of the latest markdown if they differ.
+The adopted note is [features/push-notifications.md](https://github.com/marmot-protocol/marmot/blob/master/features/push-notifications.md) in `marmot-protocol/marmot`. The pinned MDK `marmot-app` code is the interoperability reference.
 
 From that MDK tree at the pinned revision, the push path uses:
 
@@ -16,7 +16,9 @@ From that MDK tree at the pinned revision, the push path uses:
 - Encrypted token records of 1084 bytes over a 1024-byte plaintext.
 - HKDF salt `marmot-push-token-v1` and info `marmot-push-token-encryption`, as implemented in that file.
 
-`watchdog-marmot` does not implement those events itself. Chat alerts go through `MarmotAppRuntime::submit_text` with the alert id as the client token. The pinned runtime does not return a push-trigger publication result. After MDK reports the application message published, the helper reports `token_unavailable` when the recipient has no active token and `unobservable` when tokens exist. A tracing warning is not tied to one alert, so it does not change that alert's push state. The helper does not report push relay acceptance or phone delivery. The Worker does not call this path. Neither process returns token bytes. The exact states and the fields Agent C should store are in `docs/agent-a-integration.md`.
+The native helper calls `MarmotAppRuntime::submit_text` with the alert ID as the client token. The pinned runtime accepts the application message independently of push and gives the helper no alert-specific push acknowledgement. The helper reports `token_unavailable` or `unobservable` as appropriate.
+
+The Cloudflare Marmot Worker processes signed recipient gossip, checks the active group, leaf and full capability identity, and generates kind-446 notification rumors. It publishes each gift wrap, records the relay acknowledgement for its exact event ID, and retries unresolved targets independently. Telegram fallback uses an independent outbox row. Both operational stores keep sanitized evidence.
 
 ## Identity
 
@@ -28,4 +30,6 @@ Before `submit_text`, the helper records the account, group, and payload hash. A
 
 Group creation uses the official runtime, which publishes the creator's key package when account import asks for it. Before a send, the helper reads `group_members` and rejects the send when any member is not the local account or the configured recipient. Extra devices of an allowed account share that account id and stay allowed. An unexpected account fails closed.
 
-Welcome processing stays inside `marmot-app` catch-up. The loopback fixture stores each event with a sequence number. The integration test unwraps a kind-1059 gift with the temporary notification server's key, checks the signature and the full `p` tag, and checks that the inner rumor is kind 446 with version `marmot-push-v1` and 1084-byte token records. An unrelated gift wrap to the same server does not satisfy that check. The fixture does not speak to WhiteNoise, APNs, or FCM. `/v1/diagnostics/marmot?project=smartflowsocial` requires `OPERATOR_TOKEN` and still does not read MDK token state; `scripts/whitenoise-acceptance.sh status` reads helper readiness until that route does.
+Welcome processing on native stays inside `marmot-app` catch-up. On Cloudflare the SQLite-backed sender restores its group and operation history from sealed state. An authorized retry keeps the original ciphertext and event identity. A revoked capability discovered during reconciliation is excluded before further publication.
+
+Operator diagnostics require `OPERATOR_TOKEN` and expose readiness without exposing token bytes. The control fixture checked relay retrieval, independent decryption, notification gift-wrap structure, and restart. A recorded observation on the test phone is the physical gate. [Integration evidence](integration.md) · [Acceptance procedure](acceptance.md)

@@ -2,7 +2,7 @@
 
 Nostr Watchdog is an open-source infrastructure monitoring service with private, encrypted Nostr notifications. Deploy on Cloudflare or run it on your own infrastructure.
 
-This branch, `feat/rust-rewrite`, is the Rust implementation. The TypeScript Worker that is in production stays on `main` and is not changed by this branch. Do not deploy this branch over the production Worker.
+The `feat/rust-integration` branch qualifies the Rust service against the TypeScript production implementation on `main`. Deployment and physical notification acceptance use isolated staging and test identities.
 
 The project is licensed under the [Unlicense](LICENSE). Third-party crates keep their own licenses. See [deny.toml](deny.toml).
 
@@ -18,9 +18,9 @@ The native binary (`nostr-watchdog`) runs the shared monitoring core:
 - Hourly GitHub release and advisory checks for Alby Hub and BTCPay.
 - Operator routes for status, heartbeats, test alerts, failed outbox rows, and incident ack/silence.
 
-Marmot delivery on the native process goes through `watchdog-marmot`, a separate executable that links official `marmot-app` at MDK `ca52a04`. It is a separate process because that crate's SQLCipher build and the operational SQLite database both export `links = "sqlite3"`, and Cargo can link only one of them. The helper is not used on Cloudflare. A relay acknowledgement from that helper is not phone delivery. No WhiteNoise device test has been run from this branch.
+Marmot delivery on the native process goes through `watchdog-marmot`, a separate executable that links official `marmot-app` at MDK `ca52a04`. It is a separate process because that crate's SQLCipher build and the operational SQLite database both export `links = "sqlite3"`, and Cargo can link only one of them. The helper reports application-message relay acceptance and native push uncertainty separately. Physical WhiteNoise acceptance remains pending.
 
-The Cloudflare crate compiles the shared monitoring engine against a D1 store and links a wasm bundle. A local workerd process served `GET /healthz` and `GET /readyz` against a Wrangler-applied D1 schema through `0008_commit_token`. Marmot on the Worker still fails closed. It does not use the production D1 database. See [docs/mdk-compatibility.md](docs/mdk-compatibility.md).
+On Cloudflare, the operational Worker runs the shared engine and D1 outbox. It contacts the private Marmot Durable Object through `MARMOT_SENDER`. Local workerd tests exercised a scheduled incident, independent MDK decryption, trigger recovery, and restart. See [integration evidence](docs/integration.md) and [deployment](docs/deployment.md).
 
 ## Requirements
 
@@ -98,4 +98,4 @@ The MDK helper and the compile probe are outside the workspace. The helper needs
 
 ## Release status
 
-This branch is not a v1.0.0 release. Real WhiteNoise push delivery has not been observed from this code. Do not merge it to `main` or point it at production secrets until that acceptance procedure has been run and the Cloudflare storage blocker is resolved or explicitly accepted.
+Release qualification remains open for authorized staging measurements and physical WhiteNoise notification acceptance. See the current CI, runtime evidence, and gate results in [integration.md](docs/integration.md).

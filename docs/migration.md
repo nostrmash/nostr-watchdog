@@ -1,42 +1,39 @@
 # Migration and rollback
 
-Do not run this against production. `main` at `a236b35a9dda14aa6f1a96dc37fc2daccc838ed8` is the Worker to roll back to. There is no release tag.
+Use a dedicated staging database and a dedicated cryptographic namespace. The TypeScript production reference is `a236b35a9dda14aa6f1a96dc37fc2daccc838ed8`. Staging authorization and deployment order are in [deployment.md](deployment.md).
 
-## What can move
+## Operational migration manifest
 
-The Rust store applies migrations `0001` through `0006`. `0006` only adds columns and tables. It does not rewrite or delete existing rows. A D1 database that has already applied `0001`–`0005` can apply `0006` later. Taking a backup first is still required.
+Apply the files in order. Track the applied versions in each environment. Take an operational database backup before a migration or version rollback.
 
-Copy these if the cutover is approved later:
+| Migration | Purpose |
+| --- | --- |
+| `0001_init.sql` | Operational tables for monitors, incidents, heartbeats, outbox, and scheduler. |
+| `0002_hardening.sql` | Inconclusive monitor state and notification claim fields. |
+| `0003_vendor_checks.sql` | Vendor observations and check history. |
+| `0004_vendor_source_state.sql` | Separate vendor source progress and cached evidence. |
+| `0005_source_failures.sql` | Vendor source failure tracking. |
+| `0006_marmot.sql` | Marmot project metadata. |
+| `0007_marmot_push_identity.sql` | Push record identity fields and indexes. |
+| `0008_commit_token.sql` | Commit tokens for fenced monitor writes. |
+| `0009_operations.sql` | Stable delivery operation fields. |
+| `0010_lifecycle.sql` | Reconciliation and claim metadata. |
+| `0011_delivery_fencing.sql` | Authoritative counters and fallback fences. |
+| `0012_transport_evidence.sql` | Sanitized evidence and timestamps. |
 
-- Project sender keys, as the same secret names.
-- `PROJECT_RECIPIENTS`, `ADMIN_NPUB`, relay bootstrap, and monitor URLs.
-- Operator and status tokens.
-- The D1 rows for incidents, monitor state, and the outbox, after `0006`.
+The native migration tests upgrade an older schema and exercise interruption of the last migration. The workerd harness applies all files to an isolated D1 database. It checks both fallback interruption directions through the real adapter. Remote D1 migration and convergence remain part of staging.
 
-Do not copy an MLS database that does not exist yet. If a future deploy writes Marmot state and then fails, restore the operational D1 backup only. Create a new Marmot conversation. Do not load an older epoch over a newer one.
+## Cryptographic state
 
-## Staging first
+The private Cloudflare Worker uses the `v1` SQLite Durable Object class migration. Its runtime creates the account row and historical index in that namespace. Snapshot version 2 authenticates the revision, writer, and index commitments. The native helper stores its SQLCipher database and durable operation journal under the same state root. Each platform requires its cryptographic state and journal to restore the original conversation.
 
-1. Export the production D1 database with Wrangler and store that file offline. Do not commit it.
-2. Create `nostr-watchdog-rust-staging` and its own D1 database. Apply the migrations there. Use test keys and a test recipient.
-3. Run the native binary against a copy of the backup if you want to read old incidents. Do not point it at production relays with production keys while the TypeScript cron is also sending.
-4. Leave the TypeScript cron in place until the Rust process has been accepted. Two schedulers with the same keys will send duplicate alerts.
+Keep sender secrets, MLS state, and wake capabilities in their designated cryptographic or secret stores. The operational migrations carry only the application data and sanitized transport projection needed by the watchdog.
 
-## Cutover, only after approval
+## Rehearse rollback in staging
 
-1. Stop the TypeScript cron without deleting the Worker or the D1 database.
-2. Start the Rust process with the same keys and a restored database that includes `0006`.
-3. Send one test alert and confirm the destination you enabled.
-4. Watch the outbox. `relay_accepted` means a relay took the event. It does not mean the phone showed it.
+1. Disable alert delivery and pause monitors for the selected staging project. Record the active Worker versions and retain the staging D1 database and Durable Object namespace.
+2. Roll back the operational Worker to a reviewed version compatible with the applied additive migrations. Leave the migration columns and operation IDs in place.
+3. Roll back the cryptographic Worker only to a version compatible with the current sealed snapshot and history. Resume using the same namespace after readiness and a controlled alert pass.
+4. Treat restored or incomplete cryptographic storage as a recovery event. Keep affected operations quarantined pending an integrity check. Use a deliberate fresh onboarding and namespace when the original epoch and deduplication state cannot be proven.
 
-## Rollback
-
-1. Stop the Rust process.
-2. Deploy `main` at `a236b35` again. That commit is the last TypeScript revision this branch was cut from.
-3. The TypeScript Worker ignores the `0006` columns. Leaving them in place is safe. Do not drop them as part of rollback if a future Rust retry might need them.
-4. If the Rust process published NIP-17 events that the TypeScript outbox does not know about, those messages are already public to the relays. Rollback does not unsend them. It stops new ones.
-5. There is no Marmot conversation to roll back in this build. If that changes, re-onboard instead of restoring cryptographic state.
-
-## Duplicate monitoring
-
-The failure mode to avoid is both schedulers running. The Rust native process and the TypeScript cron must not be enabled on the same projects at the same time.
+A runtime restart uses the current data. A point-in-time restore changes the data and can rewind a whole consistent state. Use separate authorization before touching production, and keep one enabled scheduler per project identity through any cutover.
