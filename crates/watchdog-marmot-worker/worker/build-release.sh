@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 rm -rf build
 export CARGO_INCREMENTAL=0
 set +e
-worker-build --release
+worker-build --release . -- --locked
 build_status=$?
 set -e
 

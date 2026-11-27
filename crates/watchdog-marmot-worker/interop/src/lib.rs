@@ -60,13 +60,11 @@ impl OfficialRecipient {
         self.engine()?.fresh_key_package().await.map_err(|error| error.to_string())
     }
 
-    pub async fn join_welcome(&self, welcome: TransportMessage) -> Result<(), String> {
-        let mut engine = self.engine()?;
-        let _joined = engine
+    pub async fn join_welcome(&self, welcome: TransportMessage) -> Result<GroupId, String> {
+        self.engine()?
             .join_welcome(welcome)
             .await
-            .map_err(|error| error.to_string())?;
-        Ok(())
+            .map_err(|error| error.to_string())
     }
 
     /// Run the official convergence pass for a commit that ingest parked.

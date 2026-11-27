@@ -15,7 +15,8 @@ mod state;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use sha2::{Digest, Sha256};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 use cgka_traits::app_event::PendingAppMessageAuthority;
 use cgka_traits::convergence_pass::DurableConvergencePass;
@@ -52,6 +53,7 @@ use state::{
 };
 
 pub use state::{
+    HistoryManifest,
     AccountBinding, ObservedLeaf, OperationTombstone, PreparedPublication, PublicationRecord,
     ServerRelays, StoredWake, SyncCursor,
 };
@@ -166,7 +168,7 @@ impl MemoryMdkStorage {
             .cloned())
     }
 
-    pub fn put_publication(&self, publication: PreparedPublication) -> StorageResult<()> {
+    pub fn put_publication(&self, mut publication: PreparedPublication) -> StorageResult<()> {
         self.mutate(|state| {
             if !state.tombstones_indexed
                 && state.tombstone_high_water > state.operation_tombstones.len() as u64
@@ -222,8 +224,12 @@ impl MemoryMdkStorage {
                     ));
                 }
             }
+            if publication.recipient_hex.is_empty() {
+                publication.recipient_hex = state.binding.recipient_hex.clone();
+            }
+            let protected = publication.alert_id.clone();
             upsert_alert(&mut state.journal, publication);
-            trim_journal(state)?;
+            trim_journal(state, &protected)?;
             Ok(())
         })
     }
@@ -328,6 +334,17 @@ impl MemoryMdkStorage {
                 return Ok(());
             }
             state.operation_tombstones.push(found);
+            Ok(())
+        })
+    }
+
+    pub fn history_manifest(&self) -> StorageResult<Option<HistoryManifest>> {
+        Ok(self.lock()?.state.history_manifest.clone())
+    }
+
+    pub fn set_history_manifest(&self, manifest: HistoryManifest) -> StorageResult<()> {
+        self.mutate(|state| {
+            state.history_manifest = Some(manifest);
             Ok(())
         })
     }
@@ -1909,18 +1926,14 @@ impl StorageProvider for MemoryMdkStorage {
     }
 }
 
-fn trim_journal(state: &mut state::State) -> StorageResult<()> {
+fn trim_journal(state: &mut state::State, protected: &str) -> StorageResult<()> {
     if state.journal.len() <= state::MAX_JOURNAL {
         return Ok(());
     }
     let mut index = 0;
     while state.journal.len() > state::MAX_JOURNAL && index < state.journal.len() {
-        let phase = state.journal[index].message_phase.as_str();
-        let push_open = matches!(
-            state.journal[index].push_phase.as_str(),
-            "unknown" | "not_attempted" | "prepared" | "pending" | "publication_attempted"
-        );
-        if (phase == "relay_accepted" || phase == "rejected") && !push_open {
+        let row = &state.journal[index];
+        if row.alert_id != protected && row.operation_kind != "welcome" && row.settled() {
             let row = state.journal.remove(index);
             remember_tombstone(state, &row);
         } else {
@@ -1942,61 +1955,61 @@ fn trim_journal(state: &mut state::State) -> StorageResult<()> {
     Ok(())
 }
 
-/// Bind a tombstone to the account revision that will commit it.
+/// Authenticate a versioned record after binding it to its committing snapshot.
 pub fn stamp_tombstone(
     mut stone: OperationTombstone,
+    storage_key: &[u8; 32],
     project_id: &str,
     account_hex: &str,
     revision: u64,
     writer: &str,
-) -> OperationTombstone {
+) -> StorageResult<OperationTombstone> {
+    stone.version = 2;
     stone.project_id = project_id.to_owned();
     stone.account_hex = account_hex.to_owned();
     stone.bound_revision = revision;
     stone.bound_writer = writer.to_owned();
-    stone.authenticator = tombstone_authenticator(&stone);
-    stone
+    stone.authenticator = hex::encode(tombstone_mac(&stone, storage_key)?.finalize().into_bytes());
+    Ok(stone)
 }
 
-/// A historical row is authoritative only after the account commit that names
-/// the same revision and writer. A higher revision is an uncommitted attempt.
-pub fn history_authoritative(
+/// The authenticated index proves this record was included in a commit.
+/// This check authenticates the record and its identity and revision metadata.
+pub fn verify_tombstone(
     stone: &OperationTombstone,
-    account_revision: u64,
-    account_writer: &str,
+    storage_key: &[u8; 32],
     project_id: &str,
     account_hex: &str,
-) -> StorageResult<bool> {
-    if stone.authenticator.is_empty() || stone.authenticator != tombstone_authenticator(stone) {
-        return Err(StorageError::Backend("corrupted historical record".into()));
+    manifest: &HistoryManifest,
+) -> StorageResult<()> {
+    let invalid = || StorageError::Backend("corrupted historical record".into());
+    if stone.version != 2
+        || stone.project_id != project_id
+        || stone.account_hex != account_hex
+        || stone.bound_revision == 0
+        || stone.bound_revision > manifest.revision
+        || (stone.bound_revision == manifest.revision && stone.bound_writer != manifest.writer)
+    {
+        return Err(invalid());
     }
-    if stone.project_id != project_id || stone.account_hex != account_hex {
-        return Err(StorageError::Backend(
-            "historical record is bound to a different account".into(),
-        ));
-    }
-    if stone.bound_revision > account_revision {
-        return Ok(false);
-    }
-    if stone.bound_revision == account_revision && stone.bound_writer != account_writer {
-        return Err(StorageError::Backend("conflicting historical record".into()));
-    }
-    Ok(true)
+    let tag = hex::decode(&stone.authenticator).map_err(|_| invalid())?;
+    tombstone_mac(stone, storage_key)?.verify_slice(&tag).map_err(|_| invalid())
 }
 
-fn tombstone_authenticator(stone: &OperationTombstone) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"marmot-operation-v1");
-    hasher.update(stone.project_id.as_bytes());
-    hasher.update(stone.account_hex.as_bytes());
-    hasher.update(stone.alert_id.as_bytes());
-    hasher.update(stone.payload_sha256);
-    hasher.update(stone.operation_kind.as_bytes());
-    hasher.update(stone.group_id.as_slice());
-    hasher.update(stone.message_phase.as_bytes());
-    hasher.update(stone.bound_revision.to_le_bytes());
-    hasher.update(stone.bound_writer.as_bytes());
-    hex::encode(hasher.finalize())
+fn tombstone_mac(stone: &OperationTombstone, storage_key: &[u8; 32]) -> StorageResult<Hmac<Sha256>> {
+    let mut key = zeroize::Zeroizing::new([0; 32]);
+    hkdf::Hkdf::<Sha256>::new(Some(b"watchdog-marmot-history-v2"), storage_key)
+        .expand(b"operation-record-authentication", &mut *key)
+        .map_err(|_| StorageError::Backend("historical key derivation failed".into()))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&*key)
+        .map_err(|_| StorageError::Backend("historical authentication failed".into()))?;
+    let mut canonical = stone.clone();
+    canonical.authenticator.clear();
+    // All nested structures are ordered, and JSON provides framing for all fields.
+    let encoded = serde_json::to_vec(&canonical)
+        .map_err(|_| StorageError::Backend("historical encoding failed".into()))?;
+    mac.update(&encoded);
+    Ok(mac)
 }
 
 fn remember_tombstone(state: &mut state::State, row: &PreparedPublication) {
@@ -2024,6 +2037,9 @@ fn remember_tombstone(state: &mut state::State, row: &PreparedPublication) {
         bound_revision: 0,
         bound_writer: String::new(),
         authenticator: String::new(),
+        version: 0,
+        recipient_hex: row.recipient_hex.clone(),
+        terminal_pushes: row.terminal_push_records().unwrap_or_default(),
     };
     if state.tombstones_indexed {
         if let Some(existing) = state
@@ -2236,24 +2252,41 @@ mod tests {
     }
 
     #[test]
-    fn historical_authority_follows_the_committed_revision() {
-        let sample = remember_sample();
-        let staged = stamp_tombstone(sample.clone(), "project", "aa", 6, "writer-a");
-        assert!(!history_authoritative(&staged, 5, "writer-a", "project", "aa").unwrap());
-        assert!(history_authoritative(&staged, 6, "writer-a", "project", "aa").unwrap());
-        assert!(history_authoritative(&staged, 7, "writer-b", "project", "aa").unwrap());
-        let conflict = history_authoritative(&staged, 6, "writer-b", "project", "aa");
-        assert!(conflict.unwrap_err().to_string().contains("conflicting"));
-        let mut corrupt = staged.clone();
-        corrupt.authenticator = "00".into();
-        assert!(history_authoritative(&corrupt, 6, "writer-a", "project", "aa")
-            .unwrap_err()
-            .to_string()
-            .contains("corrupt"));
-        assert!(history_authoritative(&staged, 6, "writer-a", "other", "aa")
-            .unwrap_err()
-            .to_string()
-            .contains("different account"));
+    fn historical_record_authenticates_lifecycle_and_identity() {
+        let key = [17; 32];
+        let manifest = HistoryManifest { revision: 6, writer: "writer-a".into(), ..Default::default() };
+        let stone = stamp_tombstone(remember_sample(), &key, "project", "aa", 6, "writer-a").unwrap();
+        verify_tombstone(&stone, &key, "project", "aa", &manifest).unwrap();
+        for updated in [
+            OperationTombstone { push_phase: "rejected".into(), ..stone.clone() },
+            OperationTombstone { recipient_hex: "other".into(), ..stone.clone() },
+            OperationTombstone { message_event_id: "other".into(), ..stone.clone() },
+            OperationTombstone { bound_revision: 5, ..stone.clone() },
+        ] {
+            assert!(verify_tombstone(&updated, &key, "project", "aa", &manifest).is_err());
+        }
+        assert!(verify_tombstone(&stone, &[18; 32], "project", "aa", &manifest).is_err());
+        assert!(verify_tombstone(&stone, &key, "other", "aa", &manifest).is_err());
+    }
+
+    #[test]
+    fn retryable_unobservable_push_remains_in_the_journal() {
+        let storage = MemoryMdkStorage::empty();
+        let mut pending = sample_publication(1);
+        pending.push_phase = "unobservable".into();
+        pending.publications.push(PublicationRecord {
+            attempt_id: "attempt-a".into(),
+            event_id: "trigger-a".into(),
+            role: "push".into(),
+            destination: String::new(), phase: "unobservable".into(), server: String::new(),
+            reason: "publication_timeout".into(), started_at_ms: 0, finished_at_ms: 1,
+        });
+        storage.put_publication(pending).unwrap();
+        for id in 2..=state::MAX_JOURNAL as u32 + 2 {
+            storage.put_publication(wide_publication(id)).unwrap();
+        }
+        assert!(storage.publication("alert-1").unwrap().is_some());
+        assert!(storage.tombstone("alert-1").unwrap().is_none());
     }
 
     #[test]
@@ -2300,6 +2333,7 @@ mod tests {
         hash[..4].copy_from_slice(&id.to_le_bytes());
         PreparedPublication {
             alert_id: format!("alert-{id}"),
+            recipient_hex: String::new(),
             operation_kind: "chat".into(),
             payload_sha256: hash,
             group_id: GroupId::new(vec![1, 2, 3, 4]),
@@ -2340,6 +2374,7 @@ mod tests {
         use cgka_traits::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
         PreparedPublication {
             alert_id: format!("alert-{id}"),
+            recipient_hex: String::new(),
             operation_kind: "chat".into(),
             payload_sha256: [id; 32],
             group_id: GroupId::new(vec![1, 2, 3, 4]),

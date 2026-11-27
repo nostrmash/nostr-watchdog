@@ -1,6 +1,6 @@
 //! Live MDK records. Snapshots and the sealed document are projections of this.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use cgka_traits::app_event::PendingAppMessageAuthority;
 use cgka_traits::convergence_pass::DurableConvergencePass;
@@ -82,6 +82,7 @@ pub(crate) struct State {
     /// Number of retired identities. A sealed snapshot may omit the rows once
     /// they live in the Durable Object operation index.
     pub tombstone_high_water: u64,
+    pub history_manifest: Option<HistoryManifest>,
     /// Set after the SQL operation index has been loaded into this process.
     pub tombstones_indexed: bool,
     /// Operation ids whose historical row was looked up for this process.
@@ -165,6 +166,7 @@ impl State {
             journal: Vec::new(),
             operation_tombstones: Vec::new(),
             tombstone_high_water: 0,
+            history_manifest: None,
             tombstones_indexed: false,
             history_consulted: Vec::new(),
             pending_tombstones: Vec::new(),
@@ -569,11 +571,8 @@ impl State {
             } else {
                 self.operation_tombstones.clone()
             },
-            tombstone_high_water: if self.tombstones_indexed {
-                self.operation_tombstones.len() as u64
-            } else {
-                self.operation_tombstones.len() as u64
-            },
+            tombstone_high_water: self.tombstone_high_water.max(self.operation_tombstones.len() as u64),
+            history_manifest: self.history_manifest.clone(),
             observed_leaves: self.observed_leaves.clone(),
             sync_cursors: self.sync_cursors.clone(),
             wakes: self.wakes.clone(),
@@ -737,6 +736,7 @@ impl State {
         state.journal = saved.journal;
         state.operation_tombstones = saved.operation_tombstones;
         state.tombstone_high_water = saved.tombstone_high_water;
+        state.history_manifest = saved.history_manifest;
         state.tombstones_indexed = false;
         state.observed_leaves = saved.observed_leaves;
         state.sync_cursors = saved.sync_cursors;
@@ -1054,6 +1054,8 @@ pub(crate) struct SavedState {
     #[serde(default)]
     pub tombstone_high_water: u64,
     #[serde(default)]
+    pub history_manifest: Option<HistoryManifest>,
+    #[serde(default)]
     pub observed_leaves: Vec<ObservedLeaf>,
     #[serde(default)]
     pub sync_cursors: Vec<SyncCursor>,
@@ -1094,11 +1096,21 @@ pub struct AccountBinding {
     pub group_id_hex: Option<String>,
 }
 
+/// Index bucket commitments authenticated by the sealed account document.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HistoryManifest {
+    pub revision: u64,
+    pub writer: String,
+    pub buckets: BTreeMap<u8, String>,
+}
+
 /// One prepared publication. A retry with the same operation id returns this
 /// message instead of encrypting again.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PreparedPublication {
     pub alert_id: String,
+    #[serde(default)]
+    pub recipient_hex: String,
     #[serde(default = "default_operation_kind")]
     pub operation_kind: String,
     pub payload_sha256: [u8; 32],
@@ -1141,6 +1153,36 @@ pub struct PreparedPublication {
     pub push_attempts: u64,
     #[serde(default)]
     pub publications: Vec<PublicationRecord>,
+}
+
+impl PreparedPublication {
+    pub fn terminal_push_records(&self) -> Option<BTreeMap<String, (String, String)>> {
+        let mut targets = BTreeMap::<String, (String, String)>::new();
+        for record in self.publications.iter().filter(|record| record.role == "push") {
+            let state = targets.entry(record.event_id.clone()).or_default();
+            if state.0 != "relay_accepted" {
+                *state = (record.phase.clone(), record.reason.clone());
+            }
+        }
+        let terminal = |phase: &str, reason: &str| {
+            matches!(phase, "relay_accepted" | "rejected" | "retired" | "expired" | "terminal_failure")
+                || (phase == "unobservable" && reason == "push_unobservable")
+        };
+        if !targets.values().all(|(phase, reason)| terminal(phase, reason)) {
+            return None;
+        }
+        match self.push_phase.as_str() {
+            "relay_accepted" | "rejected" | "not_required" | "expired" | "terminal_failure" => Some(targets),
+            "unobservable" if !targets.is_empty() => Some(targets),
+            _ if self.message_phase == "rejected" && targets.is_empty() => Some(targets),
+            _ => None,
+        }
+    }
+
+    pub fn settled(&self) -> bool {
+        matches!(self.message_phase.as_str(), "relay_accepted" | "rejected")
+            && self.terminal_push_records().is_some()
+    }
 }
 
 /// One correlated relay attempt. Acceptance of a different event cannot confirm this one.
@@ -1193,6 +1235,12 @@ pub struct OperationTombstone {
     pub bound_writer: String,
     #[serde(default)]
     pub authenticator: String,
+    #[serde(default)]
+    pub version: u8,
+    #[serde(default)]
+    pub recipient_hex: String,
+    #[serde(default)]
+    pub terminal_pushes: BTreeMap<String, (String, String)>,
 }
 
 /// Encrypted wake capability. The raw device token is not stored.

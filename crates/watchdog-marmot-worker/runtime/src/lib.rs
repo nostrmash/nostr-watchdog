@@ -10,7 +10,8 @@ pub mod publication;
 pub mod push;
 
 pub use mdk_do_storage::{
-    history_authoritative, stamp_tombstone, OperationTombstone, ServerRelays, StoredWake,
+    HistoryManifest,
+    verify_tombstone, stamp_tombstone, OperationTombstone, ServerRelays, StoredWake,
 };
 
 use std::sync::Arc;
@@ -729,6 +730,22 @@ impl Session {
         Ok(())
     }
 
+    pub fn expire_push(&self, operation_id: &str) -> Result<(), SessionError> {
+        let Some(mut row) = self.storage.publication(operation_id).map_err(map_storage)? else {
+            return Err(SessionError::MissingPublication(operation_id.to_owned()));
+        };
+        for attempt in row.publications.iter_mut().filter(|item| item.role == "push") {
+            if !matches!(attempt.phase.as_str(), "relay_accepted" | "rejected" | "retired") {
+                attempt.phase = "expired".into();
+                attempt.reason = "operation_expired".into();
+            }
+        }
+        row.push_trigger = None;
+        row.push_phase = "expired".into();
+        row.updated_at_ms = clock::unix_ms();
+        self.storage.put_publication(row).map_err(map_storage)
+    }
+
     pub fn note_push(
         &self,
         alert_id: &str,
@@ -932,6 +949,28 @@ impl Session {
         Ok(true)
     }
 
+    pub fn record_trigger_target(
+        &self,
+        operation_id: &str,
+        event_id: &str,
+        server: &str,
+        phase: &str,
+    ) -> Result<(), SessionError> {
+        let row = self.storage.publication(operation_id).map_err(map_storage)?
+            .ok_or_else(|| SessionError::MissingPublication(operation_id.to_owned()))?;
+        if row.publications.iter().any(|record| record.role == "push" && record.event_id == event_id &&
+            (phase == "prepared" || record.phase == phase || record.phase == "relay_accepted")) {
+            return Ok(());
+        }
+        let reason = match phase {
+            "expired" => "trigger_attempts_exhausted",
+            "retired" => "capability_changed",
+            _ => "",
+        };
+        self.note_trigger(operation_id, phase, event_id, "", &format!("target:{phase}:{event_id}"), reason, server)?;
+        Ok(())
+    }
+
     /// Record one trigger without hiding another trigger's result.
     pub fn note_trigger(
         &self,
@@ -1014,17 +1053,9 @@ impl Session {
         let phase = aggregate_push(&existing.publications);
         existing.push_phase = phase.clone();
         existing.push_published = phase == "relay_accepted";
-        let mut ids = Vec::new();
-        for record in existing.publications.iter().filter(|record| record.role == "push") {
-            if !ids.iter().any(|id| id == &record.event_id) {
-                ids.push(record.event_id.clone());
-            }
-        }
-        existing.push_event_id = if ids.len() == 1 {
-            ids.pop()
-        } else {
-            None
-        };
+        existing.push_event_id = existing.publications.iter().find(|record|
+            record.role == "push" && record.phase == "relay_accepted"
+        ).map(|record| record.event_id.clone());
         existing.updated_at_ms = now;
         self.storage.put_publication(existing).map_err(map_storage)?;
         let stored = self.storage.publication(operation_id).map_err(map_storage)?.unwrap();
@@ -1212,10 +1243,8 @@ impl Session {
             }));
         };
         let error = push_error(&row);
-        let push_retryable = push_is_retryable(&row.push_phase, error.as_deref());
-        let message_terminal = matches!(row.message_phase.as_str(), "relay_accepted" | "rejected");
-        let push_closed = push_terminally_closed(&row);
-        let settled = message_terminal && push_closed && !push_retryable;
+        let push_retryable = row.terminal_push_records().is_none();
+        let settled = row.settled();
         let retry_after = if settled { 0 } else { 15_000 };
         let mut body = publication_counters(&row);
         let map = body.as_object_mut().expect("counters");
@@ -1233,16 +1262,15 @@ impl Session {
         map.insert("pushEventId".into(), serde_json::json!(row.push_event_id));
         map.insert("triggers".into(), trigger_evidence(&row));
         map.insert("targets".into(), target_evidence(&row));
-        map.insert(
-            "evidence".into(),
-            serde_json::json!(if trigger_evidence(&row).as_array().map(|items| items.len() > 1).unwrap_or(false) {
-                "partial_push"
-            } else if settled {
-                "settled"
-            } else {
-                "reconcile"
-            }),
-        );
+        let has_accepted_push = row.publications.iter().any(|record| record.role == "push" && record.phase == "relay_accepted");
+        let evidence = if has_accepted_push && row.push_phase != "relay_accepted" {
+            "partial_push"
+        } else if row.message_phase == "relay_accepted" {
+            "relay_acknowledgement"
+        } else {
+            "not_observed"
+        };
+        map.insert("evidence".into(), serde_json::json!(evidence));
         map.insert("error".into(), serde_json::json!(error));
         map.insert("settled".into(), serde_json::json!(settled));
         map.insert(
@@ -1576,54 +1604,30 @@ fn wakes_from_directory(directory: &push::PushDirectory) -> Vec<StoredWake> {
         .collect()
 }
 
-fn push_terminally_closed(row: &PreparedPublication) -> bool {
-    match row.push_phase.as_str() {
-        "relay_accepted" | "rejected" | "not_required" | "not_attempted" | "expired"
-        | "terminal_failure" | "token_unavailable" => true,
-        "unobservable" => {
-            let active = row
-                .publications
-                .iter()
-                .filter(|record| record.role == "push" && record.phase != "retired")
-                .collect::<Vec<_>>();
-            !active.is_empty()
-                && active.iter().all(|record| {
-                    record.phase == "relay_accepted"
-                        || record.phase == "rejected"
-                        || (record.phase == "unobservable" && record.reason == "push_unobservable")
-                })
-                && active.iter().any(|record| record.reason == "push_unobservable" || record.phase == "rejected")
-        }
-        _ => false,
-    }
-}
-
 fn target_evidence(row: &PreparedPublication) -> serde_json::Value {
-    let mut items = Vec::new();
-    let mut seen = Vec::new();
+    let mut by_event = std::collections::BTreeMap::<&str, &PublicationRecord>::new();
     for record in row.publications.iter().filter(|record| record.role == "push") {
-        if seen.iter().any(|id| id == &record.event_id) {
-            continue;
+        let effective = by_event.entry(&record.event_id).or_insert(record);
+        if effective.phase != "relay_accepted" {
+            *effective = record;
         }
-        seen.push(record.event_id.clone());
-        let retryable = record.phase != "relay_accepted"
-            && record.phase != "rejected"
-            && record.phase != "retired"
+    }
+    serde_json::Value::Array(by_event.into_values().map(|record| {
+        let retryable = !matches!(record.phase.as_str(), "relay_accepted" | "rejected" | "retired" | "expired")
             && record.reason != "push_unobservable";
-        items.push(serde_json::json!({
+        serde_json::json!({
             "eventId": record.event_id,
             "server": record.server,
             "phase": record.phase,
             "reason": record.reason,
             "retryable": retryable,
-        }));
-    }
-    serde_json::Value::Array(items)
+        })
+    }).collect())
 }
 
 fn aggregate_push(records: &[PublicationRecord]) -> String {
     let mut by_event: Vec<(String, String)> = Vec::new();
-    for record in records.iter().filter(|record| record.role == "push" && record.phase != "retired") {
+    for record in records.iter().filter(|record| record.role == "push") {
         if let Some(slot) = by_event.iter_mut().find(|(id, _)| id == &record.event_id) {
             if slot.1 != "relay_accepted" {
                 slot.1 = record.phase.clone();
@@ -1651,6 +1655,9 @@ fn aggregate_push(records: &[PublicationRecord]) -> String {
         && phases.iter().all(|phase| *phase == "rejected")
     {
         return "rejected".into();
+    }
+    if phases.iter().all(|phase| matches!(*phase, "relay_accepted" | "rejected" | "expired" | "retired")) {
+        return "terminal_failure".into();
     }
     if phases.iter().any(|phase| {
         matches!(
@@ -1690,7 +1697,7 @@ fn trigger_item(record: &PublicationRecord) -> serde_json::Value {
         "relay": record.destination,
         "server": record.server,
         "attemptId": record.attempt_id,
-        "retryable": record.phase != "relay_accepted" && record.phase != "rejected" && record.phase != "retired",
+        "retryable": !matches!(record.phase.as_str(), "relay_accepted" | "rejected" | "retired" | "expired") && record.reason != "push_unobservable",
     })
 }
 
@@ -1715,22 +1722,6 @@ fn push_error(row: &PreparedPublication) -> Option<String> {
     } else {
         None
     }
-}
-
-fn push_is_retryable(phase: &str, error: Option<&str>) -> bool {
-    if error == Some("push_unobservable") {
-        return false;
-    }
-    matches!(
-        phase,
-        "unobservable"
-            | "publication_attempted"
-            | "prepared"
-            | "pending"
-            | "token_unavailable"
-            | "accepted_pending"
-            | "completion_unknown"
-    )
 }
 
 pub fn publication_counters(row: &PreparedPublication) -> serde_json::Value {
@@ -1782,6 +1773,7 @@ fn blank_publication(
 ) -> PreparedPublication {
     PreparedPublication {
         alert_id: alert_id.to_owned(),
+        recipient_hex: String::new(),
         operation_kind: kind.to_owned(),
         payload_sha256,
         group_id,
@@ -1848,6 +1840,7 @@ mod tests {
         use cgka_traits::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
         mdk_do_storage::PreparedPublication {
             alert_id: id.to_owned(),
+            recipient_hex: String::new(),
             operation_kind: "chat".into(),
             payload_sha256: [7u8; 32],
             group_id: cgka_traits::GroupId::new(vec![1, 2, 3, 4]),

@@ -6,11 +6,11 @@
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::state::SavedState;
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 pub const KEY_VERSION: u8 = 1;
 const MAGIC: &[u8] = b"MWDO";
 const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -45,7 +45,7 @@ pub enum PersistError {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Document {
     pub format: u32,
-    pub state: SavedState,
+    pub(crate) state: SavedState,
 }
 
 pub fn seal(
@@ -53,12 +53,14 @@ pub fn seal(
     binding: SealBinding<'_>,
     document: &Document,
 ) -> Result<Vec<u8>, PersistError> {
-    let aad = associated_data(binding)?;
-    let mut plain = serde_json::to_vec(document).map_err(|_| PersistError::Corrupt)?;
+    let aad = associated_data(binding, FORMAT_VERSION)?;
+    let plain = Zeroizing::new(serde_json::to_vec(document).map_err(|_| PersistError::Corrupt)?);
     if plain.len() > MAX_DOCUMENT_BYTES {
-        plain.zeroize();
         return Err(PersistError::Capacity);
     }
+    // JSON contains repeated keys and byte arrays. Compress before sealing
+    // so a full active journal fits within the Durable Object row limit.
+    let compressed = Zeroizing::new(miniz_oxide::deflate::compress_to_vec_zlib(&plain, 3));
     let mut nonce = [0u8; 12];
     getrandom::getrandom(&mut nonce).map_err(|_| PersistError::Random)?;
     let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| PersistError::Corrupt)?;
@@ -66,15 +68,11 @@ pub fn seal(
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
-                msg: &plain,
+                msg: &compressed,
                 aad: &aad,
             },
         )
-        .map_err(|_| {
-            plain.zeroize();
-            PersistError::Corrupt
-        })?;
-    plain.zeroize();
+        .map_err(|_| PersistError::Corrupt)?;
     let mut out = Vec::with_capacity(HEADER + ciphertext.len());
     out.extend_from_slice(MAGIC);
     out.push(FORMAT_VERSION as u8);
@@ -96,7 +94,7 @@ pub fn open_sealed(
         return Err(PersistError::Corrupt);
     }
     let version = u32::from(bytes[4]);
-    if version != FORMAT_VERSION {
+    if version != 1 && version != FORMAT_VERSION {
         return Err(PersistError::Unsupported {
             found: version,
             latest: FORMAT_VERSION,
@@ -109,11 +107,11 @@ pub fn open_sealed(
             latest: u32::from(KEY_VERSION),
         });
     }
-    let aad = associated_data(binding)?;
+    let aad = associated_data(binding, version)?;
     let nonce = &bytes[6..18];
     let ciphertext = &bytes[18..];
     let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| PersistError::Corrupt)?;
-    let mut plain = cipher
+    let decoded = Zeroizing::new(cipher
         .decrypt(
             Nonce::from_slice(nonce),
             Payload {
@@ -121,11 +119,16 @@ pub fn open_sealed(
                 aad: &aad,
             },
         )
-        .map_err(|_| PersistError::Corrupt)?;
-    let document = serde_json::from_slice::<Document>(&plain).map_err(|_| PersistError::Corrupt);
-    plain.zeroize();
-    let document = document?;
-    if document.format != FORMAT_VERSION {
+        .map_err(|_| PersistError::Corrupt)?);
+    let document: Document = if version == 1 {
+        serde_json::from_slice(&decoded)
+    } else {
+        let plain = Zeroizing::new(miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
+            &decoded, MAX_DOCUMENT_BYTES,
+        ).map_err(|_| PersistError::Corrupt)?);
+        serde_json::from_slice(&plain)
+    }.map_err(|_| PersistError::Corrupt)?;
+    if document.format != version {
         return Err(PersistError::Unsupported {
             found: document.format,
             latest: FORMAT_VERSION,
@@ -134,7 +137,7 @@ pub fn open_sealed(
     Ok(document)
 }
 
-fn associated_data(binding: SealBinding<'_>) -> Result<Vec<u8>, PersistError> {
+fn associated_data(binding: SealBinding<'_>, version: u32) -> Result<Vec<u8>, PersistError> {
     if binding.project_id.is_empty()
         || binding.project_id.len() > 128
         || binding.account_hex.len() != 64
@@ -144,7 +147,7 @@ fn associated_data(binding: SealBinding<'_>) -> Result<Vec<u8>, PersistError> {
     }
     let mut aad = Vec::with_capacity(8 + binding.project_id.len() + binding.account_hex.len());
     aad.extend_from_slice(MAGIC);
-    aad.push(FORMAT_VERSION as u8);
+    aad.push(version as u8);
     aad.push(KEY_VERSION);
     aad.extend_from_slice(binding.project_id.as_bytes());
     aad.push(0xff);

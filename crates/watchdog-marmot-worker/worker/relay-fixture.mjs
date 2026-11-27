@@ -9,6 +9,8 @@ import { WebSocketServer } from "ws";
 const port = Number(process.env.PORT || 0);
 const fault = process.env.RELAY_FAULT || "";
 const events = new Map();
+const attempts = new Map();
+let interruptedRecipient = "";
 
 function address(event) {
   const d = (event.tags || []).find((tag) => tag[0] === "d");
@@ -70,6 +72,12 @@ sockets.on("connection", (socket) => {
     const [type, ...rest] = message;
     if (type === "EVENT" && rest[0] && typeof rest[0].id === "string") {
       const event = rest[0];
+      attempts.set(event.id, (attempts.get(event.id) || 0) + 1);
+      if (interruptedRecipient && event.kind === 1059 &&
+          event.tags.some(([name, value]) => name === "p" && value === interruptedRecipient)) {
+        socket.close(1011, "fixture interruption");
+        return;
+      }
       const key = address(event);
       if (key) {
         for (const [id, stored] of events) {
@@ -121,7 +129,29 @@ sockets.on("connection", (socket) => {
   });
 });
 
-server.on("request", (request, response) => {
+let probeCount = 0;
+server.on("request", async (request, response) => {
+  if (request.method === "POST" && request.url === "/control") {
+    try {
+      let body = "";
+      for await (const chunk of request) {
+        body += chunk;
+        if (body.length > 4096) throw new Error("fixture control too large");
+      }
+      interruptedRecipient = JSON.parse(body).interruptedRecipient || "";
+      response.end("{}");
+    } catch {
+      response.statusCode = 400;
+      response.end();
+    }
+    return;
+  }
+  if (request.url === "/healthcheck") {
+    response.statusCode = ++probeCount <= 2 ? 503 : 200;
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ status: response.statusCode === 200 ? "ok" : "down" }));
+    return;
+  }
   if (request.url !== "/stats") {
     response.statusCode = 404;
     response.end();
@@ -141,7 +171,7 @@ server.on("request", (request, response) => {
     }
   }
   response.setHeader("content-type", "application/json");
-  response.end(JSON.stringify({ counts, giftWraps }));
+  response.end(JSON.stringify({ counts, giftWraps, attempts: Object.fromEntries(attempts) }));
 });
 
 server.listen(port, "127.0.0.1", () => {
