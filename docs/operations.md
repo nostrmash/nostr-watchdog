@@ -56,9 +56,9 @@ Incident messages include the project, severity, service, state, incident id, UT
 
 Retries use exponential backoff starting at 30 seconds and capping at one hour, for at most 8 attempts. A missing sender key, a missing recipient, an empty bootstrap list, or a confirmed empty inbox fails immediately.
 
-## Staging and production
+## Production checks
 
-Use different secrets in each environment. D1 is a different database per environment. Enabling a monitor in staging does not enable it in production.
+Use the [production runbook](deployment.md#cloudflare-production) for Cloudflare configuration and the [WhiteNoise procedure](acceptance.md#cloudflare) for controlled Marmot alerts. Exercise outage, recovery, and retry scenarios with the local workerd fixtures.
 
 ## Silence and ack
 
@@ -69,10 +69,10 @@ Ack when a person has seen a critical incident and further reminders would only 
 1. Publish kind `10050` from the recipient account with at least one `wss` inbox relay. Confirm the relay diagnostic lists those relays and no others.
 2. Send the test alert. Confirm the relay response is `relay_accepted` and the chat title matches that project's contact name.
 3. Lock the phone and confirm the client shows a push, if that client supports locked-screen notifications for NIP-17. Record the client name. A failure here is a client or relay-push limit.
-4. Point one HTTP monitor at a URL that fails its predicate. Wait for two minute crons. Confirm one outage alert. Restore the URL. Confirm one recovery after two successes.
-5. For a heartbeat monitor, stop the emitter and confirm a stale heartbeat opens an outage. Start it with `idle: true` and confirm recovery. `loopAt` must move only when the job loop iterates. A timer that stamps `loopAt` with the send time hides a stuck loop.
+4. In a local fixture, make an HTTP monitor fail its predicate and recover. Confirm one outage and one recovery alert.
+5. In a local fixture, pause a heartbeat emitter and verify the stale heartbeat opens an outage. Check recovery after the emitter resumes. Set `loopAt` when the job loop iterates so it reflects real progress.
 6. Retry a failed relay publish and confirm the incident id and gift-wrap id do not change.
-7. Confirm staging secrets are not the production secrets, and that enable flags for unverified URLs are still `false`.
+7. Confirm production monitors use the intended URLs and the fixtures use separate credentials.
 8. From a network that is not Cloudflare, poll `/healthz` or signed `/v1/status` on a schedule. That checker is what pages you if Cloudflare itself is down.
 
 ## Limits

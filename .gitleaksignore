@@ -1,0 +1,16 @@
+# Historical loopback HTTP test headers, including the rejection fixture.
+cd2bdb91f88d189134a25560927d137da433b980:tests/runtime/worker-scheduled.sh:curl-auth-header:364
+636be71df663c7c86e07d88e3248a94218090427:tests/runtime/worker-scheduled.sh:curl-auth-header:222
+2278d2f6c11b297d3fc71eeb0e9c4c57511d7d4b:tests/runtime/worker-scheduled.sh:curl-auth-header:354
+014696c68ea0bdf9efd3e812200471b742f67bdd:tests/runtime/worker-scheduled.sh:curl-auth-header:257
+014696c68ea0bdf9efd3e812200471b742f67bdd:tests/runtime/worker-scheduled.sh:curl-auth-header:299
+
+# Historical shared sample key in a local workerd fixture and its example.
+df4259b8cfcaf50a43a953b92b90f5009d5e1e0e:crates/watchdog-marmot-worker/interop/tests/workerd_conversation.rs:generic-api-key:538
+df4259b8cfcaf50a43a953b92b90f5009d5e1e0e:crates/watchdog-marmot-worker/worker/.dev.vars.example:generic-api-key:3
+
+# Cargo dependency names in historical lockfile changes.
+d2d6e9a95b50ab7772111bf6e0f5347337cba133:probes/mdk-engine/Cargo.lock:generic-api-key:1466
+c581fc74613646080e68f94046d9de27e47416a6:crates/watchdog-marmot-worker/Cargo.lock:generic-api-key:1557
+81c756003d85d4e79bf57068fc6afe3092ef6fa4:probes/mls-durable/Cargo.lock:generic-api-key:1084
+890bce59c4679cc81dc8fe9520d9e628ba62f9fb:crates/watchdog-marmot/Cargo.lock:generic-api-key:2409

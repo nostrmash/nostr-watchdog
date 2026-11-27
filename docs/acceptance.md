@@ -28,7 +28,7 @@ If `conversation` reports an unavailable conversation index, leave the helper ru
 
 ## Cloudflare
 
-Use the [production Worker pair](deployment.md#cloudflare-production). Onboard once per project with a stable operation ID. On the phone, accept the SmartFlowSocial and NostrMash invitations where needed and open the conversations. Check Settings → Notifications → WhiteNoise on the iPhone and enable Allow Notifications and Lock Screen. Keep WhiteNoise open until the authenticated project diagnostics show recipient participation, canonical convergence, and `authority.recipientTokenReady: true`.
+Use the [production Worker pair](deployment.md#cloudflare-production). Onboard once per project with a stable operation ID. On the phone, open the SmartFlowSocial and NostrMash invitations in Chats and tap Accept. Check Settings → Notifications → WhiteNoise on the iPhone and enable Allow Notifications and Lock Screen. In WhiteNoise → Settings → Notifications, enable Local Notifications and Native Push. Keep WhiteNoise open until the authenticated project diagnostics show recipient participation, canonical convergence, and `authority.recipientTokenReady: true`.
 
 Send one test alert from the operational API for each state. Observe WhiteNoise in the foreground, then with another app in the foreground, then with the phone locked. Record the alert ID and observation before moving to the next state. For recovery, redeploy the private Worker with the same namespace, storage key, sender, and operational D1 binding. Verify the original group and operation evidence, then repeat a locked-screen alert after the rolling-hour limit allows a fourth send.
 
@@ -52,13 +52,13 @@ watchdog_request "$watchdog_url/v1/outbox/<alert-id>"
 
 ## What to record
 
-| Observation | Evidence |
-| --- | --- |
-| Group message relay acceptance | The authority or outbox recorded acceptance of the exact signed event ID. |
-| Independent message decryption | The recipient opened the alert in the named conversation. |
+| Observation                           | Evidence                                                                                      |
+| ------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Group message relay acceptance        | The authority or outbox recorded acceptance of the exact signed event ID.                     |
+| Independent message decryption        | The recipient opened the alert in the named conversation.                                     |
 | Notification trigger relay acceptance | Cloudflare recorded acceptance of the exact kind-1059 trigger. Native reports `unobservable`. |
-| Server processed the trigger | The notification server recorded processing for the test alert. |
-| Physical notification | The owner saw the notification on the test iPhone and recorded the time and phone state. |
+| Server processed the trigger          | The notification server recorded processing for the test alert.                               |
+| Physical notification                 | The owner saw the notification on the test iPhone and recorded the time and phone state.      |
 
 For each foreground, background, locked-screen and post-restart send, record the returned `alertId` (the delivery operation ID), phone state, send time, observation time, elapsed seconds and duplicate count. Record any missing notification and keep accepted event IDs when available. A phone notification is the physical acceptance criterion. Automated relay and decryption tests are supporting evidence.
 
