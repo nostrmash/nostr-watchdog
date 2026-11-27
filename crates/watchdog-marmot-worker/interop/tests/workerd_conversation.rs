@@ -425,28 +425,29 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
     assert_eq!(same["message"], after["message"]);
     assert_eq!(same["messageAttempts"].as_u64().unwrap(), 1, "{same}");
 
-    let commit = post(json!({
-        "op": "self_update",
-        "operationId": "rotate-1",
-        "groupIdHex": group_hex
-    }));
-    assert_eq!(commit["messagePhase"], "accepted_pending", "{commit}");
-    let confirmed = post(json!({
-        "op": "ack",
-        "operationId": "rotate-1",
-        "accepted": true
-    }));
-    assert_eq!(confirmed["messagePhase"], "relay_accepted", "{confirmed}");
-    let commit_message: TransportMessage =
-        serde_json::from_value(commit["message"].clone()).expect("commit");
     let group = group_from_hex(&group_hex);
-    let recipient_before = native.epoch(&group).expect("recipient epoch");
-    native
-        .ingest(commit_message)
-        .await
-        .expect("accept remote commit");
-    native.settle(&group).await.expect("apply remote commit");
-    assert!(native.epoch(&group).expect("new epoch") > recipient_before);
+    let baseline_capacity = capacity_sample(SENDER, "before-epoch-transitions");
+    for update in 1..=3 {
+        let operation = format!("rotate-{update}");
+        let commit = post(json!({
+            "op": "self_update",
+            "operationId": operation,
+            "groupIdHex": group_hex
+        }));
+        assert_eq!(commit["messagePhase"], "accepted_pending", "{commit}");
+        let confirmed = post(json!({
+            "op": "ack",
+            "operationId": operation,
+            "accepted": true
+        }));
+        assert_eq!(confirmed["messagePhase"], "relay_accepted", "{confirmed}");
+        let commit_message: TransportMessage =
+            serde_json::from_value(commit["message"].clone()).expect("commit");
+        let recipient_before = native.epoch(&group).expect("recipient epoch");
+        native.ingest(commit_message).await.expect("accept remote commit");
+        native.settle(&group).await.expect("apply remote commit");
+        assert!(native.epoch(&group).expect("new epoch") > recipient_before);
+    }
     let third = post(json!({
         "op": "send",
         "operationId": "alert-3",
@@ -486,6 +487,17 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
         chats.iter().any(|chat| chat == "via-relay"),
         "sync did not decrypt the relay reply: {synced}"
     );
+
+    for index in 0..3 {
+        let text = format!("capacity reply {index}");
+        let reply = native.send_chat(&group, &text).await.expect("recipient reply");
+        publish_value(&worker_dir, &relay_url, &persist, &serde_json::to_value(reply).unwrap());
+        let synced = post(json!({"op": "sync", "relays": [relay_url]}));
+        assert!(synced["chats"].as_array().unwrap().iter().any(|chat| chat == &text));
+    }
+    let after_epochs = capacity_sample(SENDER, "three-epochs-and-incoming-messages");
+    assert!(after_epochs["messagesPerGroup"]["used"].as_u64().unwrap()
+        > baseline_capacity["messagesPerGroup"]["used"].as_u64().unwrap());
 
     let prepared = post(json!({
         "op": "send",
@@ -775,19 +787,34 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
     // The Welcome and alert occupy two entries in the 64-entry active journal.
     // Fill the remaining slots with actual settled publications so the next
     // admission has to retire an operation in the same SQLite transaction.
+    capacity_sample(sender, "before-settled-messages");
+    let mut latencies_ms = Vec::with_capacity(62);
     for i in 0..62 {
+        let started = Instant::now();
         let response = post_to(
             sender,
             json!({
-                "op": "deliver", "operationId": format!("fill-{i}"), "text": "history fixture", "publish": true
+                "op": "deliver", "operationId": format!("fill-{i}"), "text": format!(
+                    "Fixture maintenance window {i:03}: service unavailable after synthetic checks. Visit the isolated status endpoint to inspect the deduplicated incident. Recorded probe failures: {}. This is a controlled qualification alert.", i + 2
+                ), "publish": true
             }),
         );
         assert_eq!(response["disposition"], "settled", "{response}");
+        latencies_ms.push(started.elapsed().as_millis());
     }
     assert_eq!(
         post_to(sender, json!({"op": "status"}))["historicalOperations"],
         0
     );
+    latencies_ms.sort_unstable();
+    let median = (latencies_ms[30] + latencies_ms[31]) / 2;
+    let p95 = latencies_ms[58];
+    let total: u128 = latencies_ms.iter().sum();
+    eprintln!("capacity sample: 62 settled sends took {total} ms, median {median} ms, p95 {p95} ms");
+    let full_journal = capacity_sample(sender, "at-journal-target");
+    assert_eq!(full_journal["targetJournal"]["used"], 64);
+    assert!(full_journal["warnings"].as_array().unwrap().iter().any(|item| item == "targetJournal"));
+
     let accepted_id = delivered["messageEventId"].clone();
     for fault in [
         "before_index_insert",
@@ -835,6 +862,18 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
         post_to(sender, json!({"op": "status"}))["historicalOperations"],
         1
     );
+    for index in 2..=8 {
+        let response = post_to(
+            sender,
+            json!({
+                "op": "deliver", "operationId": format!("retire-{index}"),
+                "text": format!("Fixture alert after settlement {index}"), "publish": true
+            }),
+        );
+        assert_eq!(response["disposition"], "settled", "{response}");
+    }
+    let after_retirement = capacity_sample(sender, "eight-operations-retired");
+    assert_eq!(after_retirement["retiredOperations"], 8);
 
     let removal = {
         let mut tombstone = record.clone();
@@ -967,6 +1006,9 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
     );
     assert_eq!(fresh["messagePhase"], "relay_accepted", "{fresh}");
     assert_ne!(fresh["messageEventId"], failed_event);
+    let restored = capacity_sample(sender, "retired-after-token-changes-and-restart");
+    assert!(restored["retiredOperations"].as_u64().unwrap() >= 8);
+    assert!(restored["historyRecordsPerBucket"]["used"].as_u64().unwrap() > 0);
 
     stop_child(&mut workerd);
     assert!(port_closed(standalone_port()));
@@ -1192,6 +1234,16 @@ async fn public_network_marmot_exchange_survives_restart() {
     );
     stop_child(&mut workerd);
     std::mem::forget(workerd_guard);
+}
+
+fn capacity_sample(sender: &str, stage: &str) -> Value {
+    let started = Instant::now();
+    let result = post_to(sender, json!({"op": "readiness"}));
+    let capacity = result["storageCapacity"].clone();
+    assert!(capacity["plainSnapshotBytes"]["used"].as_u64().unwrap() > 0);
+    assert!(capacity["sealedSnapshotBytes"]["used"].as_u64().unwrap() > 0);
+    eprintln!("capacity sample: {stage} ({} ms) {capacity}", started.elapsed().as_millis());
+    capacity
 }
 
 fn wait_for_recipient_tokens(sender: &str, relay: &str, count: u64) {
@@ -1871,6 +1923,9 @@ async fn scheduled_incident_reaches_official_recipient_via_both_workers() {
         ] {
             assert_eq!(diagnostics["authority"][field], true, "{project}: {diagnostics}");
         }
+        let capacity = &diagnostics["authority"]["storageCapacity"];
+        assert!(capacity["sealedSnapshotBytes"]["used"].as_u64().unwrap() > 0);
+        assert_eq!(capacity["groups"]["used"], 1);
     }
     query("UPDATE monitor_state SET last_check_at = 0");
     tick();

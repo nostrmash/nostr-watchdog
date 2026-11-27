@@ -36,6 +36,7 @@ pub(crate) const MAX_MLS_ENTRIES: usize = 20_000;
 pub(crate) const MAX_SNAPSHOTS_PER_GROUP: usize = 32;
 pub(crate) const MAX_INGRESS_MARKERS: usize = 4_096;
 pub(crate) const MAX_JOURNAL: usize = 64;
+pub(crate) const MAX_ACTIVE_JOURNAL: usize = MAX_JOURNAL * 2;
 pub(crate) const SNAPSHOT_TOMBSTONE_LIMIT: usize = 4_096;
 
 #[derive(Clone)]
@@ -754,7 +755,7 @@ impl State {
         }
         state.revision = saved.revision;
         state.binding = saved.binding;
-        if state.journal.len() > MAX_JOURNAL.saturating_mul(2) {
+        if state.journal.len() > MAX_ACTIVE_JOURNAL {
             return Err(PersistError::Capacity);
         }
         for group in state.groups.values() {

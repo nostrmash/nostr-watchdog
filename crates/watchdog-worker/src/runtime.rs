@@ -592,6 +592,7 @@ impl WorkerNotifier {
             "keyPackageReady": value["keyPackagePublished"] == true,
             "recipientTokenReady": value["recipientTokenCount"].as_u64().is_some_and(|count| count > 0),
             "storageIntegrity": value["storageIntegrity"] == "checked",
+            "storageCapacity": value["storageCapacity"],
         })
     }
 

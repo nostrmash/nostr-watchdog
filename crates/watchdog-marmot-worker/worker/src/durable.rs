@@ -7,7 +7,8 @@ use marmot_worker_runtime::inbox::{self, InboxChoice};
 use marmot_worker_runtime::publication::{self, revalidate_trigger_envelope};
 use marmot_worker_runtime::push::{capability_identity, notification_gift_wrap, CapabilityId, Platform, TokenRecord};
 use marmot_worker_runtime::{
-    stamp_tombstone, verify_tombstone, HistoryManifest, OperationTombstone, ServerRelays, Session, StoredWake,
+    CapacityReading, HistoryManifest, MAX_DOCUMENT_BYTES, OperationTombstone, ServerRelays, Session, StoredWake,
+    stamp_tombstone, verify_tombstone,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -21,6 +22,7 @@ use crate::relay;
 const ACCOUNT: &str = "self";
 const MAX_BODY: usize = 256 * 1024;
 const MAX_HISTORY_BUCKET: usize = 256;
+const MAX_SEALED_ACCOUNT_BYTES: usize = 1_500_000;
 const MAX_TRIGGER_ATTEMPTS: usize = 3;
 const MAX_PUSH_AGE_MS: u64 = 900_000;
 
@@ -734,7 +736,10 @@ async fn execute(
         session.storage().expire_overdue_pushes(marmot_worker_runtime::clock::unix_ms(), MAX_PUSH_AGE_MS)
             .map_err(|error| error.to_string())?;
     }
-    let body = dispatch(&session, project, allow_loopback, &command).await?;
+    let mut body = dispatch(&session, project, allow_loopback, &command).await?;
+    if command.op == "readiness" {
+        body["storageCapacity"] = storage_capacity(sql, &session, loaded.as_ref())?;
+    }
     if command.op == "readiness" || body["admission"] == "absent" {
         return Ok(Gate { response: body, publish: None, pull: None, hide: false, follow_push: false });
     }
@@ -776,6 +781,38 @@ async fn execute(
         hide: false,
         follow_push,
     })
+}
+
+fn storage_capacity(sql: &AccountSql, session: &Session, row: Option<&Row>) -> std::result::Result<Value, String> {
+    // A single query visits at most 256 compact buckets in operator diagnostics.
+    // Counts are advisory. Operation lookups still authenticate the bucket and record.
+    let buckets = sql.exec(
+        "SELECT COALESCE(MAX((SELECT COUNT(*) FROM json_each(entries))), 0) FROM marmot_history_bucket",
+        vec![],
+    ).map_err(|error| error.to_string())?;
+    let raw = buckets.raw().next().transpose().map_err(|error| error.to_string())?
+        .ok_or("history capacity unavailable")?;
+    let peak_bucket = usize::try_from(sql_i64(raw.first().ok_or("history capacity unavailable")?)?)
+        .map_err(|_| "history capacity is invalid")?;
+    let counts = session.storage().capacity_usage().map_err(|error| error.to_string())?;
+    let readings = counts.into_iter().chain([
+        ("plainSnapshotBytes", CapacityReading::new(session.committed_plain_bytes().unwrap_or(0), MAX_DOCUMENT_BYTES)),
+        ("sealedSnapshotBytes", CapacityReading::new(row.map_or(0, |row| row.sealed.len()), MAX_SEALED_ACCOUNT_BYTES)),
+        ("historyRecordsPerBucket", CapacityReading::new(peak_bucket, MAX_HISTORY_BUCKET)),
+    ]);
+    let mut output = serde_json::Map::new();
+    let mut warnings = Vec::new();
+    for (name, reading) in readings {
+        if reading.approaching_limit() {
+            warnings.push(name);
+        }
+        output.insert(name.into(), json!(reading));
+    }
+    output.insert("warnings".into(), json!(warnings));
+    output.insert("retiredOperations".into(), json!(
+        session.storage().retired_operation_count().map_err(|error| error.to_string())?
+    ));
+    Ok(Value::Object(output))
 }
 
 fn verify_configured_identity(session: &Session, command: &Command) -> std::result::Result<(), String> {
@@ -2699,7 +2736,7 @@ fn store(
     floors: &HashMap<String, u64>,
     sealed: &[u8],
 ) -> std::result::Result<(), String> {
-    if revision == 0 || sealed.len() > 1_500_000 {
+    if revision == 0 || sealed.len() > MAX_SEALED_ACCOUNT_BYTES {
         return Err("sealed account is not a valid committed revision".into());
     }
     let floors_json = serde_json::to_string(floors).map_err(|error| error.to_string())?;

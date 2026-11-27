@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 
 const port = Number(process.env.PORT || 0);
+const maxReplayPerFilter = 500;
 const events = new Map();
 const clients = new Set();
 const rejectKinds = new Set();
@@ -61,7 +62,7 @@ function backlog(filters) {
   for (const filter of filters.length ? filters : [{}]) {
     const found = storedEvents.filter((stored) => matches(filter, stored.event));
     found.sort(compareStored);
-    const limit = filter.limit ?? found.length;
+    const limit = Math.min(filter.limit ?? maxReplayPerFilter, maxReplayPerFilter);
     for (const stored of found.slice(0, limit)) {
       selected.set(stored.event.id, stored);
     }
@@ -263,8 +264,12 @@ class Client {
       this.send(JSON.stringify(["EOSE", sub]));
       return;
     }
-    if (type === "NEG-OPEN") {
-      remember({ type: "negentropy-open", connection: this.id });
+    if (type === "NEG-OPEN" && typeof rest[0] === "string") {
+      // A finite REQ can finish on this relay. The SDK needs a distinct reply
+      // when a client probes for the unsupported NIP-77 comparison protocol.
+      remember({ type: "negentropy-refused", connection: this.id });
+      this.send(JSON.stringify(["NEG-ERR", rest[0], "blocked: NIP-77 unavailable"]));
+      return;
     }
     if (type === "CLOSE" && typeof rest[0] === "string") {
       this.subs.delete(rest[0]);
@@ -293,6 +298,16 @@ function readBody(request) {
 let healthReady = false;
 const server = createServer(async (request, response) => {
   const url = new URL(request.url || "/", "http://127.0.0.1");
+  if (request.method === "GET" && url.pathname === "/" &&
+      request.headers.accept?.includes("application/nostr+json")) {
+    remember({ type: "nip11" });
+    response.setHeader("content-type", "application/nostr+json");
+    response.end(JSON.stringify({
+      supported_nips: [1, 11],
+      limitation: { max_limit: maxReplayPerFilter },
+    }));
+    return;
+  }
   if (request.method === "POST" && url.pathname === "/telegram") {
     const message = JSON.parse(await readBody(request));
     response.setHeader("content-type", "application/json");

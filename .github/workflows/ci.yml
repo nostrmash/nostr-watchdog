@@ -197,11 +197,25 @@ jobs:
           cargo build --locked --release --manifest-path crates/watchdog-marmot/Cargo.toml
           test -x crates/watchdog-marmot/target/release/watchdog-marmot
 
+      - name: Build the optimized watchdog executable
+        id: watchdog
+        run: cargo build --release --locked -p watchdog-native
+
       - name: Native executable incident, restart, and independent recipient
+        env:
+          WATCHDOG_TEST_BINARY: ${{ github.workspace }}/target/release/nostr-watchdog
         run: |
-          cargo build --release --locked -p watchdog-native
-          export WATCHDOG_TEST_BINARY="$PWD/target/release/nostr-watchdog"
-          cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml --test fixture_exchange -- --test-threads=1
+          for run in 1 2 3; do
+            echo "Optimized native exchange $run of 3"
+            cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
+              --test fixture_exchange -- --test-threads=1
+          done
+
+      - name: Exercise the owner's WhiteNoise acceptance script
+        if: ${{ !cancelled() && steps.watchdog.outcome == 'success' }}
+        env:
+          WATCHDOG_TEST_BINARY: ${{ github.workspace }}/target/release/nostr-watchdog
+        run: |
           cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
             --test fixture_exchange whitenoise_script_onboards_and_reuses_the_conversation -- --ignored --exact
 
@@ -243,7 +257,7 @@ jobs:
           worker-build --release crates/watchdog-worker -- --locked
           sh crates/watchdog-marmot-worker/worker/build-release.sh
           cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml \
-            -p marmot-worker-interop --test workerd_conversation -- --ignored --test-threads=1 --skip public
+            -p marmot-worker-interop --test workerd_conversation -- --ignored --test-threads=1 --skip public --show-output
 
   # SQLCipher WASM is a separate expected-failure research probe.
   # The public-network tests remain opt-in.

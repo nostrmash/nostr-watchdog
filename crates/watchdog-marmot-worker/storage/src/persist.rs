@@ -13,7 +13,7 @@ use crate::state::SavedState;
 pub const FORMAT_VERSION: u32 = 2;
 pub const KEY_VERSION: u8 = 1;
 const MAGIC: &[u8] = b"MWDO";
-const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 const HEADER: usize = 4 + 1 + 1 + 12;
 
 /// Binds a snapshot to one project Durable Object and one account.
@@ -87,6 +87,14 @@ pub fn open_sealed(
     binding: SealBinding<'_>,
     bytes: &[u8],
 ) -> Result<Document, PersistError> {
+    open_sealed_with_size(key, binding, bytes).map(|(document, _)| document)
+}
+
+pub fn open_sealed_with_size(
+    key: &[u8; 32],
+    binding: SealBinding<'_>,
+    bytes: &[u8],
+) -> Result<(Document, usize), PersistError> {
     if bytes.len() < HEADER + 16 || bytes.len() > HEADER + MAX_DOCUMENT_BYTES + 16 {
         return Err(PersistError::Corrupt);
     }
@@ -120,21 +128,21 @@ pub fn open_sealed(
             },
         )
         .map_err(|_| PersistError::Corrupt)?);
-    let document: Document = if version == 1 {
-        serde_json::from_slice(&decoded)
+    let plain = if version == 1 {
+        decoded
     } else {
-        let plain = Zeroizing::new(miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
+        Zeroizing::new(miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
             &decoded, MAX_DOCUMENT_BYTES,
-        ).map_err(|_| PersistError::Corrupt)?);
-        serde_json::from_slice(&plain)
-    }.map_err(|_| PersistError::Corrupt)?;
+        ).map_err(|_| PersistError::Corrupt)?)
+    };
+    let document: Document = serde_json::from_slice(&plain).map_err(|_| PersistError::Corrupt)?;
     if document.format != version {
         return Err(PersistError::Unsupported {
             found: document.format,
             latest: FORMAT_VERSION,
         });
     }
-    Ok(document)
+    Ok((document, plain.len()))
 }
 
 fn associated_data(binding: SealBinding<'_>, version: u32) -> Result<Vec<u8>, PersistError> {

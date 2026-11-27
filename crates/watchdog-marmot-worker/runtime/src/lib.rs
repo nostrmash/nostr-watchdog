@@ -10,7 +10,7 @@ pub mod publication;
 pub mod push;
 
 pub use mdk_do_storage::{
-    HistoryManifest,
+    CapacityReading, HistoryManifest, MAX_DOCUMENT_BYTES,
     verify_tombstone, stamp_tombstone, OperationTombstone, ServerRelays, StoredWake,
 };
 
@@ -71,6 +71,7 @@ pub struct Session {
     storage: MemoryMdkStorage,
     keys: Keys,
     proof: Arc<ProofSigner>,
+    committed_plain_bytes: Option<usize>,
 }
 
 impl Session {
@@ -97,7 +98,7 @@ impl Session {
         account_hex: &str,
         sealed: &[u8],
     ) -> Result<Self, SessionError> {
-        let document = mdk_do_storage::open_sealed(
+        let (document, plain_bytes) = mdk_do_storage::open_sealed_with_size(
             storage_key,
             SealBinding {
                 project_id,
@@ -110,11 +111,16 @@ impl Session {
         let secret = storage
             .account_secret()
             .ok_or_else(|| SessionError::Storage("account secret is missing".into()))?;
-        let session = Self::bind(storage, secret)?;
+        let mut session = Self::bind(storage, secret)?;
+        session.committed_plain_bytes = Some(plain_bytes);
         if session.public_key_hex() != account_hex.to_ascii_lowercase() {
             return Err(SessionError::IdentityMismatch);
         }
         Ok(session)
+    }
+
+    pub fn committed_plain_bytes(&self) -> Option<usize> {
+        self.committed_plain_bytes
     }
 
     pub fn seal(&self, storage_key: &[u8; 32], project_id: &str) -> Result<Vec<u8>, SessionError> {
@@ -1439,6 +1445,7 @@ impl Session {
             storage,
             keys,
             proof: Arc::new(proof),
+            committed_plain_bytes: None,
         })
     }
 

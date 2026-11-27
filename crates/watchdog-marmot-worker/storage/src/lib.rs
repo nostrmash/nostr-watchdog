@@ -46,7 +46,7 @@ use openmls_traits::storage::CURRENT_VERSION;
 use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 use zeroize::Zeroizing;
 
-pub use persist::{Document, PersistError, SealBinding, open_sealed, seal};
+pub use persist::{Document, MAX_DOCUMENT_BYTES, PersistError, SealBinding, open_sealed, open_sealed_with_size, seal};
 
 use state::{
     Forgotten, GroupImage, SnapKey, State, export_mls, import_mls, is_key_package_storage_key,
@@ -81,6 +81,30 @@ struct Shared {
 #[derive(Clone)]
 pub struct MemoryMdkStorage {
     shared: Arc<Shared>,
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct CapacityReading {
+    pub used: usize,
+    pub limit: usize,
+}
+
+impl CapacityReading {
+    pub fn new(used: usize, limit: usize) -> Self {
+        Self { used, limit }
+    }
+
+    pub fn approaching_limit(self) -> bool {
+        self.used.saturating_mul(5) >= self.limit.saturating_mul(4)
+    }
+}
+
+fn peak_per_group<'a>(groups: impl Iterator<Item = &'a GroupId>) -> usize {
+    let mut counts = HashMap::new();
+    for group in groups {
+        *counts.entry(group).or_insert(0) += 1;
+    }
+    counts.into_values().max().unwrap_or(0)
 }
 
 impl MemoryMdkStorage {
@@ -118,6 +142,36 @@ impl MemoryMdkStorage {
             format: persist::FORMAT_VERSION,
             state: bag.state.save(&mls)?,
         })
+    }
+
+    pub fn capacity_usage(&self) -> StorageResult<[(&'static str, CapacityReading); 7]> {
+        let bag = self.lock()?;
+        let state = &bag.state;
+        let mls = self.shared.mls.values.read()
+            .map_err(|_| StorageError::Backend("openmls storage lock failed".into()))?;
+        let reading = CapacityReading::new;
+        Ok([
+            ("groups", reading(state.groups.len(), state::MAX_GROUPS)),
+            ("messagesPerGroup", reading(
+                peak_per_group(state.messages.iter().map(|item| &item.group_id)),
+                state::MAX_MESSAGES_PER_GROUP,
+            )),
+            ("mlsEntries", reading(mls.len(), state::MAX_MLS_ENTRIES)),
+            ("snapshotsPerGroup", reading(
+                peak_per_group(state.snapshots.keys().map(|key| &key.group)),
+                state::MAX_SNAPSHOTS_PER_GROUP,
+            )),
+            ("checkpointsPerGroup", reading(
+                peak_per_group(state.checkpoints.keys().map(|key| &key.group)),
+                state::MAX_SNAPSHOTS_PER_GROUP,
+            )),
+            ("activeJournal", reading(state.journal.len(), state::MAX_ACTIVE_JOURNAL)),
+            ("targetJournal", reading(state.journal.len(), state::MAX_JOURNAL)),
+        ])
+    }
+
+    pub fn retired_operation_count(&self) -> StorageResult<u64> {
+        Ok(self.lock()?.state.tombstone_high_water)
     }
 
     pub fn account_secret(&self) -> Option<[u8; 32]> {
@@ -1964,7 +2018,7 @@ fn trim_journal(state: &mut state::State, protected: &str) -> StorageResult<()> 
             index += 1;
         }
     }
-    if state.journal.len() > state::MAX_JOURNAL.saturating_mul(2) {
+    if state.journal.len() > state::MAX_ACTIVE_JOURNAL {
         return Err(StorageError::Backend(
             "publication journal exceeded its bound".into(),
         ));

@@ -45,6 +45,57 @@ The active journal retains unresolved operations. Compaction excludes the curren
 
 A legacy snapshot without authenticated history metadata requires recovery or deliberate re-onboarding. Preserve the full state and its history together. A complete point-in-time rollback can restore mutually consistent old records and snapshots. Treat a known restore as an operator recovery event and follow the fencing procedure in [deployment.md](deployment.md). The service has no independent witness for a complete rollback.
 
+### Cloudflare account capacity
+
+The authenticated Marmot readiness response reports `authority.storageCapacity` with live used and limit counters. It lists a warning once a counter reaches 80% of its limit. The sealed account supplies the committed plaintext byte count after authenticated decompression. The sealed row length includes a 34-byte envelope and authentication tag for format 2. The largest SQL history bucket is reported separately from the authenticated retired-operation high-water count. The capacity query leaves state unchanged.
+
+| Limit | Current bound |
+| --- | ---: |
+| Accounts per Durable Object | 1 |
+| Groups per account | 64 |
+| Message records per group | 4,096 |
+| OpenMLS provider entries per account | 20,000 |
+| Snapshots and checkpoints per group | 32 each |
+| Serialized plaintext account document | 8,388,608 bytes |
+| Sealed account row, application cap | 1,500,000 bytes |
+| Active publication journal | 64 target, 128 hard cap |
+| Authenticated historical index | 256 buckets, 256 records per bucket |
+| Rolling ingress markers | 4,096 |
+
+The platform documents an 8 MB maximum row or BLOB and a 10 GB limit per paid SQLite Durable Object. The Watchdog applies the smaller account cap above. A full bucket can stop retirement before the total historical index reaches 65,536 entries. [Cloudflare Durable Object limits](https://developers.cloudflare.com/durable-objects/platform/limits/)
+
+The controlled local workerd scenarios used generated identities and loopback relays. The operations used actual MDK encryption, SQLite persistence and relay acknowledgement. The autonomous test filled the journal with 62 settled alerts, changed and revoked recipient tokens, interrupted and retried retirement, restarted workerd and recovered the original accepted event ID. A separate conversation verified three consecutive MLS epoch transitions, subsequent alert decryption, and incoming recipient messages. The scheduled incident scenario also went through both Worker bundles and actual D1.
+
+| Sample | Plain / sealed bytes | Message records | MLS entries | Snapshots / checkpoints | Journal / retired / peak history bucket |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before the 62 sends | 181,703 / 52,073 | 5 | 13 | 1 / 0 | 2 / 0 / 0 |
+| Journal target reached | 3,118,049 / 997,747 | 129 | 13 | 1 / 0 | 64 / 0 / 0 |
+| After retirement, token changes and restart | 3,126,332 / 997,205 | 139 | 13 | 1 / 0 | 64 / 1 / 1 |
+| Before epoch changes in second conversation | 214,329 / 55,443 | 12 | 14 | 1 / 0 | 7 / 0 / 0 |
+| After three epoch changes and incoming traffic | 597,897 / 116,785 | 24 | 14 | 4 / 3 | 11 / 0 / 0 |
+
+The 62 sends took 21.6 seconds total, with a 355 ms median and a 569 ms p95. Readiness probes took 14–40 ms. The highest sampled local workerd process RSS was 374 MiB. This process includes the local runtime and its isolates. Remote isolate memory, CPU and network latency require staging measurements.
+
+At the journal target, the sealed account had 502,253 bytes of room and the plaintext account had 5,270,559 bytes of room. The sealed account was the closest hard limit at roughly 66% used. The journal is designed to hold steady at its target when publications settle. Larger messages, multiple push destinations and retained epoch snapshots can exhaust sealed bytes sooner. A stalled journal or a busy epoch history can change which bound is reached first. The 4,096 message-record bound counts storage records, including protocol activity. A mixed workload's safe lifetime depends on the traffic and state composition.
+
+The storage-only regression exercised 4,100 historical identities and prevented re-encryption when the associated index was missing. Separately, hashing sequential synthetic IDs `alt_capacity_fixture_00001` and onward into the real 256 SHA-256 partitions produced a largest bucket of 29 at 4,100 entries, the first 80% warning at 43,127 entries, and a first rejected insertion at 55,314. This sample only measures partition distribution. It uses no cryptographic messages or SQLite transactions and gives no guaranteed count before a bucket fills.
+
+MDK already prunes old replay anchors and state checkpoints within its canonical convergence policy. Its group message retention features do not authorize clearing raw transport replay state or retired application identities. The Worker retains its existing maintenance policy and authenticated history. Capacity warnings and the documented rotation procedure preserve original operation IDs and avoid re-encrypting old outbox rows. [Operator procedure](deployment.md#capacity-and-staging-measurements)
+
+### Current dependency review
+
+All three lockfiles passed `cargo audit` and `cargo deny` (advisories, dependency bans, licenses and sources). The repository remains Unlicensed. Existing upstream licenses and attribution remain in place.
+
+| Warning | Path and disposition |
+| --- | --- |
+| `chrono` 0.4.45 | Unmaintained runtime dependency in the three workspaces. No patched version is listed. The existing advisory-specific policy remains in place. |
+| `heapless` 0.8.0 | Nine unsoundness warnings. The locked graph reaches it through `nostr → faster-hex` on Linux and WASM. All production builds enable `faster-hex/alloc`, which compiles out its heapless code. The affected APIs have no production caller in this graph. `faster-hex` 0.10 requires heapless 0.8 for its non-alloc implementation. |
+| `instant` 0.1.13 | Unmaintained WASM-only dependency of a second upstream Nostr crate in the helper lockfile. It is absent from the Linux native graph and both deployed WASM workspaces. |
+| `proc-macro-error2` 2.0.1 | Unmaintained build-time macro support through the upstream libcrux/Hax path. It has no request-time call site. |
+| `zbus_names`, `zvariant`, `zvariant_derive` | Unmaintained. The first two are Linux helper native dependencies through MDK's Secret Service keyring and also support host macros. The derive crate only runs at build time. The Workers have no D-Bus dependency. |
+
+The compatibility crate re-exports the upstream FFI and forwards the selected bundled SQLCipher and OpenSSL features. It declares no separate `links` value and runs no build script. The locked native graphs have one SQLite link provider, upstream `libsqlite3-sys` 0.40.0. The optimized helper fixture verifies the linked SQLCipher 4.20.0 and SQLite 3.54.1. The Cloudflare release has no SQLCipher linkage. The Cloudflare workspace uses the adapter for native MDK interoperability tests. No new suppression or dependency upgrade was required for the warnings above.
+
 ### Executed tests
 
 - Native controlled test used the actual watchdog and helper, a real HTTP monitor, an independent official MarmotApp recipient, and isolated relays and state. The recipient decrypted the outage and the recovery alert in the same conversation. The original outbox kept its event ID and `relay_accepted` message state. Native push evidence remained `unobservable`. The configured critical fallback reached an isolated Telegram-compatible endpoint. Representative helper crash boundaries were exercised. The final optimized native suite passed in 175.20 seconds, including a direct check of SQLCipher 4.20.0 and SQLite 3.54.1.
