@@ -13,6 +13,7 @@
 // The encoding above is adapted from MIT-licensed marmot-app. The rest of
 // this crate is Unlicense, the same license as the watchdog.
 
+use serde::{Deserialize, Serialize};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chacha20poly1305::aead::{Aead, Payload};
@@ -90,6 +91,22 @@ pub struct TokenRecord {
     pub encrypted_token: Vec<u8>,
     pub owner_sig: String,
     pub removed: bool,
+}
+
+/// Authenticated wake identity. A token fingerprint is not sufficient:
+/// the same fingerprint can exist on another server, leaf, or record version.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityId {
+    pub group_id_hex: String,
+    pub member_id_hex: String,
+    pub leaf_index: u32,
+    pub platform: String,
+    pub server_pubkey_hex: String,
+    pub token_fingerprint: String,
+    pub owner_ts: i64,
+    pub record_digest: String,
+    pub ciphertext_sha256: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -438,6 +455,24 @@ fn same_slot(left: &TokenRecord, right: &TokenRecord) -> bool {
 fn record_digest(record: &TokenRecord) -> Result<String, String> {
     let bytes = signed_record_bytes(record)?;
     Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+/// Identity of one encrypted capability, using the pinned record bytes.
+pub fn capability_identity(record: &TokenRecord) -> Result<CapabilityId, String> {
+    if record.removed {
+        return Err("a removed token is not a wake capability".into());
+    }
+    Ok(CapabilityId {
+        group_id_hex: record.group_id_hex.clone(),
+        member_id_hex: record.member_id_hex.clone(),
+        leaf_index: record.leaf_index,
+        platform: record.platform.name().to_owned(),
+        server_pubkey_hex: record.server_pubkey_hex.clone(),
+        token_fingerprint: record.token_fingerprint.clone(),
+        owner_ts: record.owner_ts,
+        record_digest: record_digest(record)?,
+        ciphertext_sha256: hex::encode(Sha256::digest(&record.encrypted_token)),
+    })
 }
 
 fn signed_record_bytes(record: &TokenRecord) -> Result<Vec<u8>, String> {

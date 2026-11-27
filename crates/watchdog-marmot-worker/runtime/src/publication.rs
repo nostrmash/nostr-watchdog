@@ -6,6 +6,8 @@
 
 use serde_json::Value;
 
+use crate::push::CapabilityId;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameClass {
     Unrelated,
@@ -165,19 +167,19 @@ pub struct TriggerJob {
     pub event: Value,
     pub relays: Vec<String>,
     pub server: String,
-    pub fingerprints: Vec<String>,
+    pub capabilities: Vec<CapabilityId>,
 }
 
-/// Split a stored trigger envelope into jobs that are still authorized.
+/// Split a stored trigger envelope into jobs whose exact capabilities remain authorized.
 ///
-/// Accepted jobs are not returned. A job whose fingerprints are no longer all
-/// authorized is marked `retired` and its signed event bytes are left unchanged.
+/// Accepted jobs are not returned. A job that does not match the current
+/// authenticated record is marked `retired`. Its signed event bytes stay as stored.
 pub fn revalidate_trigger_envelope(
     envelope: &Value,
-    authorized: &std::collections::HashSet<String>,
-) -> (Value, Vec<TriggerJob>, Vec<String>) {
+    authorized: &[CapabilityId],
+) -> (Value, Vec<TriggerJob>, Vec<CapabilityId>) {
     let Some(items) = envelope.as_array() else {
-        return (envelope.clone(), Vec::new(), Vec::new());
+        return (envelope.clone(), Vec::new(), authorized.to_vec());
     };
     let mut updated = Vec::new();
     let mut jobs = Vec::new();
@@ -188,16 +190,7 @@ pub fn revalidate_trigger_envelope(
             .get("phase")
             .and_then(|value| value.as_str())
             .unwrap_or("prepared");
-        let fingerprints = item
-            .get("fingerprints")
-            .and_then(|value| value.as_array())
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|value| value.as_str().map(str::to_owned))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let capabilities = item_capabilities(&item);
         let event = item.get("event").cloned().unwrap_or(Value::Null);
         let relays = item
             .get("relays")
@@ -218,25 +211,26 @@ pub fn revalidate_trigger_envelope(
             updated.push(item);
             continue;
         }
-        let still_authorized = !fingerprints.is_empty()
-            && fingerprints
-                .iter()
-                .all(|fingerprint| authorized.contains(fingerprint));
+        let still_authorized = !capabilities.is_empty()
+            && capabilities.iter().all(|capability| {
+                capability.server_pubkey_hex == server && authorized.iter().any(|item| item == capability)
+            });
         if still_authorized {
             if !relays.is_empty() {
                 jobs.push(TriggerJob {
                     event,
                     relays,
                     server,
-                    fingerprints,
+                    capabilities,
                 });
             }
             updated.push(item);
             continue;
         }
-        for fingerprint in &fingerprints {
-            if authorized.contains(fingerprint) {
-                uncovered.push(fingerprint.clone());
+        for capability in &capabilities {
+            if authorized.iter().any(|item| item == capability) && !uncovered.iter().any(|item| item == capability)
+            {
+                uncovered.push(capability.clone());
             }
         }
         if let Some(map) = item.as_object_mut() {
@@ -244,7 +238,25 @@ pub fn revalidate_trigger_envelope(
         }
         updated.push(item);
     }
+    for capability in authorized {
+        if !capability_covered(&updated, capability) && !uncovered.iter().any(|item| item == capability) {
+            uncovered.push(capability.clone());
+        }
+    }
     (Value::Array(updated), jobs, uncovered)
+}
+
+fn item_capabilities(item: &Value) -> Vec<CapabilityId> {
+    item.get("capabilities")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn capability_covered(items: &[Value], capability: &CapabilityId) -> bool {
+    items.iter().any(|item| {
+        let phase = item.get("phase").and_then(|value| value.as_str()).unwrap_or("");
+        phase != "retired" && item_capabilities(item).iter().any(|item| item == capability)
+    })
 }
 
 pub fn split_count(len: usize, batch: usize) -> usize {
@@ -258,6 +270,7 @@ pub fn split_count(len: usize, batch: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::push::CapabilityId;
     use serde_json::json;
 
     fn ok(id: &str, accepted: bool) -> Value {
@@ -380,18 +393,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_revoked_batch_is_retired_without_editing_the_event() {
-        let event = json!({"id": "trigger-1", "sig": "signed"});
-        let envelope = json!([{
+    fn capability(server: &str, leaf: u32, owner_ts: i64, digest: &str) -> CapabilityId {
+        CapabilityId {
+            group_id_hex: "aa".into(),
+            member_id_hex: "bb".into(),
+            leaf_index: leaf,
+            platform: "fcm".into(),
+            server_pubkey_hex: server.into(),
+            token_fingerprint: "sha256:abcdef0123456789abcdef01".into(),
+            owner_ts,
+            record_digest: digest.into(),
+            ciphertext_sha256: digest.into(),
+        }
+    }
+
+    fn envelope_for(event: Value, server: &str, capability: &CapabilityId, phase: &str) -> Value {
+        json!([{
             "event": event,
             "relays": ["wss://inbox.example"],
-            "server": "server",
-            "fingerprints": ["sha256:aaa"],
-            "phase": "unobservable"
-        }]);
-        let (updated, jobs, uncovered) =
-            revalidate_trigger_envelope(&envelope, &std::collections::HashSet::new());
+            "server": server,
+            "capabilities": [capability],
+            "phase": phase
+        }])
+    }
+
+    #[test]
+    fn a_revoked_record_is_retired_without_editing_the_event() {
+        let event = json!({"id": "trigger-1", "sig": "signed"});
+        let stored = capability("server", 1, 10, "digest-old");
+        let envelope = envelope_for(event.clone(), "server", &stored, "unobservable");
+        let (updated, jobs, uncovered) = revalidate_trigger_envelope(&envelope, &[]);
         assert!(jobs.is_empty());
         assert!(uncovered.is_empty());
         assert_eq!(updated[0]["phase"], "retired");
@@ -399,30 +430,109 @@ mod tests {
     }
 
     #[test]
-    fn an_accepted_trigger_is_not_sent_again() {
+    fn the_same_fingerprint_on_another_server_leaf_or_group_does_not_authorize() {
+        let event = json!({"id": "trigger-1", "sig": "signed"});
+        let stored = capability("server-a", 1, 10, "digest-old");
+        let envelope = envelope_for(event.clone(), "server-a", &stored, "prepared");
+        let other_server = capability("server-b", 1, 10, "digest-old");
+        let (updated, jobs, uncovered) = revalidate_trigger_envelope(&envelope, &[other_server.clone()]);
+        assert!(jobs.is_empty());
+        assert_eq!(updated[0]["phase"], "retired");
+        assert_eq!(updated[0]["event"], event);
+        assert_eq!(uncovered, vec![other_server]);
+
+        let other_leaf = capability("server-a", 2, 10, "digest-old");
+        let (updated, jobs, _) = revalidate_trigger_envelope(&envelope, &[other_leaf]);
+        assert!(jobs.is_empty());
+        assert_eq!(updated[0]["phase"], "retired");
+
+        let mut other_group = capability("server-a", 1, 10, "digest-old");
+        other_group.group_id_hex = "cc".into();
+        let (updated, jobs, _) = revalidate_trigger_envelope(&envelope, &[other_group]);
+        assert!(jobs.is_empty());
+        assert_eq!(updated[0]["event"], event);
+    }
+
+    #[test]
+    fn a_replacement_record_does_not_authorize_the_older_ciphertext() {
+        let event = json!({"id": "trigger-1", "sig": "signed"});
+        let stored = capability("server", 1, 10, "digest-old");
+        let replacement = capability("server", 1, 11, "digest-new");
+        let envelope = envelope_for(event.clone(), "server", &stored, "prepared");
+        let (updated, jobs, uncovered) = revalidate_trigger_envelope(&envelope, &[replacement.clone()]);
+        assert!(jobs.is_empty());
+        assert_eq!(updated[0]["phase"], "retired");
+        assert_eq!(updated[0]["event"]["sig"], "signed");
+        assert_eq!(uncovered, vec![replacement]);
+    }
+
+    #[test]
+    fn a_partial_batch_retires_the_signed_event_and_returns_the_valid_record() {
+        let event = json!({"id": "trigger-1", "sig": "signed"});
+        let kept = capability("server", 1, 10, "digest-a");
+        let mut dropped = capability("server", 2, 10, "digest-b");
+        dropped.token_fingerprint = "sha256:00112233445566778899aabb".into();
+        let envelope = json!([{
+            "event": event,
+            "relays": ["wss://inbox.example"],
+            "server": "server",
+            "capabilities": [kept, dropped],
+            "phase": "unobservable"
+        }]);
+        let (updated, jobs, uncovered) = revalidate_trigger_envelope(&envelope, &[kept.clone()]);
+        assert!(jobs.is_empty());
+        assert_eq!(updated[0]["phase"], "retired");
+        assert_eq!(updated[0]["event"]["id"], "trigger-1");
+        assert_eq!(uncovered, vec![kept]);
+    }
+
+    #[test]
+    fn overlapping_fingerprints_stay_distinct_and_accepted_triggers_stay_accepted() {
+        let first = capability("server", 1, 10, "digest-a");
+        let mut second = capability("server", 2, 10, "digest-b");
+        second.token_fingerprint = first.token_fingerprint.clone();
         let envelope = json!([
             {
-                "event": {"id": "kept"},
+                "event": {"id": "kept", "sig": "one"},
                 "relays": ["wss://a.example"],
-                "server": "s",
-                "fingerprints": ["sha256:aaa"],
+                "server": "server",
+                "capabilities": [first],
                 "phase": "relay_accepted"
             },
             {
-                "event": {"id": "retry"},
+                "event": {"id": "retry", "sig": "two"},
                 "relays": ["wss://b.example"],
-                "server": "s",
-                "fingerprints": ["sha256:bbb"],
+                "server": "server",
+                "capabilities": [second],
                 "phase": "unobservable"
             }
         ]);
-        let mut authorized = std::collections::HashSet::new();
-        authorized.insert("sha256:aaa".into());
-        authorized.insert("sha256:bbb".into());
-        let (_updated, jobs, uncovered) = revalidate_trigger_envelope(&envelope, &authorized);
+        let (updated, jobs, uncovered) =
+            revalidate_trigger_envelope(&envelope, &[first.clone(), second.clone()]);
         assert!(uncovered.is_empty());
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].event["id"], "retry");
+        assert_eq!(jobs[0].capabilities, vec![second]);
+        assert_eq!(updated[0]["phase"], "relay_accepted");
+        assert_eq!(updated[0]["event"]["sig"], "one");
+    }
+
+    #[test]
+    fn a_fingerprint_list_without_a_record_identity_is_not_authorization() {
+        let event = json!({"id": "trigger-1", "sig": "signed"});
+        let envelope = json!([{
+            "event": event,
+            "relays": ["wss://inbox.example"],
+            "server": "server",
+            "fingerprints": ["sha256:abcdef0123456789abcdef01"],
+            "phase": "prepared"
+        }]);
+        let current = capability("server", 1, 10, "digest");
+        let (updated, jobs, uncovered) = revalidate_trigger_envelope(&envelope, &[current.clone()]);
+        assert!(jobs.is_empty());
+        assert_eq!(updated[0]["phase"], "retired");
+        assert_eq!(updated[0]["event"]["sig"], "signed");
+        assert_eq!(uncovered, vec![current]);
     }
 
     #[test]

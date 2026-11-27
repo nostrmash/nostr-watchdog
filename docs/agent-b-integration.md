@@ -58,6 +58,18 @@ Agent C sends one of these operations. It does not sequence `send`, `ack`, `stag
 
 Requires a prior `onboard` with the recipient public key and the account relays. The object pulls kind 30443 authored by that recipient, checks the event signature and the author, and rejects a package for any other account. It creates the group once, persists every Welcome, and publishes each Welcome to the relays stored with that group. A bound group id is not onboarding completion. The response `onboarding` object distinguishes `accountInitialized`, `recipientDiscovered`, `groupAdmitted`, `groupPersisted`, `welcomePrepared`, `welcomePublicationPending`, `welcomeAccepted`, `recipientParticipationObserved`, and `conversationReady`. `completion` is `not_started`, `pending`, `unknown`, or `ready`. `conversationReady` requires both a correlated Welcome acceptance and an observed recipient leaf. A later `establish`, including one with a different operation id, republishes the original Welcome bytes and does not create a replacement group. If the group row exists and the Welcome row does not, the response is `onboarding_completion_unknown` and no new group is created. Production callers cannot replace the publication relays. `relays` on the command is ignored unless `MARMOT_ALLOW_LOOPBACK=1`.
 
+`deliver` does not onboard, establish, sync, or maintain. Agent C schedules those separately. `deliver` and `reconcile` encrypt or reuse one stored operation and, when `publish` is true, publish that operation. They do not advance onboarding or group catch-up.
+
+Schedule, owned by Agent C:
+
+| Operation | When |
+| --- | --- |
+| `onboard` | once per project object |
+| `establish` | until `welcomeAccepted` is true. Repeat the same conversation; do not mint a second group |
+| `sync` | every 30 seconds while any cursor is not caught up, otherwise every 2 minutes |
+| `maintain` | every 6 hours |
+| `deliver` / `reconcile` | per alert. Wait `retryAfterMs` while `disposition` is `reconcile` |
+
 ### deliver
 
 ```json
@@ -71,9 +83,11 @@ Requires a prior `onboard` with the recipient public key and the account relays.
 
 The object encrypts to the bound group, persists that ciphertext, persists a publication attempt, then publishes the application event. An `OK` counts only when its event id is the prepared event id. An unrelated `OK` does not end the exchange and does not accept the event. The recorded relay is the relay that sent the matching `OK`, which may be a later destination. A timeout or disconnect is `completion_unknown` for the message and `unobservable` for a trigger. It is not `rejected`. An explicit `OK false` for the prepared id is `rejected`. Acceptance is monotonic.
 
-Only after the message is `relay_accepted` does the object select current tokens and publish kind 1059 triggers. Each trigger is its own publication record: server, event id, token fingerprints, destinations, attempt, and outcome. One accepted trigger does not mark the operation accepted while another trigger is unresolved. The aggregate `pushPhase` stays open, `disposition` stays `reconcile`, and `triggers` lists the sanitized per-trigger evidence. `evidence` becomes `partial_push` when more than one trigger exists. Already accepted triggers are not sent again.
+Only after the message is `relay_accepted` does the object select current tokens and publish kind 1059 triggers. Each trigger is its own publication record: server, event id, capability identities, destinations, attempt, and outcome. One accepted trigger does not mark the operation accepted while another trigger is unresolved. The aggregate `pushPhase` stays open, `disposition` stays `reconcile`, and `triggers` plus `targets` list the sanitized evidence. `evidence` becomes `partial_push` when more than one trigger exists. Already accepted triggers are not sent again.
 
-Before a stored trigger is retried, the object rechecks current membership and token records. A batch that no longer matches authorized fingerprints is retired. Its signed bytes are not edited. Still-authorized devices that the retired batch no longer covers receive a new, separately identified trigger. The application message is not encrypted again.
+A prepared capability is authorized only when the current record matches all of: group id, recipient account, MLS leaf, platform, notification-server public key, token fingerprint, owner timestamp, canonical record digest, and the SHA-256 of the encrypted token. The digest is the pinned marmot-app signed-record bytes. A fingerprint is not enough. The same fingerprint on another server, group, leaf, or replacement record does not authorize the stored event. A batch that fails that check is retired. Its signed event bytes are not edited and the application message is not encrypted again. Devices in that batch that still match a current record get a new trigger with a new event id. An accepted trigger stays accepted.
+
+An authorized server with no usable inbox stays in `targets`. While discovery is unfinished the call returns that server in the internal discover set and does not publish. After a negative kind 10050 cache, or after rediscovery still finds no inbox, the object records `gap:<server>` with reason `push_unobservable`. That gap is not a publication attempt and does not increment `pushPublicationAttempts`. A retryable timeout stays `disposition: reconcile` with `error: publication_timeout`. A terminal gap plus an accepted sibling settles, keeps `evidence: partial_push`, and sets `error: push_unobservable` and `pushRetryable: false`. A revoked target becomes `token_unavailable`. It is not reported as notified. A later stale acknowledgement does not downgrade `relay_accepted`.
 
 Tokens come from kind 447, 448, and 449 gossip. The sender's own tokens are excluded. A leaf is authorized only when it is this account's own leaf or an engine-reported leaf that is still a member and has not been removed. A second device of the recipient is another leaf of the same account, not a third account. A device that has never produced an engine-visible leaf is not authorized. Triggers go to a validated token hint or to relays taken from that server's signed kind 10050 event. Discovery relays are not publication destinations. A missing token sets `pushState` to `token_unavailable` and leaves the message accepted. `pushRetryable` is false for `push_unobservable` and true for a timeout, a disconnect, a prepared trigger, or a token wait. `error` is `publication_timeout` or `push_unobservable` when one of those reasons was recorded, and null otherwise.
 
@@ -83,7 +97,7 @@ Tokens come from kind 447, 448, and 449 gossip. The sender's own tokens are excl
 { "op": "reconcile", "operationId": "alert-1", "publish": true }
 ```
 
-Loads the stored operation and returns the projection of the persisted row after any publication in this call. It does not create a ciphertext. If the message is still unpublished it publishes the stored event. If the message is accepted and a trigger is still unresolved, it revalidates that trigger and publishes only the unresolved authorized batches. A retired operation returns its historical phases, `"resubmittable": false`, and `"pushRetryable": false`. A missing or corrupt deduplication index fails the call instead of encrypting again.
+Loads the stored operation and returns the projection of the persisted row after any publication in this call. It does not create a ciphertext. If the message is still unpublished it publishes the stored event. If the message is accepted and a trigger is still unresolved, it revalidates that trigger and publishes only the unresolved authorized batches. A retired operation returns its historical phases, `"resubmittable": false`, and `"pushRetryable": false`. An operation id with no journal row and no authoritative tombstone fails with `retired operation has no record`. That error is not a settled admission. `deliver` of a new id is the admission path. `reconcile` is not. A status or readiness read does not reconcile and does not increment publication counters. A missing or corrupt historical record fails the call instead of encrypting again. `pushPublicationAttempts` counts network publication attempts. `pushAttempts` counts recorded outcomes and is not a substitute for that count.
 
 ### readiness
 
@@ -99,7 +113,7 @@ Returns `account`, `pubkey`, `groupBound`, `recipient`, `recipientTokenCount`, `
 { "op": "sync" }
 ```
 
-Pulls three bounded pages from the account relays: kind 445 group events, kinds 447/448/449 token gossip, and kind 1059 addressed to this account. Each stream has a stored cursor. A full page walks older events. A short page advances `since` and marks that stream caught up. A failed event does not mark the stream caught up. The response includes `chats` and `pages`. Production callers cannot substitute relays.
+Pulls three bounded pages of 20 from the account relays: kind 445 group events, kinds 447/448/449 token gossip, and kind 1059 addressed to this account. Each stream has a stored cursor. A short completed page advances `since` to the newest timestamp and marks that stream caught up. A full page whose oldest timestamp is shared by the whole page keeps `until` on that timestamp and does not skip the rest of the second. A full page that also contains newer timestamps sets `until` to one second before the oldest timestamp. A failed ingest, a missing event id, or a missing EOSE leaves `caughtUp` false and sets `until` to the oldest timestamp in the page. The cursor moves only after the ingest and the account commit. Production callers cannot substitute relays. A synchronization gap is not reported as catch-up.
 
 ### maintain
 
@@ -107,7 +121,7 @@ Pulls three bounded pages from the account relays: kind 445 group events, kinds 
 { "op": "maintain", "publish": true }
 ```
 
-Republishes the stored kind 30443 key package. A failed publication does not mint a replacement package. Agent C should schedule this on a slow interval. It is the operational substitute for MDK's disabled periodic maintenance. It does not rotate the sender identity and it does not create a group.
+Republishes the stored kind 30443 key package. A failed publication does not mint a replacement package. Agent C should call it every 6 hours. It is the operational substitute for MDK's disabled periodic maintenance. It does not rotate the sender identity and it does not create a group.
 
 ### Outcome
 
@@ -138,6 +152,7 @@ The body is JSON. `operationId` is the stable operation id. `projectId` on `onbo
 
 ```json
 {
+  "op": "onboard",
   "projectId": "smartflowsocial",
   "operationId": "onboarding-operation-id",
   "replace": false,
@@ -259,7 +274,9 @@ The in-memory provider implements the synchronous storage trait. `backend()` ret
 
 Journal rows live in the snapshot. The same operation id cannot change group, kind, payload hash, or ciphertext. Phase updates of the same ciphertext are allowed. The journal keeps 64 full rows. A row leaves the journal only when the message is `relay_accepted` or `rejected` and the push phase is not `unknown`, `not_attempted`, `prepared`, `pending`, or `publication_attempted`. An accepted message with an unresolved push stays in the journal. The removed row becomes a tombstone bound to the project, sender, recipient, group, operation type, operation id, payload hash, and the terminal phases. The tombstone has no ciphertext. A retry of that id returns the historical result and does not encrypt again.
 
-Tombstones are written to SQLite table `marmot_operation` (`alert_id`, `record`) before the account snapshot is sealed. After that install, the sealed snapshot stores the high-water count and an empty tombstone list. Opening the account loads the SQL rows and refuses the request when fewer rows are present than the high-water mark, or when a record does not parse. Pending journal rows are not discarded by that index. The sealed snapshot still refuses to grow past 4096 tombstones if the index is not installed. `historicalCapacityRemaining` exposes that remaining snapshot capacity, or null when the index is active. This is not a claim of unbounded Durable Object storage. The platform database quota is the remaining limit.
+Ordinary admission does not read `marmot_operation`. It looks up one `alert_id`. A commit writes only tombstones created or changed in that attempt. Each row carries `project_id`, `account_hex`, `bound_revision`, `bound_writer`, and an authenticator over those fields plus the payload hash, kind, group, and message phase. A row is authoritative only when the authenticator matches and its revision is older than the account row, or equal to it with the same writer. A higher revision is an uncommitted attempt and does not retire the operation. A losing compare-and-swap deletes the rows that attempt inserted. A crash between the insert and the account write leaves those rows non-authoritative because the stored account revision is still the previous one, and the journal row is still in the previous snapshot. The snapshot omits the tombstone list once incremental history is enabled. The row count is not the integrity check. A corrupt authenticator, a mismatched project or account, or a same-revision writer conflict fails closed. The sealed snapshot still refuses to grow past 4096 tombstones if incremental history is not enabled. `historicalOperations` is `SELECT COUNT(*)` and is a report, not a proof. `historicalCapacityRemaining` is null once incremental history is enabled.
+
+Measured admission of 40 new operations, with 100, 1,000, and 10,000 historical ids kept outside the provider: 404 µs, 410 µs, and 1,085 µs. A full scan of the 10,000-id list was 8,413 µs. The Durable Object lookup is `SELECT record FROM marmot_operation WHERE alert_id = ?`. This is not a claim about Cloudflare CPU time.
 
 ## Relay transport
 
@@ -269,7 +286,7 @@ Destinations are 1 to 4 URLs. `wss` on port 443 is allowed for a public host. Cr
 
 The logical token slot is group, member identity, MLS leaf index, platform, and notification-server public key. The token fingerprint is `sha256:` plus 24 hex characters and is not part of the slot. A newer owner timestamp replaces the slot. An equal timestamp uses the canonical record digest. An owner proof is required before a record is admitted. A removed record is a tombstone and blocks an older record from returning. The sender stores the encrypted wake capability, not the raw device token.
 
-Leaf identity is this account's `own_leaf_index` plus leaves reported by the engine on `MessageReceived.sender_leaf_index` and cleared by `GroupMemberLeavesRemoved`. The public engine roster is account-level and does not include every device leaf. A leaf that the engine has not reported is not authorized. Positions are not inferred from the number of accounts.
+Leaf identity is this account's `own_leaf_index` plus leaves reported by the engine on `MessageReceived.sender_leaf_index` and cleared by `GroupMemberLeavesRemoved`. An observed leaf whose epoch is older than the current group epoch is not authorized. A newer epoch that binds the same leaf index to a different member marks the previous binding removed. The public engine roster is account-level and does not include every device leaf. A leaf that the engine has not reported at the current epoch is not authorized. Positions are not inferred from the number of accounts. Pending MDK application events are dropped in the same snapshot that records a successful ingest. A failed account commit restores the previous snapshot, including those events.
 
 Kind 10050 is fetched from the account relays when a hint is missing, invalid, stale, or a previous publication to it was unresolved. The selected event must verify, must be authored by the notification server, and must be the newest such event, with the event id breaking a timestamp tie. Relays come only from that event's `relay` or `r` tags after the destination policy. Positive and negative results are cached for one hour. An empty or invalid result is a negative cache entry, not permission to publish to the discovery relays.
 
@@ -281,39 +298,130 @@ From `crates/watchdog-marmot-worker`:
 CARGO_INCREMENTAL=0 cargo test -p mdk-do-storage -p marmot-worker-runtime -p marmot-worker-interop --offline --lib --test two_member -- --test-threads=8
 ```
 
-Result: storage 5 passed, runtime 24 passed, `two_member` 4 passed. That includes exact OK correlation, multi-trigger partial failure, trigger revalidation, key-package reuse, more than 4096 indexed tombstones, kind 10050 selection, and the two-device leaf test.
+Result: storage 7 passed, runtime 29 passed, `two_member` 4 passed. That includes full capability-identity revalidation, terminal and retryable push gaps, sync cursors that do not skip a shared timestamp, historical revision authority, and admission that stayed under 1.1 ms at 10,000 external identities.
 
 ```text
 cd worker && sh build-release.sh
 ```
 
-This run completed `worker-build --release` and printed `wasm_bytes=10803268` and `gzip_bytes=4146727`. The script still treats the known staging-directory move failure as success only when `index_bg.wasm`, `index.js`, and `build/worker/shim.mjs` are present and the wasm header is `00 61 73 6d`. Nothing was deployed.
+This run deleted `build/` first, then `worker-build --release` exited 1 with `Resource deadlock avoided` (os error 11) after writing the bundle. The script accepted it only because `index_bg.wasm`, `index.js`, and `build/worker/shim.mjs` were non-empty, the shim loads `index.js`, and the wasm header was `00 61 73 6d`. It printed `wasm_bytes=10841293` and `gzip_bytes=4170699`. Nothing was deployed.
 
 ```text
 CARGO_INCREMENTAL=0 cargo test -p marmot-worker-interop --offline --test workerd_conversation -- --ignored --nocapture --test-threads=1
 ```
 
-Both ignored tests passed against that bundle. The conversation test reported `wasm_bytes=10803268`, `database_bytes=397312`, `send_ms=37`, `revision=46`. It also rejected an unrelated positive OK as `completion_unknown` and accepted a matching OK that arrived after that unrelated frame. The autonomous test stopped Welcome publication after the group was stored, restarted workerd, recovered the same group and the original Welcome, then continued through token gossip, one alert, gift-wrap acceptance, revocation, an unobservable hint, restart, reconcile without a new ciphertext, and a second alert.
+Both local ignored tests passed against that bundle in 13.20s. The conversation test reported `wasm_bytes=10841293`, `database_bytes=397312`, `send_ms=37`, `revision=46`. It also rejected an unrelated positive OK as `completion_unknown` and accepted a matching OK that arrived after that unrelated frame. The autonomous test stopped Welcome publication after the group was stored, restarted workerd, recovered the same group and the original Welcome, then continued through token gossip, one alert, gift-wrap acceptance, revocation, an unobservable hint, restart, reconcile without a new ciphertext, and a second alert.
 
 ```text
-CARGO_INCREMENTAL=0 cargo test -p marmot-worker-interop --offline --test public_relay -- --ignored --nocapture --test-threads=1
+CARGO_INCREMENTAL=0 cargo test -p marmot-worker-interop --offline --test workerd_conversation -- --ignored --nocapture --test-threads=1 public_network_marmot_exchange_survives_restart
 ```
 
-`wss://relay.eu.whitenoise.chat` accepted one disposable kind 0 and one disposable kind 10050 from a key generated for that test. Kind 1 is rejected by that relay (`kind not allowed`). This was not the Durable Object, not a project identity, and not a phone notification.
+Passed in 28.50s. The optimized Durable Object, a generated sender, and an independent official MDK recipient used `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`. The recipient's kind 30443 was accepted by the EU relay. The object discovered it, created the group, and published the Welcome. The recipient joined, published a kind 445 chat, and the object's sync decrypted `public-reply`. Signed token gossip was ingested. `deliver` of `public-alert` returned `messagePhase: relay_accepted` and `pushPhase: relay_accepted`, with the trigger's relay `wss://relay.eu.whitenoise.chat`. After a workerd restart, `reconcile` returned the same `messageEventId` `495477dcbf3e1457959d01a8260a94544b803d76fc7e3c894d801f6e2c75d152`. A second deliver, `public-alert-2`, was accepted with a different message id. No production identity and no personal WhiteNoise account was used. Phone delivery was not observed.
+
+`public_relay.rs` remains a connectivity probe. It publishes disposable kind 0 and kind 10050 events through Node.js and is not this result.
 
 Cloudflare's published Worker limits remain 64 MiB uncompressed, 1 second startup, 128 MB isolate memory, and 10 ms CPU on Free or 30 seconds by default on Paid. Those platform figures were not measured. The 37 ms figure is local workerd wall time.
 
+## Frozen result
+
+`POST https://marmot-sender.internal/marmot?sender=<projectId>` with `Authorization: Bearer <MARMOT_OPERATOR_TOKEN>`.
+
+Settled one-trigger deliver:
+
+```json
+{
+  "projectId": "public-probe",
+  "operationId": "public-alert",
+  "messageState": "relay_accepted",
+  "messagePhase": "relay_accepted",
+  "messageEventId": "495477dcbf3e1457959d01a8260a94544b803d76fc7e3c894d801f6e2c75d152",
+  "pushState": "relay_accepted",
+  "pushPhase": "relay_accepted",
+  "pushEventId": "87adeee3b371cdc2a4027ab5f060c1ac76aa3e22359b2a2dcac74f42b27eb205",
+  "evidence": "prepared_message",
+  "error": null,
+  "disposition": "settled",
+  "settled": true,
+  "retryAfterMs": 0,
+  "pushRetryable": false,
+  "phoneDelivery": false,
+  "pushPublicationAttempts": 1,
+  "pushAttempts": 1,
+  "messageAttempts": 1,
+  "messagePublicationAttempts": 1
+}
+```
+
+`messageEventId` is the transport message id. `pushEventId` is the Nostr event id. `evidence` stays `prepared_message` for a single accepted trigger. `partial_push` is used when more than one trigger is present.
+
+One accepted trigger and one retryable timeout:
+
+```json
+{
+  "disposition": "reconcile",
+  "settled": false,
+  "evidence": "partial_push",
+  "error": "publication_timeout",
+  "pushRetryable": true,
+  "retryAfterMs": 15000,
+  "pushState": "unobservable"
+}
+```
+
+One accepted trigger and one terminal missing inbox:
+
+```json
+{
+  "disposition": "settled",
+  "settled": true,
+  "evidence": "partial_push",
+  "error": "push_unobservable",
+  "pushRetryable": false,
+  "retryAfterMs": 0,
+  "targets": [
+    {"eventId": "trigger-a", "phase": "relay_accepted", "retryable": false},
+    {"eventId": "gap:server-b", "server": "server-b", "phase": "unobservable", "reason": "push_unobservable", "retryable": false}
+  ]
+}
+```
+
+Use `pushPublicationAttempts` for network attempts. Preparing a trigger does not increment it. A readiness or status read does not increment it and is not a reconcile.
+
 ## Deployment
 
-Keep this object as a separately bound Worker. The wasm build, the loopback flag, and the two secrets are isolated from Agent C's entrypoint. Agent C calls `POST /marmot?sender=<projectId>`. Do not link this crate into the main Worker bundle unless a later build proves that combination stays inside the size and startup limits. This repository does not deploy the object.
+Keep this object as a separately bound Worker. The wasm build, the loopback flag, and the storage key are isolated from Agent C's entrypoint. The supported binding is a cross-script Durable Object namespace. The object name is the project id. There is no public route between the two Workers.
+
+Marmot script `marmot-sender-probe`, class export `MarmotSender`, migration tag `v1` with `new_sqlite_classes = ["MarmotSender"]`. On the watchdog Worker:
+
+```toml
+[[durable_objects.bindings]]
+name = "MARMOT_SENDER"
+class_name = "MarmotSender"
+script_name = "marmot-sender-probe"
+```
+
+`MARMOT_OPERATOR_TOKEN` is present on both Workers. `MARMOT_STORAGE_KEY` is present only on `marmot-sender-probe`. The watchdog calls the namespace stub for `sender=<projectId>` and posts the JSON body to `/marmot`. A private service binding is the fallback if the runtime cannot bind another script's Durable Object class:
+
+```toml
+[[services]]
+binding = "MARMOT"
+service = "marmot-sender-probe"
+```
+
+That binding can serve `https://marmot-sender.internal/marmot?sender=<projectId>` without a public hostname. The namespace binding is the one to use. It addresses the object directly.
+
+Deploy `marmot-sender-probe` and its migration before adding the watchdog binding. Roll back by removing the watchdog binding first. Do not delete the Marmot class while the watchdog still names it, and do not point a new account at an existing object id or reuse another account's storage key. This repository did not deploy either Worker. The local proof is one workerd process for the Marmot Worker. A combined two-Worker workerd was not run.
 
 ## Remaining limits
 
 - The public engine trait exposes members without leaf indexes. A device is authorized only after the engine reports its leaf on a group event, or when the leaf is this account's own leaf. A silent extra device stays unauthorized until it speaks. That is fail-closed, not a guessed roster.
 - `maintain` republishes one stored key package. It does not rotate the sender and it does not create a group. MDK periodic maintenance stays disabled so a send does not emit a surprise commit.
-- Restoring a backup of the snapshot and the epoch-floor column together still rolls the group back. If that state cannot be shown to be current, re-onboard instead of replaying it. The operation index must be restored with the snapshot. A snapshot whose high-water mark exceeds the index fails closed.
+- Restoring a backup of the snapshot and the epoch-floor column together still rolls the group back. If that state cannot be shown to be current, re-onboard instead of replaying it. Historical rows are authoritative only when their authenticator and revision agree with that snapshot. A row count is not that proof.
 - The relay client rejects credentials, unsafe ports, non-public hosts, `.example`, `.local`, and `.internal`. It does not answer NIP-42 AUTH. Loopback is unreachable unless `MARMOT_ALLOW_LOOPBACK=1`.
 - The loopback fixture does not check Nostr signatures. Key-package admission and kind 10050 selection verify signatures in the object. Phone delivery is not claimed from a relay OK.
 - `worker-build --release` can fail while moving its staging directory (`Resource deadlock avoided`, os error 11) after the wasm and shim already exist. `worker/build-release.sh` deletes `build/`, runs the release build, requires the wasm magic and `index.js`, copies the shim when the move failed, and exits nonzero when any required file is missing or empty. It does not deploy.
-- Historical operation identity is durable in `marmot_operation` after the index is installed. The 4096 snapshot cap remains the fail-closed limit when that index is absent. Durable Object storage quota is still a platform limit.
+- Historical identity is one SQL row per operation, written with the account commit and ignored until that commit wins. The 4096 snapshot cap remains only when incremental history is off. Durable Object storage quota is still a platform limit.
+- A device that has not spoken since the current epoch stays unauthorized. Group catch-up does not treat a missing or partial page as success.
+- The public-network run used official MDK for the recipient and this crate's pinned token-gossip encoder. `marmot-app` and a Transponder server were not in this workspace. The EU relay accepted the gift wrap. That is not phone delivery.
+- `deliver` does not onboard or sync. Agent C must schedule `onboard`, `establish`, `sync`, and `maintain`. The integrated adapter that posts `op: send` without a group id is not this contract.
 - An upstream storage-contract harness is not available at this revision. SQLCipher remains unusable for `wasm32-unknown-unknown`; the Durable Object does not depend on it.
