@@ -22,6 +22,8 @@ pub struct Journal {
     root: PathBuf,
     records: HashMap<String, Value>,
     wal_lines: u64,
+    /// A failed reload after a partial write. No later call may treat memory as durable.
+    poisoned: bool,
 }
 
 impl Journal {
@@ -29,6 +31,7 @@ impl Journal {
         fs::create_dir_all(root).map_err(|error| format!("boundary_write: {error}"))?;
         restrict_dir(root)?;
         ensure_not_symlink(root)?;
+        ensure_owned(root)?;
         let mut records = HashMap::new();
         load_files(root, &mut records)?;
         load_consumed(root, &mut records)?;
@@ -43,7 +46,12 @@ impl Journal {
             root: root.to_path_buf(),
             records,
             wal_lines,
+            poisoned: false,
         })
+    }
+
+    pub fn poisoned(&self) -> bool {
+        self.poisoned
     }
 
     pub fn get(&self, id: &str) -> Option<Value> {
@@ -52,7 +60,10 @@ impl Journal {
 
     #[cfg(test)]
     pub fn visible(&self, id: &str) -> Option<Value> {
-        self.records.get(id).filter(|value| !is_released(value)).cloned()
+        self.records
+            .get(id)
+            .filter(|value| !is_released(value))
+            .cloned()
     }
 
     pub fn disposition(&self, id: &str) -> Option<String> {
@@ -64,8 +75,7 @@ impl Journal {
     }
 
     pub fn record(&mut self, id: &str, value: &Value) -> Result<(), String> {
-        self.records.insert(id.to_string(), value.clone());
-        self.persist(id, value)
+        self.commit(id, value)
     }
 
     /// Keeps the operation id and forgets only an attempt MDK did not admit.
@@ -79,19 +89,37 @@ impl Journal {
             object.insert("operation_id".to_string(), json!(id));
             object.insert("disposition".to_string(), json!("released"));
         }
+        self.commit(id, &value)
+    }
+
+    /// Memory changes only after the write-ahead line and the per-id file are durable.
+    /// A failed write reloads disk, or refuses every later mutation if reload fails.
+    fn commit(&mut self, id: &str, value: &Value) -> Result<(), String> {
+        if self.poisoned {
+            return Err("boundary_durable_failure".to_string());
+        }
+        if let Err(error) = self.persist(id, value) {
+            match Self::open(&self.root) {
+                Ok(fresh) => {
+                    self.records = fresh.records;
+                    self.wal_lines = fresh.wal_lines;
+                }
+                Err(_) => self.poisoned = true,
+            }
+            return Err(error);
+        }
         self.records.insert(id.to_string(), value.clone());
-        self.persist(id, &value)
+        Ok(())
     }
 
     fn persist(&mut self, id: &str, value: &Value) -> Result<(), String> {
-        append_log(
-            &self.root,
-            &json!({"operation_id": id, "record": value}),
-        )?;
+        append_log(&self.root, &json!({"operation_id": id, "record": value}))?;
         self.wal_lines = self.wal_lines.saturating_add(1);
         atomic_json(&self.root.join(format!("{id}.json")), value)?;
         let log = self.root.join(LOG_NAME);
-        let length = fs::metadata(&log).map(|metadata| metadata.len()).unwrap_or(0);
+        let length = fs::metadata(&log)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         if self.should_checkpoint(length) {
             self.checkpoint()?;
         }
@@ -100,7 +128,8 @@ impl Journal {
 
     fn should_checkpoint(&self, wal_len: u64) -> bool {
         wal_len > CHECKPOINT_AT
-            || (self.wal_lines >= 8 && self.wal_lines > (self.records.len() as u64).saturating_mul(2))
+            || (self.wal_lines >= 8
+                && self.wal_lines > (self.records.len() as u64).saturating_mul(2))
     }
 
     /// Drops superseded log lines. Per-id files already hold the latest record.
@@ -258,6 +287,24 @@ fn ensure_not_symlink(path: &Path) -> Result<(), String> {
     }
 }
 
+fn ensure_owned(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        extern "C" {
+            fn getuid() -> u32;
+        }
+        let uid = fs::symlink_metadata(path)
+            .map_err(|error| format!("boundary_read: {error}"))?
+            .uid();
+        if uid != unsafe { getuid() } {
+            return Err("boundary_owner".to_string());
+        }
+    }
+    let _ = path;
+    Ok(())
+}
+
 fn load_files(root: &Path, records: &mut HashMap<String, Value>) -> Result<(), String> {
     let entries = fs::read_dir(root).map_err(|error| format!("boundary_read: {error}"))?;
     for entry in entries.flatten() {
@@ -267,8 +314,8 @@ fn load_files(root: &Path, records: &mut HashMap<String, Value>) -> Result<(), S
             continue;
         }
         let bytes = fs::read(entry.path()).map_err(|error| format!("boundary_read: {error}"))?;
-        let value = serde_json::from_slice::<Value>(&bytes)
-            .map_err(|_| "boundary_corrupt".to_string())?;
+        let value =
+            serde_json::from_slice::<Value>(&bytes).map_err(|_| "boundary_corrupt".to_string())?;
         let id = name.trim_end_matches(".json");
         records.insert(id.to_string(), value);
     }
@@ -281,8 +328,8 @@ fn load_consumed(root: &Path, records: &mut HashMap<String, Value>) -> Result<()
         return Ok(());
     }
     let bytes = fs::read(&path).map_err(|error| format!("boundary_read: {error}"))?;
-    let value = serde_json::from_slice::<Value>(&bytes)
-        .map_err(|_| "boundary_corrupt".to_string())?;
+    let value =
+        serde_json::from_slice::<Value>(&bytes).map_err(|_| "boundary_corrupt".to_string())?;
     let Some(object) = value.as_object() else {
         return Ok(());
     };
@@ -341,7 +388,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("watchdog-journal-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let first = json!({"operation_id": "alt_one", "disposition": "published", "message_ids": ["m1"]});
+        let first =
+            json!({"operation_id": "alt_one", "disposition": "published", "message_ids": ["m1"]});
         let mut journal = Journal::open(&root).unwrap();
         journal.record("alt_one", &first).unwrap();
         let mut raw = fs::read(root.join(LOG_NAME)).unwrap();
@@ -415,7 +463,10 @@ mod tests {
         assert!(!status.success());
         let mut journal = Journal::open(&root).unwrap();
         assert!(journal.visible("alt_a").is_some());
-        assert!(journal.get("alt_b").is_none(), "a torn append became an operation");
+        assert!(
+            journal.get("alt_b").is_none(),
+            "a torn append became an operation"
+        );
         journal
             .record(
                 "alt_c",
@@ -425,7 +476,11 @@ mod tests {
         drop(journal);
         let reopened = Journal::open(&root).unwrap();
         assert_eq!(
-            reopened.visible("alt_a").unwrap().get("payload_sha256").and_then(Value::as_str),
+            reopened
+                .visible("alt_a")
+                .unwrap()
+                .get("payload_sha256")
+                .and_then(Value::as_str),
             Some("a")
         );
         assert!(reopened.visible("alt_c").is_some());
@@ -474,10 +529,8 @@ mod tests {
             super::checkpoint_child();
             return;
         }
-        let root = std::env::temp_dir().join(format!(
-            "watchdog-journal-chk-kill-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("watchdog-journal-chk-kill-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("a_checkpoint_killed_before_rename_keeps_the_previous_log")
@@ -499,7 +552,8 @@ mod tests {
 
     #[test]
     fn releasing_an_unadmitted_attempt_keeps_the_operation_id() {
-        let root = std::env::temp_dir().join(format!("watchdog-journal-release-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("watchdog-journal-release-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut journal = Journal::open(&root).unwrap();
         journal
@@ -514,8 +568,82 @@ mod tests {
         assert!(reopened.visible("alt_two").is_none());
         assert_eq!(reopened.disposition("alt_two").as_deref(), Some("released"));
         assert_eq!(
-            reopened.get("alt_two").unwrap().get("payload_sha256").and_then(Value::as_str),
+            reopened
+                .get("alt_two")
+                .unwrap()
+                .get("payload_sha256")
+                .and_then(Value::as_str),
             Some("same")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_append_does_not_keep_an_unpersisted_record() {
+        let root =
+            std::env::temp_dir().join(format!("watchdog-journal-fail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut journal = Journal::open(&root).unwrap();
+        journal
+            .record(
+                "alt_ok",
+                &json!({"operation_id": "alt_ok", "disposition": "published"}),
+            )
+            .unwrap();
+        let log = root.join(LOG_NAME);
+        let mut permissions = fs::metadata(&log).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&log, permissions).unwrap();
+        let failed = journal.record(
+            "alt_new",
+            &json!({"operation_id": "alt_new", "disposition": "submitting"}),
+        );
+        assert!(failed.is_err(), "a read-only log accepted a record");
+        assert!(journal.get("alt_new").is_none());
+        assert!(journal.get("alt_ok").is_some());
+        let mut permissions = fs::metadata(&log).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&log, permissions).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ordinary_writes_do_not_rewrite_thousands_of_historical_records() {
+        let root =
+            std::env::temp_dir().join(format!("watchdog-journal-volume-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut journal = Journal::open(&root).unwrap();
+        let started = std::time::Instant::now();
+        for index in 0..1_500 {
+            journal
+                .record(
+                    &format!("op_{index}"),
+                    &json!({
+                        "operation_id": format!("op_{index}"),
+                        "disposition": "published",
+                        "payload_sha256": format!("{index:08x}")
+                    }),
+                )
+                .unwrap();
+        }
+        let write_ms = started.elapsed().as_millis();
+        let log_len = fs::metadata(root.join(LOG_NAME)).unwrap().len();
+        assert!(
+            log_len < CHECKPOINT_AT + 8_192,
+            "the log rewrote history ({log_len} bytes after {write_ms} ms)"
+        );
+        let reopen_started = std::time::Instant::now();
+        let reopened = Journal::open(&root).unwrap();
+        let reopen_ms = reopen_started.elapsed().as_millis();
+        assert!(reopened.get("op_0").is_some());
+        assert!(reopened.get("op_1499").is_some());
+        assert_eq!(reopened.records.len(), 1_500);
+        eprintln!(
+            "journal volume: 1500 writes in {write_ms} ms, log {log_len} bytes, reopen {reopen_ms} ms"
+        );
+        assert!(
+            reopen_ms < 10_000,
+            "startup replay of 1500 records took {reopen_ms} ms"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -536,8 +664,10 @@ fn torn_child() {
         .append(true)
         .open(root.join(LOG_NAME))
         .unwrap();
-    file.write_all(br#"{"operation_id":"alt_b","record":{"disposition":"submitting","payload_sha256":"b""#)
-        .unwrap();
+    file.write_all(
+        br#"{"operation_id":"alt_b","record":{"disposition":"submitting","payload_sha256":"b""#,
+    )
+    .unwrap();
     file.write_all(&[0xff, 0xfe]).unwrap();
     file.sync_all().unwrap();
     fs::write(root.join("torn"), b"1").unwrap();

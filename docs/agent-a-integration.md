@@ -10,12 +10,13 @@ Every alert operation is bound to:
 
 - project id
 - stable operation id, normally the alert id (`alt_...`)
+- operation type `application_message`
 - sender public key
-- authorized recipient
+- authorized recipient public key
 - group id
 - payload hash
 
-An existing operation id cannot be reused for a different project, sender, recipient, group, or payload. The helper returns `alert_identity_mismatch`. An identity change does not move an already submitted alert into a new conversation. A new rotation needs a new onboarding operation id. It does not rewrite old alert journals.
+An existing operation id cannot be reused for a different project, sender, recipient, group, payload, or operation type. The helper returns `alert_identity_mismatch`. A released attempt keeps the same binding. A retry with another recipient fails even when the group and payload match. A legacy journal row that has no `recipient` is not attached to the recipient configured now. Historical alerts do not move to a replacement conversation after re-onboarding. A new rotation needs a new onboarding operation id. It does not rewrite old alert journals.
 
 Onboarding is a separate operation, idempotent within the project and bound to the recipient and the `replace` flag.
 
@@ -46,7 +47,7 @@ Newline-delimited JSON on the Unix socket. Requests that carry `nsec` must not b
 | `reconcile` | Same as `hold`. Poll again without encrypting again. |
 | `hold` | Retry later without encrypting again. |
 | `terminal` | Stop automatic retries for this phase. |
-| `retry_after_ms` | Recommended next reconciliation delay. Advisory until Agent C's scheduler reads it. |
+| `retry_after_ms` | Relative delay in milliseconds. It is not an absolute timestamp. |
 | `operation_age_ms` | Age since the first observation of this operation. |
 | `message_attempts`, `unknown_attempts`, `token_wait_attempts`, `unobservable_attempts` | Authoritative cumulative counters for those phases. Unknown counters stay absent or null. |
 | `started_at_ms` | First observation of this operation. |
@@ -54,9 +55,24 @@ Newline-delimited JSON on the Unix socket. Requests that carry `nsec` must not b
 | `account`, `group`, `payload_sha256` | Binding checked on every retry. |
 | `operation` | Nested view for Agent C. Its `disposition` is `settled` or `reconcile`. It does not replace the journal `disposition`. |
 
-`operation` fields, camelCase: `projectId`, `operationId`, `messageState`, `messageEventId`, `pushState`, `pushEventId` (null), `evidence` (`not_observed`, `token_availability_only`, or `helper_journal`), `error` (null), `disposition` (`settled` or `reconcile`), `retryAtMs` (the recommended delay while reconciling, otherwise null), `phoneDelivery` (false), `startedAtMs`, `messageAttempts`, `unknownAttempts`, `tokenWaitAttempts`, `unobservableAttempts`, `pushPublicationAttempts` (null).
+`operation` is the object Agent C should copy. `retryAtMs` and `retryAfterMs` are the same relative delay. Convert it with `now + retryAfterMs`. Do not treat either name as an absolute clock time. `startedAtMs` is frozen on the first observation. `updatedAtMs` is the time of this response.
 
-Copy those counters and `retryAtMs`. Do not invent push publication attempts from token availability, from a missing warning, or by restating `unobservable`. Scheduler attempts stay Agent C's counter. A later timeout or push failure does not downgrade a `relay_accepted` application message or clear its message ids.
+| `operation` field | Authoritative meaning |
+| --- | --- |
+| `messageSubmissions` | `1` after MDK has a local-send record (`relay_accepted`, `accepted_pending`, or `rejected`). Null while admission is still unknown. This is not `message_attempts`. |
+| `messagePublications` | Null. This revision does not count external publication attempts. |
+| `messageReconciles` | Cumulative `accepted_pending` observations, and only then. Null on other message states. |
+| `ambiguousReconciles` | Cumulative `completion_unknown` or `prepared` observations. Null on other message states. |
+| `tokenWaits` | Cumulative missing-token observations while push is `token_unavailable`. Null otherwise. |
+| `pushPublications` | Null. No correlated push attempt is visible. |
+| `pushReconciles` | Cumulative observations that settled push as `unobservable`. Null otherwise. |
+| `retryAfterMs` | Relative delay while `disposition` is `reconcile`. Null when `settled`. |
+
+The older flat fields `message_attempts`, `unknown_attempts`, `token_wait_attempts`, and `unobservable_attempts` are the same raw counters `advance_phase` keeps. `message_attempts` counts pending-publication reconciliations. It is not a submission count. Leave a null nested field null in `auth_*`. Do not substitute zero.
+
+`disposition: settled` with push `unobservable` means this MDK revision will not produce a correlated push result. That is not a temporary network failure and it should not be polled like one. `token_unavailable` stays `reconcile` until two waits or the 24 hour age limit, and the application message stays `relay_accepted`.
+
+Copy `retryAfterMs` and the nested counters. Do not invent push publication attempts from token availability, from a missing warning, or by restating `unobservable`. Scheduler attempts stay Agent C's `attempt_count`. A later timeout or push failure does not downgrade a `relay_accepted` application message or clear its message ids.
 
 A push-reconciliation response is not a new application-message submission. `message_attempts` stays unchanged when only push state is settled. Agent C may keep a separate scheduler-attempt counter.
 
@@ -118,7 +134,7 @@ Safe re-onboarding for Agent C:
 - `replace: true` adopts the group id MDK already considers reusable. It is not permission to create a second conversation after an ambiguous outcome.
 - An unready conversation index stays `RetryIndex`. Creation waits until two empty lookups and at least 15 seconds.
 - Missing or replaced MDK storage, a signed-out device, or a missing saved group fails closed. Do not import over a cached account whose storage is gone.
-- Already submitted alert ids stay bound to their original account, group, and payload.
+- Already submitted alert ids stay bound to their original account, recipient, group, and payload.
 
 `readiness` returns `recipient_devices`, `active_recipient_tokens`, and the identity step. It does not return token bytes or fingerprints.
 
@@ -130,7 +146,11 @@ Safe re-onboarding for Agent C:
 
 Checkpoint runs when the log exceeds 64 KiB, or when superseded lines are at least eight and more than twice the number of operation ids. It writes any missing per-id file, then atomically replaces the log with an empty file. It does not copy historical ids back into the log, so the next operation is one append. A crash after the empty temporary file is synced and before the rename leaves the previous log in place.
 
-`released` means MDK did not admit the attempt. The id stays, with its project, sender, group, and payload hash. The same identity may be submitted again only while MDK still has no record. A different identity or payload returns `alert_identity_mismatch`. An intent recorded before a crash stays visible, so recovery does not encrypt again. Repair of a torn line does not create an operation id from the fragment and does not erase an earlier complete intent.
+`released` means MDK returned a pre-admission validation error and `local_send_status` was empty. The id stays, with its project, sender, recipient, group, operation type, and payload hash. The same identity may be submitted again only in that case. Any other `submit_text` error, including a timeout, a storage error, a panicked admission task, or an empty status after a successful return, stays `completion_unknown` and is not encrypted again. When a later `local_send_status` appears, the same operation id is projected. A different recipient, sender, group, or payload returns `alert_identity_mismatch`.
+
+A journal write updates memory only after the log line and the per-id file are synced. If that write fails, the helper reloads the directory before it returns. If the reload fails, the journal is poisoned and later sends return `boundary_durable_failure` instead of calling `submit_text`. A symlink is `boundary_symlink`. A directory owned by another user is `boundary_owner`.
+
+Checkpoint still reads the per-id files. That is acceptable at the current volume. A local run of 1,500 operations took about 21 seconds, almost all of it `fsync`, left `operations.log` at 42,120 bytes, and reopened in 95 milliseconds. An ordinary write does not copy those historical records back into the log.
 
 Manual retry of a completed cryptographic operation returns the stored record. A dead-letter reset of the scheduler counter does not authorize `SendStep::Submit` while a journal or MDK record exists.
 
@@ -191,6 +211,40 @@ Do not add a second push publisher. If a shared encoder is extracted, it has to 
 
 `decrypt_push_token_for_test` and owner-proof verification are `pub(crate)`. The fixture unwraps the kind-1059 gift with the temporary server key and checks the kind-446 rumor against this revision. It does not decrypt the token and it does not prove APNs or FCM delivery.
 
-Membership is checked with fresh `group_members` immediately before `submit_text`. Official MDK at this revision does not expose an atomic membership-and-send call. `submit_text` does not return `RefusedNewMembers`. A member can be removed, or a stale group can change, after the check and before the send commits. That race is not closed by querying membership immediately beforehand. After admission, the local-send status stays the publication record. A historical operation stays bound to its stored recipient and group and is not rerouted. A missing or replaced account or device store fails closed. An ambiguous onboarding operation does not create a second conversation. Extra devices of an authorized account are allowed by the membership rule. `active_recipient_tokens` counts two active leaves of the authorized recipient. This fixture does not pair a second live device. Out-of-order token records are not reordered by this helper.
+Membership is checked with fresh `group_members` immediately before `submit_text`. A failed roster query refuses the send. Official MDK at this revision does not expose a guarded text send that holds membership across admission. `submit_custom_event_to_members` checks a member list later, and it is not the kind-9 path this helper uses. `submit_text` does not return `RefusedNewMembers`. A member can be removed, or a stale group can change, after the check returns and before the worker encrypts. That race is still open. After admission, the local-send status stays the publication record. A historical operation stays bound to its stored recipient and group and is not rerouted. A missing or replaced account or device store fails closed. An ambiguous onboarding operation does not create a second conversation. Extra devices of an authorized account are allowed by the membership rule. `active_recipient_tokens` counts two active leaves of the authorized recipient. This fixture does not pair a second live device. Out-of-order token records are not reordered by this helper.
+
+`RelaySafetyPolicy` already drops discovered group, inbox, key-package, and notification endpoints that are private literals, localhost, or plaintext public URLs. Production does not pass `--allow-loopback`. The same policy accepts a `wss` domain without resolving it. nostr-sdk resolves that name when it dials. MDK's own dial-safety note calls this an accepted residual. There is no public connector in this revision that replaces that resolver. A one-time DNS lookup in this helper is not protection.
+
+Native deployment is blocked until the host prevents `watchdog-marmot` from opening WebSockets except to the configured relay allowlist. On a Mac that is an application firewall or a `pf` rule scoped to that binary. Without it, a discovered relay name can be rebound to a private address after the URL check.
 
 A physical locked-screen notification on the WhiteNoise relays has not been observed. Relay acceptance of the group message, gift-wrap acceptance, and a notification on the phone are three different results.
+
+## What Agent C applies on the integration branch
+
+This branch does not edit Agent C's store, scheduler, or `DeliveryOutcome`. The native adapter in `crates/watchdog-native/src/marmot.rs` still maps the flat helper fields onto the current `DeliveryOutcome`. That struct has no counter or retry-delay field, so the engine's own fallback delay is what the scheduler sees until the integration branch reads the helper JSON.
+
+On `feat/rust-integration`, copy from the helper `send` response's `operation` object:
+
+- `operationId` stays the alert id. Marmot dead-letter mode stays `Reconcile`.
+- `messageState` and `pushState` through the existing parsers.
+- `messageEventId`. Leave `pushEventId` null.
+- `disposition` `settled` or `reconcile`.
+- `retryAfterMs` as a relative delay: `now + retryAfterMs`, clamped to 15 seconds through 5 minutes. `retryAtMs` is the same relative value.
+- `messageSubmissions`, `messagePublications`, `messageReconciles`, `ambiguousReconciles`, `tokenWaits`, `pushPublications`, and `pushReconciles` onto the nullable `auth_*` columns. Copy null as null. Do not map the flat `message_attempts` field onto `auth_message_submissions`.
+- `startedAtMs` into `operation_started_at` once. Do not move it on later responses. `updatedAtMs` is not an age.
+
+`onboard` request: `operation_id`, `nsec`, `relays`, `recipient`, `replace`. `onboard_status` returns `phase` `absent`, `importing`, `intending`, or `established`. `readiness` returns `identity.step`, `recipient_devices`, and `active_recipient_tokens`, and no token bytes. `MARMOT_REONBOARD=<project>` remains `reonboard:<project>` with `replace: true`.
+
+Claim renewal is already in the adapter. After the claim is lost, the in-flight helper call may finish and the next owner reconciles the same operation id. It does not start another `submit_text`.
+
+## Commands run on this branch
+
+```bash
+export ODIN="$HOME/.local/odin-dev-2026-10/odin"
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_INCREMENTAL=false
+cargo test -p watchdog-core --lib marmot_recovery --offline
+cargo test --manifest-path crates/watchdog-marmot/Cargo.toml --offline --lib
+cargo test --manifest-path crates/watchdog-marmot/Cargo.toml --offline --test fixture_exchange -- --test-threads=1 --skip whitenoise_relays
+```
+
+Results on this handoff: `marmot_recovery` 15 passed. Helper lib tests passed, including torn-tail recovery, a read-only log that did not keep an unpersisted record, and 1,500 historical operations. `fixture_exchange` passed in 33.48 seconds with the public-relay test skipped. `whitenoise_relays_deliver_one_alert` then passed in 13.00 seconds against `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat` using generated identities. The phone procedure is `docs/acceptance.md`. It is not passed until the owner sees the notification.

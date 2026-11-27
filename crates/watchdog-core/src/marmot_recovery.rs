@@ -579,6 +579,30 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_status_stays_unknown_until_the_same_operation_becomes_visible() {
+        assert_eq!(
+            reconcile_send(
+                Some(StoredSend::CompletionUnknown),
+                true,
+                UpstreamSend::Absent
+            ),
+            SendStep::CompletionUnknown
+        );
+        assert_eq!(
+            reconcile_send(
+                Some(StoredSend::CompletionUnknown),
+                true,
+                UpstreamSend::Queued
+            ),
+            SendStep::ProjectUpstream
+        );
+        assert_ne!(
+            reconcile_send(Some(StoredSend::Submitting), true, UpstreamSend::Absent),
+            SendStep::Submit
+        );
+    }
+
+    #[test]
     fn a_refused_commit_is_projected_and_not_encrypted_again() {
         assert_eq!(
             reconcile_send(Some(StoredSend::Submitting), true, UpstreamSend::Rejected),
