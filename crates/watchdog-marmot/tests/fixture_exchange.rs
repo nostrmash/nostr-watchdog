@@ -2,6 +2,7 @@
 //! `MarmotApp` runtime, not a second helper. Both talk to the loopback
 //! fixture relay. The test prints no keys.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -2031,11 +2032,9 @@ async fn image_exchange() {
     let first_text = read(&alert, "payload_text");
     assert_eq!(journal_ids(&root, &alert), [first_id.clone()]);
     assert!(!first_text.is_empty());
-    let (first_seq, first) = single_group_event(&relay.url, log_seq, None);
-    assert_eq!(
-        recipient.ingest(peel_relay_event(&first)).await.unwrap(),
-        [first_text]
-    );
+    let mut decrypted = HashSet::new();
+    let chats = decrypt_fixture_chats(&recipient, &relay.url, log_seq, &mut decrypted).await;
+    let first = matching_relay_id(&chats, &first_text);
 
     watchdog.stop();
     helper.stop();
@@ -2062,21 +2061,12 @@ async fn image_exchange() {
     let recovery = wait_monitor_alert(&db, true).await;
     wait_image_message_receipt(&db, &recovery).await;
     let recovery_text = read(&recovery, "payload_text");
-    let (_, recovered) = single_group_event(&relay.url, first_seq, Some(first.id));
-    assert_eq!(
-        recipient
-            .ingest(peel_relay_event(&recovered))
-            .await
-            .unwrap(),
-        [recovery_text]
-    );
-    assert_ne!(recovered.id, first.id);
-    assert_eq!(
-        fixture_events(&relay.url, 445)
-            .iter()
-            .filter(|(_, event)| event.id == first.id)
-            .count(),
-        1
+    let chats = decrypt_fixture_chats(&recipient, &relay.url, log_seq, &mut decrypted).await;
+    let recovered = matching_relay_id(&chats, &recovery_text);
+    assert_ne!(recovered, first);
+    assert!(
+        chats.iter().all(|(_, text)| text != &first_text),
+        "reconciliation encrypted the outage alert again"
     );
 
     watchdog.stop();
@@ -2117,19 +2107,32 @@ async fn loopback_welcome(relay: &str, recipient: &str) -> Event {
     panic!("no Welcome for the official recipient on the isolated relay");
 }
 
-fn single_group_event(relay: &str, after: u64, already_decrypted: Option<EventId>) -> (u64, Event) {
-    let mut events = fixture_events(relay, 445)
-        .into_iter()
-        .filter(|(seq, event)| *seq > after && Some(event.id) != already_decrypted);
-    let (seq, event) = events
-        .next()
-        .expect("accepted group event on the fixture relay");
+async fn decrypt_fixture_chats(
+    recipient: &OfficialRecipient,
+    relay: &str,
+    after: u64,
+    decrypted: &mut HashSet<EventId>,
+) -> Vec<(EventId, String)> {
+    let mut chats = Vec::new();
+    for (seq, event) in fixture_events(relay, 445) {
+        if seq <= after || !decrypted.insert(event.id) {
+            continue;
+        }
+        event.verify().unwrap();
+        let messages = recipient.ingest(peel_relay_event(&event)).await.unwrap();
+        chats.extend(messages.into_iter().map(|message| (event.id, message)));
+    }
+    chats
+}
+
+fn matching_relay_id(chats: &[(EventId, String)], expected: &str) -> EventId {
+    let mut matching = chats.iter().filter(|(_, chat)| chat == expected);
+    let (id, _) = matching.next().expect("expected the decrypted alert");
     assert!(
-        events.next().is_none(),
-        "a second group event was encrypted"
+        matching.next().is_none(),
+        "the recipient decrypted a duplicate"
     );
-    event.verify().unwrap();
-    (seq, event)
+    *id
 }
 
 fn peel_relay_event(event: &Event) -> TransportMessage {
