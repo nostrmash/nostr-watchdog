@@ -2,6 +2,7 @@
 //! `MarmotApp` runtime, not a second helper. Both talk to the loopback
 //! fixture relay. The test prints no keys.
 
+use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -13,8 +14,8 @@ use std::time::Duration;
 use base64::Engine;
 use cgka_traits::GroupId;
 use marmot_app::{
-    AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppConfig, PUSH_ENCRYPTED_TOKEN_LEN,
-    PUSH_VERSION, PushPlatform,
+    AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppConfig, PushPlatform,
+    PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION,
 };
 use nostr::event::FinalizeEvent;
 use nostr::nips::nip59::UnwrappedGift;
@@ -71,15 +72,30 @@ fn endpoints(url: &str) -> Vec<cgka_traits::TransportEndpoint> {
     vec![cgka_traits::TransportEndpoint(url.to_string())]
 }
 
+fn run_exchange<F: Future<Output = ()> + 'static>(exchange: fn() -> F) {
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    // The MDK future also needs this stack when block_on polls it on the calling thread.
+    let result = std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(exchange());
+        })
+        .expect("fixture thread")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[test]
 fn helper_message_decrypts_in_an_official_runtime_and_survives_restart() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(exchange());
+    run_exchange(exchange);
 }
 
 async fn exchange() {
@@ -311,12 +327,10 @@ async fn exchange() {
         alien_id,
         "an unrelated group event satisfied the alert check"
     );
-    assert!(
-        session
-            .group_was_accepted(&account, &group)
-            .await
-            .expect("delivery")
-    );
+    assert!(session
+        .group_was_accepted(&account, &group)
+        .await
+        .expect("delivery"));
     let rows = runtime
         .messages_with_query(
             &recipient_hex,
@@ -1063,13 +1077,7 @@ async fn crash_send(
 #[test]
 #[ignore = "publishes throwaway key packages to the WhiteNoise relays"]
 fn whitenoise_relays_deliver_one_alert() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(public_import());
+    run_exchange(public_import);
 }
 
 async fn public_import() {
@@ -1203,13 +1211,7 @@ fn endpoints_of(relays: &[String]) -> Vec<cgka_traits::TransportEndpoint> {
 #[test]
 #[ignore = "runs the owner acceptance script against a controlled recipient and relay"]
 fn whitenoise_script_onboards_and_reuses_the_conversation() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(acceptance_script_exchange());
+    run_exchange(acceptance_script_exchange);
 }
 
 async fn acceptance_script_exchange() {
@@ -1362,13 +1364,7 @@ impl Drop for AcceptanceScript {
 
 #[test]
 fn packaged_binaries_deliver_monitor_incident_reconcile_and_send_recovery() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(executable_exchange());
+    run_exchange(executable_exchange);
 }
 
 async fn executable_exchange() {
