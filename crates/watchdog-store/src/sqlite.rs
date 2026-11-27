@@ -432,7 +432,8 @@ impl SqliteStore {
                last_finished_at = excluded.last_finished_at,
                last_error = excluded.last_error,
                last_success_at = CASE
-                 WHEN excluded.last_error IS NULL THEN excluded.last_success_at
+                 WHEN excluded.last_error IS NULL AND excluded.last_success_at IS NOT NULL
+                   THEN excluded.last_success_at
                  ELSE scheduler_runs.last_success_at
                END,
                run_owner = excluded.run_owner

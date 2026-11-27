@@ -219,6 +219,8 @@ while [ ! -f "$persist/reminder-race.entered" ]; do
   fi
   sleep 0.02
 done
+curl -sS --max-time 3 "http://127.0.0.1:${worker_port}/readyz" |
+  python3 -c 'import json, sys; body = json.load(sys.stdin); assert body["scheduler"] == "fresh", body'
 curl -fsS --max-time 3 -X POST -H "authorization: Bearer runtime-operator-token" \
   "http://127.0.0.1:${worker_port}/v1/incidents/${incident}/ack" | grep -F '"status":"acked"'
 rm "$persist/reminder-race"
