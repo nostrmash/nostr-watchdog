@@ -22,6 +22,7 @@ const ACCOUNT: &str = "self";
 const MAX_BODY: usize = 256 * 1024;
 const MAX_HISTORY_BUCKET: usize = 256;
 const MAX_TRIGGER_ATTEMPTS: usize = 3;
+const MAX_PUSH_AGE_MS: u64 = 900_000;
 
 #[durable_object]
 pub struct MarmotSender {
@@ -728,6 +729,10 @@ async fn execute(
             &storage_key,
             "key-package",
         )?;
+    }
+    if matches!(command.op.as_str(), "deliver" | "send" | "reconcile" | "maintain") {
+        session.storage().expire_overdue_pushes(marmot_worker_runtime::clock::unix_ms(), MAX_PUSH_AGE_MS)
+            .map_err(|error| error.to_string())?;
     }
     let body = dispatch(&session, project, allow_loopback, &command).await?;
     if command.op == "readiness" || body["admission"] == "absent" {
@@ -1790,9 +1795,10 @@ async fn prepare_push(
     let binding = session.binding().map_err(|error| error.to_string())?;
     if binding.group_id_hex.as_deref() != Some(&hex::encode(stored.group_id.as_slice()))
         || binding.recipient_hex != stored.recipient_hex
-        || marmot_worker_runtime::clock::unix_ms().saturating_sub(stored.started_at_ms) >= 900_000
+        || marmot_worker_runtime::clock::unix_ms().saturating_sub(stored.started_at_ms) >= MAX_PUSH_AGE_MS
     {
-        session.expire_push(operation_id).map_err(|error| error.to_string())?;
+        session.storage().expire_operation_push(operation_id, marmot_worker_runtime::clock::unix_ms())
+            .map_err(|error| error.to_string())?;
         persist_session(sql, storage_key, project, &session, row.revision as u64)?;
         return Ok(empty_push(Some("expired".into())));
     }

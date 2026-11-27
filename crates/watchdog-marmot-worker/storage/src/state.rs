@@ -1156,6 +1156,18 @@ pub struct PreparedPublication {
 }
 
 impl PreparedPublication {
+    pub(crate) fn expire_push(&mut self, now: u64) {
+        for attempt in self.publications.iter_mut().filter(|item| item.role == "push") {
+            if !matches!(attempt.phase.as_str(), "relay_accepted" | "rejected" | "retired") {
+                attempt.phase = "expired".into();
+                attempt.reason = "operation_expired".into();
+            }
+        }
+        self.push_trigger = None;
+        self.push_phase = "expired".into();
+        self.updated_at_ms = self.updated_at_ms.max(now);
+    }
+
     pub fn terminal_push_records(&self) -> Option<BTreeMap<String, (String, String)>> {
         let mut targets = BTreeMap::<String, (String, String)>::new();
         for record in self.publications.iter().filter(|record| record.role == "push") {

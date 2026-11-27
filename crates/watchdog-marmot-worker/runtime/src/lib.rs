@@ -730,22 +730,6 @@ impl Session {
         Ok(())
     }
 
-    pub fn expire_push(&self, operation_id: &str) -> Result<(), SessionError> {
-        let Some(mut row) = self.storage.publication(operation_id).map_err(map_storage)? else {
-            return Err(SessionError::MissingPublication(operation_id.to_owned()));
-        };
-        for attempt in row.publications.iter_mut().filter(|item| item.role == "push") {
-            if !matches!(attempt.phase.as_str(), "relay_accepted" | "rejected" | "retired") {
-                attempt.phase = "expired".into();
-                attempt.reason = "operation_expired".into();
-            }
-        }
-        row.push_trigger = None;
-        row.push_phase = "expired".into();
-        row.updated_at_ms = clock::unix_ms();
-        self.storage.put_publication(row).map_err(map_storage)
-    }
-
     pub fn note_push(
         &self,
         alert_id: &str,

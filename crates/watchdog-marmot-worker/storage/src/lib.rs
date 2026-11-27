@@ -338,6 +338,30 @@ impl MemoryMdkStorage {
         })
     }
 
+    pub fn expire_overdue_pushes(&self, now: u64, max_age_ms: u64) -> StorageResult<()> {
+        self.mutate(|state| {
+            for row in &mut state.journal {
+                if row.operation_kind == "chat"
+                    && row.message_phase == "relay_accepted"
+                    && now.saturating_sub(row.started_at_ms) >= max_age_ms
+                    && !row.settled()
+                {
+                    row.expire_push(now);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn expire_operation_push(&self, operation_id: &str, now: u64) -> StorageResult<()> {
+        self.mutate(|state| {
+            let row = state.journal.iter_mut().find(|row| row.alert_id == operation_id)
+                .ok_or_else(|| StorageError::Backend("operation is missing".into()))?;
+            row.expire_push(now);
+            Ok(())
+        })
+    }
+
     pub fn history_manifest(&self) -> StorageResult<Option<HistoryManifest>> {
         Ok(self.lock()?.state.history_manifest.clone())
     }
@@ -2287,6 +2311,15 @@ mod tests {
         }
         assert!(storage.publication("alert-1").unwrap().is_some());
         assert!(storage.tombstone("alert-1").unwrap().is_none());
+        let started = storage.publication("alert-1").unwrap().unwrap().started_at_ms;
+        storage.expire_overdue_pushes(started + 899_999, 900_000).unwrap();
+        assert!(!storage.publication("alert-1").unwrap().unwrap().settled());
+        storage.expire_overdue_pushes(started + 900_000, 900_000).unwrap();
+        storage.put_publication(wide_publication(10_000)).unwrap();
+        let retired = storage.tombstone("alert-1").unwrap().unwrap();
+        assert_eq!(retired.message_phase, "relay_accepted");
+        assert_eq!(retired.push_phase, "expired");
+
     }
 
     #[test]
