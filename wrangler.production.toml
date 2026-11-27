@@ -1,0 +1,45 @@
+name = "nostr-watchdog"
+account_id = "9f65435f3bc2df9dee3cb9aeb02da2f4"
+main = "crates/watchdog-worker/build/worker/shim.mjs"
+compatibility_date = "2026-11-22"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = true
+# The existing production monitoring, recipients and transport rollout flags
+# are managed on the Worker. Preserve them across code deployments.
+keep_vars = true
+
+[limits]
+cpu_ms = 30000
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+
+[triggers]
+crons = ["* * * * *", "0 * * * *"]
+
+[vars]
+ENVIRONMENT = "production"
+MARMOT_BOOTSTRAP_RELAYS = "wss://nos.lol,wss://relay.primal.net"
+
+[secrets]
+required = ["OPERATOR_TOKEN", "STATUS_READ_TOKEN", "STATUS_SIGNING_SECRET", "HEARTBEAT_KEYS", "SFS_BOT_NSEC", "NOSTRMASH_BOT_NSEC", "MARMOT_OPERATOR_TOKEN"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nostr-watchdog"
+database_id = "fbb00d08-4cd1-40a3-a4c5-437a439c1a09"
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "MARMOT_SENDER"
+class_name = "MarmotSender"
+script_name = "nostr-watchdog-marmot"

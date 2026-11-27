@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "mdk-engine-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Compile probe for the pinned Marmot cgka-engine. Not part of the watchdog workspace."
+
+[dependencies]
+# Pinned to the MDK commit that produced MarmotKit nightly 2026-11-26.
+# cgka-engine is the WASM-targeted MLS state machine. marmot-app is intentionally
+# absent: it requires SQLCipher, OpenSSL, and Tokio networking.
+cgka-engine = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182" }

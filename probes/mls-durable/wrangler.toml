@@ -1,0 +1,13 @@
+name = "mls-durable-probe"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-11-22"
+workers_dev = false
+
+[durable_objects]
+bindings = [
+  { name = "MLS_GROUP", class_name = "MlsGroupObject" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MlsGroupObject"]

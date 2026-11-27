@@ -1,0 +1,36 @@
+# Isolated workerd fixture. Do not deploy this file.
+# PRIVATE_NETWORK_PROFILE is set only here so the probe may call the local fixture.
+# Production and wrangler.rust-local.toml do not set it.
+
+name = "nostr-watchdog-runtime-test"
+main = "crates/watchdog-worker/build/worker/shim.mjs"
+compatibility_date = "2026-11-22"
+
+[limits]
+cpu_ms = 30000
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nostr-watchdog-runtime-test"
+database_id = "00000000-0000-4000-8000-0000000000bb"
+migrations_dir = "migrations"
+
+[vars]
+ENVIRONMENT = "test"
+WATCHDOG_ENABLED = "true"
+ALERTS_ENABLED = "true"
+ENABLE_SFS_WEB = "true"
+ENABLE_SFS_WORKER = "false"
+SFS_WEB_READY_URL = "http://127.0.0.1:8765/healthcheck"
+PRIVATE_NETWORK_PROFILE = "true"
+ENABLE_NIP17 = "false"
+ENABLE_MARMOT = "false"
+TELEGRAM_CRITICAL_MODE = "nostr_fallback"
+TELEGRAM_BOT_TOKEN = "000000:runtime-fixture-not-a-real-token"
+TELEGRAM_CHAT_IDS = "{\"smartflowsocial\":\"1\"}"
+CHECK_TIMEOUT_MS = "2000"
+CRITICAL_REMINDER_SECONDS = "1"
+OPERATOR_TOKEN = "runtime-operator-token"
+STATUS_READ_TOKEN = "runtime-status-token"
+STATUS_SIGNING_SECRET = "runtime-signing-secret-32chars-min"
+HEARTBEAT_KEYS = "{\"sfs-worker\":\"0123456789abcdef0123456789abcdef\"}"

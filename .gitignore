@@ -1,4 +1,7 @@
 node_modules/
+/target/
+**/target/
+probes/mls-durable/build/
 .wrangler/
 .dev.vars
 .setup-secrets.json

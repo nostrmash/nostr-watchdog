@@ -1,0 +1,7 @@
+[target.wasm32-unknown-unknown]
+# rustc's archiver. The C build below uses the same llvm-ar so wasm-ld can
+# read libsecp256k1.a. Host `ar` writes a Darwin archive that drops the symbols.
+ar = "scripts/wasm-ar"
+
+[env]
+AR_wasm32_unknown_unknown = { value = "scripts/wasm-ar", relative = true }

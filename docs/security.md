@@ -1,65 +1,35 @@
-# Security
+# Security model
 
-## Secrets
+Nostr Watchdog sends operational alerts. Treat the sender keys, operator token, vendor tokens, and any future MLS state as secrets. The service does not need the operator's personal Nostr key.
 
-Secrets are Cloudflare secret bindings or `.dev.vars`. They are not written to source, Wrangler vars, D1, logs, alert text, or URLs. The logger drops field names that look like tokens, secrets, keys, passwords, or cookies, and alert text redacts `nsec`, `npub`, bearer tokens, `token=` / `secret=` assignments, long hex strings, and URL userinfo.
+## What the native process protects
 
-`.dev.vars.example` has empty values. `.gitignore` ignores `.dev.vars`. Tests generate sender keys in the Vitest config and inject them as bindings. Those keys are not printed and are not in git. Vitest may warn that `secrets.required` is unset in the process environment. The test bindings supply them inside the Worker.
+- Probe URLs must be `https`, or `http` only when `PRIVATE_NETWORK_PROFILE=true`, on the host that was configured. Credentials, non-default ports, localhost, `.local`, `.internal`, `.home.arpa`, and private, link-local, metadata, CGNAT, and documentation addresses are rejected. Decimal and hex IPv4 literals are rejected.
+- Redirects are limited to two hops and the original host. An authenticated probe does not follow a redirect.
+- Relay URLs must be `wss` on port 443 and must not be a private address. `ws://` is rejected. Inbox relays that fail that check are dropped before use.
+- GitHub requests are limited to `https` hosts `api.github.com` or `*.github.com`. Other bases are treated as unavailable. Redirects are not followed.
+- Heartbeats use HMAC-SHA256. The current key and, on failure, the previous key are checked. Nonces are stored and a repeat is `401`. A valid older observation is `409` and does not replace newer progress. Equal timestamps keep the first committed row.
+- Operator and status tokens are compared by hashing both sides and comparing the digests. The status body can be signed with `STATUS_SIGNING_SECRET`.
+- Logs go through the existing redaction idea for token-like fields. Private keys, MLS secrets, and push tokens are not written by this code because it does not hold the latter two. Do not add debug prints of `nsec`, `TELEGRAM_BOT_TOKEN`, `GITHUB_TOKEN`, or authorization headers.
+- The SQLite file is created mode `0600` on Unix. That is filesystem permissions, not encryption. Anyone who can read the file can read alert text and the stored NIP-17 gift wrap.
+- The native helper configures its process-local SOCKS5 proxy before the MDK relay client and runtime start. The proxy bounds handshakes, DNS lookups, and connections separately from established forwarding.
 
-Operator routes require `Authorization: Bearer <OPERATOR_TOKEN>` compared in constant time. If the token is missing, those routes return 503. There is no CORS middleware and no public test-alert route. `GET /healthz` returns only liveness.
+## What it does not protect
 
-Report vulnerabilities privately. See [SECURITY.md](../SECURITY.md).
+- D1 and SQLite are not application-level encrypted. A copy of the database is a copy of the alert history.
+- Memory zeroization of secrets is limited. `nsec` values are ordinary `String`s. WASM and a moving garbage-collected host would not honor zeroize anyway. The native process drops them when the request ends, which is not a guarantee against swapping or core dumps.
+- Relay `OK` is not evidence the operator's phone showed the alert.
+- Native HTTP, Telegram, and relay sockets resolve once, reject private answers unless the monitor explicitly allows them, and connect to that address while TLS still checks the original name. DNS, TCP, TLS, and the body share one deadline. The Worker `fetch` API cannot pin DNS. Its URL policy rejects literal private hosts before the request, which is weaker than the native pin.
+- Discovery relays never receive a signed NIP-42 identity. Publication relays are signed only after they require authentication, and the original event is resent once with the same id.
+- Operator routes require the operator token. The status reader token can read status and cannot acknowledge, silence, or onboard.
+- Marmot device tokens are wake capabilities. The cryptographic authority handles them. The operational stores retain sanitized delivery evidence and keep the legacy encrypted-token column unused. External diagnostics expose readiness and relay evidence.
 
-## Outbound probes
+## Dependencies
 
-Every probe URL comes from configuration, and the host must match the host of that configured URL. The Worker does not accept a caller-supplied URL or header. Probes are HTTPS on port 443 unless `PRIVATE_NETWORK_PROFILE=true`, which is off by default. Userinfo, redirects to another host, and redirects that fail the same policy are rejected. A probe that sends `Authorization` does not follow any redirect. Vendor calls refuse every redirect so a token cannot be replayed to another host. Gateway health tokens are separate from publish and read API tokens.
+CI runs `cargo deny` and `cargo audit` across the operational workspace and both Marmot lockfiles. The MDK revision still requires the `libsqlite3-sys` 0.38 interface through rusqlite. A local compatibility crate re-exports upstream `libsqlite3-sys` 0.40.0, which links SQLCipher 4.20.0 and SQLite 3.54.1. The native acceptance suite verifies both linked versions directly. The production Cloudflare Worker uses Durable Object SQLite and does not link SQLCipher. The independent Rust recipient in the Cloudflare qualification suite uses the same patched library. [RustSec binding advisory](https://rustsec.org/advisories/RUSTSEC-2026-0459.html) · [RustSec SQLCipher advisory](https://rustsec.org/advisories/RUSTSEC-2026-0502.html)
 
-Blocked destinations, unless the private-network profile is explicitly on, include loopback, private ranges, link-local, multicast, documentation ranges, IPv6 unique-local and link-local, IPv4-mapped private addresses, decimal and hex IP literals, `localhost`, and metadata hostnames.
+The upstream MDK, binding, and SQLCipher notices are in `LICENSES/` and installed in the native image.
 
-Response bodies are capped. Vendor response bodies are not logged. Alerts include a version string only when it matches a short safe character set.
+## Cloudflare production
 
-## Vendor credentials
-
-Alby Hub monitoring uses GET and a read-only token. It does not unlock a wallet, request a mnemonic, or ask for payment permission. BTCPay monitoring uses GET. It does not create invoices. The BTCPay key, when set, is sent only to the configured origin as `Authorization: token <key>`.
-
-## Heartbeats
-
-`POST /v1/heartbeats/:monitorId` requires HMAC-SHA256 over:
-
-```text
-timestamp
-nonce
-POST
-/v1/heartbeats/:monitorId
-sha256-hex of the raw body
-```
-
-Headers are `X-Watchdog-Timestamp` (unix seconds), `X-Watchdog-Nonce` (16–128 characters from `[A-Za-z0-9_-]`), and `X-Watchdog-Signature` (64 hex characters). Verification uses WebCrypto. The nonce is stored in D1 until the skew window ends, so a replay inside that window fails. A body over the configured cap is rejected before it is parsed. The signing key is the key for that monitor id only. Clock skew outside `HEARTBEAT_MAX_SKEW_SECONDS` is rejected.
-
-## Delivery
-
-Gift wraps go only to kind 10050 inbox relays whose event id and signature verify. Telegram requests go only to `api.telegram.org`, and the bot token is not logged. The chat id must be an integer string. Critical Telegram text is the same short incident text as the Nostr message. When Telegram is configured, dual delivery is the default because a relay can accept an event that no phone displays. That also sends the alert text to Telegram. Use `nostr_fallback` when you would rather risk a missed page than send the text to Telegram on every critical incident. Fallback sends one Telegram message per incident, not one per Nostr retry.
-
-## Data stored in D1
-
-The outbox stores the alert plaintext and, after the first signing, the gift-wrap JSON so a retry keeps the same event id. Relays store the encrypted gift wrap. D1 does not. Do not put wallet seeds, unlock passwords, payment tokens, or NWC secrets in alert text. The Worker does not add them. Accepted rows are deleted after 14 days and dead letters after 30 days. Open incidents and alerts that can still be retried are kept.
-
-Cloudflare operates D1 and the Worker isolate. This repository cannot promise that Cloudflare staff, a legal request, or a platform compromise cannot read that plaintext. Use a separate D1 database, operator token, and sender key for staging and production. Heartbeat secrets rotate by publishing the new key in `HEARTBEAT_KEYS` and the old key in `HEARTBEAT_KEYS_PREVIOUS`, then clearing the previous key after emitters have restarted.
-
-Test alerts are limited to three per project per hour.
-
-## Licenses
-
-This project's `LICENSE` is the Unlicense and stays the Unlicense. Production dependencies reported by `pnpm licenses list --prod`:
-
-| Package                                            | License   |
-| -------------------------------------------------- | --------- |
-| `nostr-tools`                                      | Unlicense |
-| `@noble/ciphers`, `@noble/curves`, `@noble/hashes` | MIT       |
-| `@scure/base`, `@scure/bip32`, `@scure/bip39`      | MIT       |
-
-The MIT packages are transitive dependencies of `nostr-tools` and are bundled into the Worker. Their MIT terms still apply to that code. Dev tooling is not part of the runtime bundle. Source files do not add an extra license header.
-
-## What a healthy check does not prove
-
-A healthy check does not prove that a wallet can pay, that a phone displayed an alert, or that software with no published advisory is free of vulnerabilities. `unknown` and `no_published_advisories` are not "secure". Cloudflare cannot observe an outage of Cloudflare. Run a second checker somewhere else against `/healthz` and, if you can keep the token outside Cloudflare, against signed `GET /v1/status`.
+`nostr-watchdog-marmot` has neither a public route nor a preview URL. The operational Worker accesses `MarmotSender` through a cross-script binding authenticated by `MARMOT_OPERATOR_TOKEN`. Keep the distinct 32-byte `MARMOT_STORAGE_KEY` in secure recovery custody and bind it only to the private Worker. See [deployment.md](deployment.md#cloudflare-production) for provisioning, backup, and rollback.

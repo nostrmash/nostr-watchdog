@@ -1,0 +1,4 @@
+# Local test secrets only. Wrangler reads `.dev.vars`, which is gitignored.
+# Do not put production keys here.
+MARMOT_STORAGE_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+MARMOT_OPERATOR_TOKEN=local-test-token

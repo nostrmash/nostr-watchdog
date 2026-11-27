@@ -1,0 +1,25 @@
+[package]
+name = "watchdog-engine"
+version = "1.0.0-dev"
+description = "Check cycle, incident commits, and alert dispatch for Nostr Watchdog."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+futures-util = "0.3"
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+watchdog-core = { workspace = true }
+watchdog-notify = { workspace = true }
+watchdog-store = { workspace = true }
+
+[dev-dependencies]
+nostr = { git = "https://github.com/nostrdevkit/nostr", rev = "4904ffb85f60178375a1dda659a61793f36f03b8", default-features = false, features = ["std", "os-rng"] }
+tokio = { workspace = true }
+watchdog-store = { workspace = true, features = ["sqlite"] }

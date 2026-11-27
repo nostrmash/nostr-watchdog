@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+      - feat/rust-rewrite
+      - feat/rust-production-hardening
+      - feat/rust-integration
   pull_request:
   workflow_dispatch:
 
@@ -11,96 +14,255 @@ permissions:
   contents: read
 
 jobs:
-  lint-and-typecheck:
+  rust:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          version: 12.21.0
+          toolchain: "1.100.0"
+          components: rustfmt, clippy
 
-      - name: Setup Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: "26.13.1"
-          cache: pnpm
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Clippy
+        run: cargo clippy --locked --workspace --exclude watchdog-worker --all-targets -- -W clippy::all
 
-      - name: Validate formatting, lint, and types
-        run: pnpm validate
+      - name: Test
+        run: |
+          cargo test --locked --workspace --exclude watchdog-worker
+          cargo test --locked -p watchdog-store --features sqlite --lib
 
-      - name: Audit production dependencies
-        run: pnpm audit --prod --audit-level=high
+      - name: Release binary
+        run: cargo build --locked --release -p watchdog-native
 
-  unit-and-integration-tests:
-    needs: lint-and-typecheck
+      - name: Install cargo-deny and cargo-audit
+        run: |
+          cargo install cargo-deny --version 0.22.1 --locked
+          cargo install cargo-audit --version 0.23.0 --locked
+
+      - name: Dependency policy
+        run: |
+          cargo deny --locked check
+          cargo deny --locked --manifest-path crates/watchdog-marmot/Cargo.toml --config deny.toml check
+          cargo deny --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml --config deny.toml check
+
+      - name: Known vulnerabilities
+        run: |
+          cargo audit
+          cargo audit --file crates/watchdog-marmot/Cargo.lock
+          cargo audit --file crates/watchdog-marmot-worker/Cargo.lock
+
+  wasm-worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          version: 12.21.0
+          toolchain: "1.100.0"
+          targets: wasm32-unknown-unknown
+          components: llvm-tools
 
-      - name: Setup Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: "26.13.1"
-          cache: pnpm
+      - name: Check the operational Worker
+        run: cargo check --locked -p watchdog-worker --target wasm32-unknown-unknown
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Check the pinned cgka-engine for wasm
+        run: cargo check --locked --manifest-path probes/mdk-engine/Cargo.toml --target wasm32-unknown-unknown
 
-      - name: Run unit tests
-        run: pnpm test:unit
-
-      - name: Run integration tests
-        run: pnpm test:integration
-
-      - name: Run security tests
-        run: pnpm test:security
-
-  coverage-and-build:
-    needs: unit-and-integration-tests
+  image:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+      - name: Build the image
+        run: docker build -t nostr-watchdog:ci .
+
+      - name: Boot, health, persistent state, and helper startup
+        run: |
+          docker volume create watchdog-data
+          docker run -d --name watchdog -v watchdog-data:/data -p 127.0.0.1:8787:8787 nostr-watchdog:ci
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:8787/healthz; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8787/healthz | grep -F '"status":"ok"'
+          docker exec watchdog test -x /usr/local/bin/nostr-watchdog
+          docker exec watchdog test -x /usr/local/bin/watchdog-marmot
+          docker exec watchdog test -d /data/marmot
+          docker exec watchdog sh -c 'test "$(id -u)" = 10001 && test "$(stat -c %a /data/marmot)" = 700'
+          docker exec watchdog sh -c 'ldd /usr/local/bin/nostr-watchdog && ldd /usr/local/bin/watchdog-marmot' | tee /tmp/watchdog-ldd
+          if grep -F 'not found' /tmp/watchdog-ldd; then exit 1; fi
+          docker exec -d watchdog sh -c '/usr/local/bin/watchdog-marmot --root /data/marmot --socket /data/marmot/helper.sock --allow-loopback --relay ws://127.0.0.1/ >/data/marmot/helper.log 2>&1'
+          sleep 2
+          if ! docker exec watchdog test -S /data/marmot/helper.sock; then
+            docker exec watchdog cat /data/marmot/helper.log || true
+            exit 1
+          fi
+          docker exec watchdog sh -c 'echo persisted >/data/marmot/persistence-marker'
+          docker exec watchdog test -s /data/watchdog.sqlite
+          docker rm -f watchdog
+          docker run -d --name watchdog -v watchdog-data:/data -p 127.0.0.1:8787:8787 nostr-watchdog:ci
+          ready=0
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:8787/healthz | grep -F '"status":"ok"'; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = "1"
+          docker exec watchdog test -s /data/watchdog.sqlite
+          docker exec watchdog test -s /data/marmot/persistence-marker
+          # This smoke test covers the packaged executables and volume only.
+          # The native conversation test runs separately with the official recipient.
+
+      - name: Verify actual image conversation across container replacement
+        run: |
+          docker build --target image-test-driver -t nostr-watchdog-test-driver:ci .
+          driver=$(docker create nostr-watchdog-test-driver:ci)
+          trap 'docker rm "$driver"' EXIT
+          docker cp "$driver:/out/fixture_exchange" /tmp/watchdog-image-fixture
+          WATCHDOG_TEST_IMAGE=nostr-watchdog:ci WATCHDOG_TEST_REPO_ROOT="$PWD" \
+            /tmp/watchdog-image-fixture image_preserves_an_official_mdk_conversation --ignored --exact --nocapture
+
+  workerd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          version: 12.21.0
+          toolchain: "1.100.0"
+          targets: wasm32-unknown-unknown
+          components: llvm-tools
 
-      - name: Setup Node
-        uses: actions/setup-node@v7
+      - name: Install Node
+        uses: actions/setup-node@v4
         with:
-          node-version: "26.13.1"
-          cache: pnpm
+          node-version: "22"
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Install worker-build
+        run: cargo install worker-build --version 0.9.0 --locked
 
-      - name: Run coverage
-        run: pnpm test:coverage
+      - name: Workerd scheduled suite
+        run: sh tests/runtime/worker-scheduled.sh
 
-      - name: Build
-        run: pnpm build
+  native-marmot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-      - name: Upload coverage artifact
-        if: always()
-        uses: actions/upload-artifact@v7
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          name: coverage-summary
-          path: coverage/coverage-summary.json
-          if-no-files-found: ignore
+          toolchain: "1.100.0"
+          components: llvm-tools
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pinned Odin
+        run: |
+          curl -fsSL -o /tmp/odin.tar.gz \
+            https://github.com/odin-lang/Odin/releases/download/dev-2026-10/odin-linux-amd64-dev-2026-10.tar.gz
+          echo "c3c8b095621fd0c75f7f73e3a0829f1b4d45324225f20ba11ed8dc4da310a8ab  /tmp/odin.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/odin-dev-2026-10"
+          tar -xzf /tmp/odin.tar.gz -C "$HOME/.local/odin-dev-2026-10" --strip-components=1
+          echo "ODIN=$HOME/.local/odin-dev-2026-10/odin" >> "$GITHUB_ENV"
+          "$HOME/.local/odin-dev-2026-10/odin" version | grep -E "dev-2026-10|84bc3fc"
+
+      - name: Test and build the helper
+        run: |
+          cargo build --locked --release --manifest-path crates/watchdog-marmot/Cargo.toml
+          cargo test --locked --release --manifest-path crates/watchdog-marmot/Cargo.toml --lib
+          test -x crates/watchdog-marmot/target/release/watchdog-marmot
+
+      - name: Build the optimized watchdog executable
+        id: watchdog
+        run: cargo build --release --locked -p watchdog-native
+
+      - name: Native executable incident, restart, and independent recipient
+        env:
+          WATCHDOG_TEST_BINARY: ${{ github.workspace }}/target/release/nostr-watchdog
+        run: |
+          for run in 1 2 3; do
+            echo "Optimized native exchange $run of 3"
+            cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
+              --test fixture_exchange -- --test-threads=1
+          done
+
+      - name: Exercise the owner's WhiteNoise acceptance script
+        if: ${{ !cancelled() && steps.watchdog.outcome == 'success' }}
+        env:
+          WATCHDOG_TEST_BINARY: ${{ github.workspace }}/target/release/nostr-watchdog
+        run: |
+          cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
+            --test fixture_exchange whitenoise_script_onboards_and_reuses_the_conversation -- --ignored --exact
+
+  cloudflare-marmot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          targets: wasm32-unknown-unknown
+          components: llvm-tools
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pinned local runtime and build tool
+        run: |
+          npm ci --prefix crates/watchdog-marmot-worker/worker
+          cargo install worker-build --version 0.9.0 --locked
+
+      - name: Test the Marmot Worker workspace
+        run: |
+          cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml --workspace --lib
+          cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml \
+            -p marmot-worker-interop --test two_member
+
+      - name: Check the Durable Object for wasm
+        run: cargo check --locked --manifest-path crates/watchdog-marmot-worker/worker/Cargo.toml --target wasm32-unknown-unknown
+
+      - name: Build both optimized bundles and test actual workerd
+        run: |
+          sh scripts/build-production-workers.sh
+          cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml \
+            -p marmot-worker-interop --test workerd_conversation -- --ignored --test-threads=1 --skip public --show-output
+
+      - name: Package the production Worker pair
+        run: |
+          wrangler=crates/watchdog-marmot-worker/worker/node_modules/.bin/wrangler
+          "$wrangler" deploy --config wrangler.marmot-production.toml --dry-run --outdir "$RUNNER_TEMP/watchdog-marmot"
+          "$wrangler" deploy --config wrangler.production.toml --dry-run --outdir "$RUNNER_TEMP/watchdog-operational"
+
+  # SQLCipher WASM is a separate expected-failure research probe.
+  # The public-network tests remain opt-in.

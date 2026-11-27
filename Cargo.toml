@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/watchdog-core",
+    "crates/watchdog-store",
+    "crates/watchdog-engine",
+    "crates/watchdog-notify",
+    "crates/watchdog-native",
+    "crates/watchdog-worker",
+]
+exclude = ["probes/mdk-engine", "crates/watchdog-marmot"]
+# The MDK compile probe lives outside the workspace so `cargo test --workspace`
+# does not download OpenMLS. See probes/mdk-engine.
+
+[workspace.package]
+edition = "2021"
+license = "Unlicense"
+publish = false
+rust-version = "1.91"
+
+[workspace.dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+hex = "0.4"
+hmac = "0.12"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tracing = "0.1"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+watchdog-core = { path = "crates/watchdog-core" }
+watchdog-engine = { path = "crates/watchdog-engine" }
+watchdog-notify = { path = "crates/watchdog-notify" }
+watchdog-store = { path = "crates/watchdog-store" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

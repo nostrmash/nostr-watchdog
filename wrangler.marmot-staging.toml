@@ -1,0 +1,22 @@
+# Isolated staging Marmot Worker. Do not deploy without authorization.
+# Do not attach the production watchdog D1 database or production sender.
+# MARMOT_STORAGE_KEY is a secret on this Worker only.
+
+name = "nostr-watchdog-marmot-staging"
+main = "crates/watchdog-marmot-worker/worker/build/worker/shim.mjs"
+compatibility_date = "2026-11-26"
+workers_dev = false
+
+[build]
+command = "bash crates/watchdog-marmot-worker/worker/build-release.sh"
+
+[vars]
+MARMOT_ALLOW_LOOPBACK = "0"
+
+[[durable_objects.bindings]]
+name = "MARMOT_SENDER"
+class_name = "MarmotSender"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MarmotSender"]

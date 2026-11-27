@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["storage", "runtime", "interop", "worker"]
+
+[workspace.package]
+edition = "2021"
+license = "Unlicense"
+publish = false
+rust-version = "1.91"
+
+[workspace.dependencies]
+base64 = "0.22"
+cgka-engine = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182" }
+cgka-traits = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182" }
+chacha20poly1305 = "0.10"
+hex = "0.4"
+hkdf = "0.12"
+k256 = { version = "0.14", default-features = false, features = ["schnorr"] }
+nostr = { git = "https://github.com/nostrdevkit/nostr", rev = "4904ffb85f60178375a1dda659a61793f36f03b8" }
+openmls = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
+openmls_memory_storage = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
+openmls_traits = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+transport-nostr-peeler = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182" }
+zeroize = "1"
+
+# MDK pins rusqlite 0.40, which requires libsqlite3-sys 0.38. Use the current
+# upstream bindings and patched SQLCipher within this workspace.
+[patch.crates-io]
+libsqlite3-sys = { path = "../watchdog-sqlcipher-compat" }

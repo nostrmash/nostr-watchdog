@@ -1,0 +1,31 @@
+[workspace]
+
+[package]
+name = "mls-durable"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Unlicense"
+publish = false
+rust-version = "1.91"
+description = "OpenMLS group persisted in a Durable Object SQLite database. Not the production Worker."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hex = "0.4"
+openmls = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
+openmls_basic_credential = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2" }
+openmls_memory_storage = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
+openmls_rust_crypto = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
+openmls_traits = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+worker = { version = "0.9", features = ["d1"] }
+
+[features]
+default = []
+js = ["openmls/js"]

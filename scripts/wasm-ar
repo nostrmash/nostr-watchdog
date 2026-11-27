@@ -1,0 +1,8 @@
+#!/bin/sh
+# libsecp256k1's wasm objects must be archived with llvm-ar. The host `ar`
+# writes a Darwin archive that wasm-ld does not load, so the Worker link
+# reports missing rustsecp256k1 symbols.
+set -eu
+sysroot="$(rustc --print sysroot)"
+host="$(rustc -vV | awk '/^host: / { print $2 }')"
+exec "$sysroot/lib/rustlib/$host/bin/llvm-ar" "$@"

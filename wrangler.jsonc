@@ -176,6 +176,8 @@
         ],
       },
     },
+    // Retained for TypeScript rollback reference. Rust production uses
+    // wrangler.production.toml and wrangler.marmot-production.toml.
     "production": {
       "name": "nostr-watchdog",
       "limits": { "cpu_ms": 30000 },

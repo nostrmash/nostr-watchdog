@@ -1,0 +1,34 @@
+name = "nostr-watchdog-marmot"
+account_id = "9f65435f3bc2df9dee3cb9aeb02da2f4"
+main = "crates/watchdog-marmot-worker/worker/build/worker/shim.mjs"
+compatibility_date = "2026-11-26"
+workers_dev = false
+preview_urls = false
+
+[limits]
+cpu_ms = 30000
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+
+[vars]
+MARMOT_ALLOW_LOOPBACK = "0"
+
+[secrets]
+required = ["MARMOT_OPERATOR_TOKEN", "MARMOT_STORAGE_KEY"]
+
+[[durable_objects.bindings]]
+name = "MARMOT_SENDER"
+class_name = "MarmotSender"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MarmotSender"]

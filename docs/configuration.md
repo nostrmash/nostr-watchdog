@@ -1,6 +1,6 @@
 # Configuration
 
-Non-secret settings live in `wrangler.jsonc` `vars`. Secrets are bound with `wrangler secret put` and, locally, `.dev.vars`. Wrangler does not inherit `vars` into named environments, so the top-level environment, `staging`, and `production` each carry a full copy.
+Production runtime settings live on the `nostr-watchdog` Worker. `wrangler.production.toml` preserves existing dashboard variables with `keep_vars = true`. Use Worker secret bindings for credentials and `.dev.vars` for local fixtures. `wrangler.jsonc` contains the legacy TypeScript configuration and remains a rollback reference.
 
 Placeholder D1 ids in `wrangler.jsonc` must be replaced with the ids from `wrangler d1 create` before any remote command. See [deployment.md](deployment.md).
 
