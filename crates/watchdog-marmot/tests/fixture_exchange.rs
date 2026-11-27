@@ -1847,6 +1847,10 @@ async fn executable_exchange() {
             .map(Vec::as_slice),
         Some(recovered_ids.as_slice())
     );
+    assert!(
+        receive_packaged_alert(&runtime, &recipient_hex, &group, crash_text).await,
+        "the recipient did not decrypt the recovered crash-boundary alert"
+    );
     assert_eq!(
         plaintext_count(&runtime, &recipient_hex, &group, crash_text).await,
         1,
@@ -2441,6 +2445,12 @@ async fn crash_and_reconcile(
         recovered.get("message_ids"),
         "{point} changed message ids on the second reconcile"
     );
+    if point != "intent" {
+        assert!(
+            receive_packaged_alert(runtime, recipient, group, text).await,
+            "the recipient did not decrypt the message recovered at {point}"
+        );
+    }
     let count = plaintext_count(runtime, recipient, group, text).await;
     drop(helper);
     count
