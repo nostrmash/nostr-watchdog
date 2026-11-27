@@ -24,3 +24,13 @@ WATCHDOG_ENABLED = "true"
 ALERTS_ENABLED = "false"
 ENABLE_MARMOT = "false"
 ENABLE_NIP17 = "false"
+
+# Private cross-script binding. The class is exported by the Marmot Worker,
+# not by this script. Start that Worker from wrangler.marmot-local.toml first.
+# MARMOT_OPERATOR_TOKEN is a local secret. MARMOT_STORAGE_KEY stays on the
+# Marmot Worker.
+
+[[durable_objects.bindings]]
+name = "MARMOT_SENDER"
+class_name = "MarmotSender"
+script_name = "nostr-watchdog-marmot-local"

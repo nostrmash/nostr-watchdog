@@ -25,7 +25,7 @@ Transports are independent. One failure does not cancel the others.
 
 | Transport | Role in this branch |
 | --- | --- |
-| Marmot | Preferred on the native process when `ENABLE_MARMOT=true`. The helper calls `marmot-app` create, send, and catch-up. Membership that is not the sender plus the configured recipient fails closed. The Worker calls Durable Object class `MarmotSender` only when the `MARMOT_SENDER` binding is present. Staging and production configs omit that binding, and `ENABLE_MARMOT` stays false there. |
+| Marmot | Preferred on the native process when `ENABLE_MARMOT=true`. The helper calls `marmot-app` create, send, and catch-up. Membership that is not the sender plus the configured recipient fails closed. The operational Worker calls Durable Object class `MarmotSender` through the `MARMOT_SENDER` binding on the dedicated Marmot Worker. Staging names that script `nostr-watchdog-marmot-staging`. `ENABLE_MARMOT` stays false until a deliberate activation. Production wrangler is untouched. |
 | NIP-17 | Default compatibility transport. The native process stores the gift wrap and retries that event. The Worker currently publishes a new wrap to the first bootstrap relay only. |
 | Telegram | Optional. `dual` sends it with the Nostr alert for critical open, remind, and close. `nostr_fallback` sends one Telegram after the first critical NIP-17 or Marmot failure. |
 

@@ -51,7 +51,10 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
     let settings = load_settings(|key| vars.get(key).cloned().unwrap_or_default());
     let store = D1Store::new(&db);
     let marmot = env.durable_object("MARMOT_SENDER").ok();
-    let marmot_supported = marmot.is_some() && settings.marmot_enabled;
+    let marmot_supported = marmot.is_some()
+        && vars
+            .get("MARMOT_OPERATOR_TOKEN")
+            .is_some_and(|token| !token.is_empty());
     let notifier = WorkerNotifier {
         db: env.d1("DB")?,
         vars: vars.clone(),
@@ -94,12 +97,179 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
         &settings,
         &get,
         &notifier,
-        request,
+        request.clone(),
         now_ms(),
         &SystemClock,
     )
     .await;
+    if let ApiRequest::Onboard { body, .. } = request {
+        if response.status == 202 {
+            return exact_json(cloudflare_onboard(&notifier, &body, response).await);
+        }
+    }
     exact_json(response)
+}
+
+async fn cloudflare_onboard(
+    notifier: &WorkerNotifier,
+    body: &[u8],
+    mut response: ApiResponse,
+) -> ApiResponse {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return response;
+    };
+    let project = value.get("projectId").and_then(Value::as_str).unwrap_or("");
+    let operation = value
+        .get("operationId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let replace = value
+        .get("replace")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let Some(namespace) = &notifier.marmot else {
+        return onboard_note(response, "marmot_engine_unavailable", false);
+    };
+    let Some(token) = notifier
+        .vars
+        .get("MARMOT_OPERATOR_TOKEN")
+        .filter(|token| !token.is_empty())
+    else {
+        return onboard_note(response, "marmot_unauthorized", false);
+    };
+    let Some(url) = watchdog_core::delivery::marmot_sender_url(project) else {
+        return onboard_note(response, "invalid_project", false);
+    };
+    let recipient = watchdog_core::catalog::project_recipient(
+        notifier
+            .vars
+            .get("PROJECT_RECIPIENTS")
+            .map(String::as_str)
+            .unwrap_or(""),
+        notifier
+            .vars
+            .get("ADMIN_NPUB")
+            .map(String::as_str)
+            .unwrap_or(""),
+        project,
+    );
+    let Some(recipient) = recipient.filter(|value| value.len() == 64) else {
+        return onboard_note(response, "recipient_unconfigured", false);
+    };
+    let secret = watchdog_core::catalog::project_by_id(project)
+        .map(|item| {
+            notifier
+                .vars
+                .get(item.sender_secret)
+                .map(String::as_str)
+                .unwrap_or("")
+        })
+        .unwrap_or("");
+    if secret.starts_with("nsec1") {
+        return onboard_note(response, "sender_secret_must_be_hex", false);
+    }
+    let relays: Vec<&str> = notifier
+        .vars
+        .get("BOOTSTRAP_RELAYS")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut command = serde_json::json!({
+        "op": "onboard",
+        "operationId": operation,
+        "projectId": project,
+        "recipient": recipient,
+        "replace": replace,
+        "relays": relays
+    });
+    if secret.len() == 64 && secret.chars().all(|item| item.is_ascii_hexdigit()) {
+        command["senderSecretHex"] = serde_json::json!(secret);
+    }
+    match post_marmot(
+        namespace,
+        token,
+        &url,
+        command.to_string(),
+        notifier.timeout_ms,
+    )
+    .await
+    {
+        MarmotCall::Response(status, transport) if (200..300).contains(&status) => {
+            let returned = transport
+                .get("operationId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let returned_project = transport
+                .get("projectId")
+                .and_then(Value::as_str)
+                .unwrap_or(project);
+            if !returned.is_empty() && (returned != operation || returned_project != project) {
+                return onboard_note(response, "operation_identity_mismatch", false);
+            }
+            if let Some(object) = response.body.as_object_mut() {
+                object.insert("status".to_string(), serde_json::json!("accepted"));
+                object.insert("connected".to_string(), serde_json::json!(true));
+                object.insert(
+                    "phase".to_string(),
+                    transport
+                        .get("messagePhase")
+                        .cloned()
+                        .unwrap_or(serde_json::json!("not_submitted")),
+                );
+                object.insert(
+                    "reused".to_string(),
+                    transport
+                        .get("reused")
+                        .cloned()
+                        .unwrap_or(serde_json::json!(false)),
+                );
+                if let Some(pubkey) = transport.get("pubkey").and_then(Value::as_str) {
+                    object.insert(
+                        "accountPrefix".to_string(),
+                        serde_json::json!(&pubkey[..pubkey.len().min(8)]),
+                    );
+                }
+                if let Some(onboarding) =
+                    transport.get("onboarding").filter(|item| item.is_object())
+                {
+                    object.insert("onboarding".to_string(), onboarding.clone());
+                }
+                object.remove("dependency");
+                object.insert(
+                    "note".to_string(),
+                    serde_json::json!(
+                        "The Durable Object recorded this onboarding operation. A persisted group is not proof the recipient accepted the Welcome."
+                    ),
+                );
+            }
+            response
+        }
+        MarmotCall::Timeout => onboard_note(response, "marmot_timeout", false),
+        MarmotCall::Malformed => onboard_note(response, "marmot_response_invalid", false),
+        MarmotCall::Transport | MarmotCall::Response(_, _) => {
+            onboard_note(response, "marmot_transport_error", false)
+        }
+    }
+}
+
+fn onboard_note(mut response: ApiResponse, error: &str, connected: bool) -> ApiResponse {
+    if let Some(object) = response.body.as_object_mut() {
+        object.insert("status".to_string(), serde_json::json!("unavailable"));
+        object.insert("connected".to_string(), serde_json::json!(connected));
+        object.insert("error".to_string(), serde_json::json!(error));
+        object.insert(
+            "note".to_string(),
+            serde_json::json!(
+                "The operation id is stored. The Marmot transport did not establish the conversation."
+            ),
+        );
+    }
+    response
 }
 
 pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
@@ -203,7 +373,70 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
             console_log!("push reconciliation failed: {error}");
         }
     }
+    if push_deadline.saturating_sub(now_ms()) >= 1_500 {
+        drive_marmot_lifecycle(&notifier, now_ms()).await;
+    }
     Ok(())
+}
+
+async fn drive_marmot_lifecycle(notifier: &WorkerNotifier, now: i64) {
+    let Some(namespace) = &notifier.marmot else {
+        return;
+    };
+    if notifier.vars.get("ENABLE_MARMOT").map(String::as_str) != Some("true") {
+        return;
+    }
+    let Some(token) = notifier
+        .vars
+        .get("MARMOT_OPERATOR_TOKEN")
+        .filter(|token| !token.is_empty())
+    else {
+        return;
+    };
+    let relays: Vec<String> = notifier
+        .vars
+        .get("BOOTSTRAP_RELAYS")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let maintain = (now / 3_600_000) % 6 == 0 && (now / 60_000) % 60 == 0;
+    for project in watchdog_core::catalog::PROJECTS {
+        let Some(url) = watchdog_core::delivery::marmot_sender_url(project.id) else {
+            continue;
+        };
+        let _ = post_marmot(
+            namespace,
+            token,
+            &url,
+            serde_json::json!({"op": "establish", "relays": relays}).to_string(),
+            notifier.timeout_ms,
+        )
+        .await;
+        let _ = post_marmot(
+            namespace,
+            token,
+            &url,
+            serde_json::json!({"op": "sync"}).to_string(),
+            notifier.timeout_ms,
+        )
+        .await;
+        if maintain {
+            let _ = post_marmot(
+                namespace,
+                token,
+                &url,
+                serde_json::json!({"op": "maintain"}).to_string(),
+                notifier.timeout_ms,
+            )
+            .await;
+        }
+    }
 }
 
 struct WorkerHttp;
@@ -313,64 +546,126 @@ impl Notifier for WorkerNotifier {
     async fn deliver_marmot(&self, row: &OutboxRow, _claim: &str) -> DeliveryOutcome {
         let _ = self.db;
         let _ = MARMOT_ENGINE_STATUS;
+        let admitted = watchdog_core::delivery::marmot_operation_admitted(
+            row.message_state.as_deref(),
+            row.message_event_id.as_deref(),
+            row.preserve_message,
+        );
         let Some(namespace) = &self.marmot else {
-            return marmot_unavailable();
+            return marmot_unavailable("marmot_engine_unavailable");
         };
-        let Ok(id) = namespace.id_from_name(&row.project_id) else {
-            return marmot_unavailable();
-        };
-        let Ok(stub) = id.get_stub() else {
-            return marmot_hold("marmot_object_unavailable");
-        };
-        let headers = Headers::new();
-        if let Some(token) = self
+        let Some(token) = self
             .vars
             .get("MARMOT_OPERATOR_TOKEN")
             .filter(|token| !token.is_empty())
-        {
-            if headers
-                .set("authorization", &format!("Bearer {token}"))
-                .is_err()
-            {
-                return marmot_hold("marmot_object_unavailable");
-            }
-        }
-        let _ = headers.set("content-type", "application/json");
-        let body = serde_json::json!({
-            "op": "send",
-            "operationId": row.id,
-            "projectId": row.project_id,
-            "text": row.payload_text,
-            "publish": true
-        })
-        .to_string();
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post)
-            .with_headers(headers)
-            .with_body(Some(wasm_bindgen::JsValue::from_str(&body)));
-        let Ok(request) = Request::new_with_init("https://marmot-sender.internal/marmot", &init)
         else {
-            return marmot_hold("marmot_object_unavailable");
+            return marmot_unavailable("marmot_unauthorized");
         };
-        let Ok(mut response) = stub.fetch_with_request(request).await else {
-            return marmot_hold("marmot_object_unavailable");
+        let Some(url) = watchdog_core::delivery::marmot_sender_url(&row.project_id) else {
+            return marmot_unavailable("invalid_project");
         };
-        let Ok(text) = response.text().await else {
-            return marmot_hold("marmot_response_invalid");
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&text) else {
-            return marmot_hold("marmot_response_invalid");
-        };
-        cloudflare_outcome(&value)
+        match post_marmot(
+            namespace,
+            token,
+            &url,
+            marmot_delivery_body(row, admitted),
+            self.timeout_ms,
+        )
+        .await
+        {
+            MarmotCall::Response(status, value) => {
+                cloudflare_outcome(status, &value, &row.project_id, &row.id, admitted)
+            }
+            MarmotCall::Timeout => marmot_hold("marmot_timeout", admitted),
+            MarmotCall::Transport => marmot_hold("marmot_transport_error", admitted),
+            MarmotCall::Malformed => marmot_hold("marmot_response_invalid", admitted),
+        }
     }
 }
 
-fn marmot_unavailable() -> DeliveryOutcome {
+fn marmot_delivery_body(row: &OutboxRow, admitted: bool) -> String {
+    let mut body = serde_json::json!({
+        "op": watchdog_core::delivery::marmot_transport_op(admitted),
+        "operationId": row.id,
+        "publish": true
+    });
+    if !admitted {
+        body["text"] = serde_json::json!(row.payload_text);
+    }
+    body.to_string()
+}
+
+enum MarmotCall {
+    Response(u16, Value),
+    Timeout,
+    Transport,
+    Malformed,
+}
+
+async fn post_marmot(
+    namespace: &ObjectNamespace,
+    token: &str,
+    url: &str,
+    body: String,
+    timeout_ms: u64,
+) -> MarmotCall {
+    let project = url
+        .split("sender=")
+        .nth(1)
+        .unwrap_or_default()
+        .split('&')
+        .next()
+        .unwrap_or_default();
+    let Ok(id) = namespace.id_from_name(project) else {
+        return MarmotCall::Transport;
+    };
+    let Ok(stub) = id.get_stub() else {
+        return MarmotCall::Transport;
+    };
+    let headers = Headers::new();
+    if headers
+        .set("authorization", &format!("Bearer {token}"))
+        .is_err()
+        || headers.set("content-type", "application/json").is_err()
+    {
+        return MarmotCall::Transport;
+    }
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(wasm_bindgen::JsValue::from_str(&body)));
+    let Ok(request) = Request::new_with_init(url, &init) else {
+        return MarmotCall::Transport;
+    };
+    let fetch = stub.fetch_with_request(request);
+    futures_util::pin_mut!(fetch);
+    let mut response =
+        match futures_util::future::select(fetch, Delay::from(Duration::from_millis(timeout_ms)))
+            .await
+        {
+            Either::Left((Ok(response), _)) => response,
+            Either::Left((Err(_), _)) => return MarmotCall::Transport,
+            Either::Right((_, _)) => return MarmotCall::Timeout,
+        };
+    let status = response.status_code();
+    let Ok(text) = response.text().await else {
+        return MarmotCall::Malformed;
+    };
+    if text.len() > 65_536 {
+        return MarmotCall::Malformed;
+    }
+    match serde_json::from_str::<Value>(&text) {
+        Ok(value) => MarmotCall::Response(status, value),
+        Err(_) => MarmotCall::Malformed,
+    }
+}
+
+fn marmot_unavailable(error: &str) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
         terminal: true,
         hold_attempt: false,
-        error: Some("marmot_engine_unavailable".to_string()),
+        error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),
         message_phase: None,
@@ -381,7 +676,7 @@ fn marmot_unavailable() -> DeliveryOutcome {
     }
 }
 
-fn marmot_hold(error: &str) -> DeliveryOutcome {
+fn marmot_hold(error: &str, admitted: bool) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
         terminal: false,
@@ -389,19 +684,59 @@ fn marmot_hold(error: &str) -> DeliveryOutcome {
         error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),
-        message_phase: Some("not_submitted".to_string()),
-        push_phase: Some("not_attempted".to_string()),
+        message_phase: if admitted {
+            None
+        } else {
+            Some("not_submitted".to_string())
+        },
+        push_phase: if admitted {
+            None
+        } else {
+            Some("not_attempted".to_string())
+        },
         message_event_id: None,
         push_envelope: None,
         operation: None,
     }
 }
 
-fn cloudflare_outcome(value: &Value) -> DeliveryOutcome {
+fn cloudflare_outcome(
+    status: u16,
+    value: &Value,
+    project: &str,
+    operation_id: &str,
+    admitted: bool,
+) -> DeliveryOutcome {
+    if status == 401 || value.get("error").and_then(Value::as_str) == Some("unauthorized") {
+        return marmot_unavailable("marmot_unauthorized");
+    }
+    if status == 400 {
+        let error = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("invalid_project");
+        return marmot_unavailable(error);
+    }
+    if !(200..300).contains(&status) {
+        return marmot_hold("marmot_transport_error", admitted);
+    }
+    if value.get("ok") == Some(&serde_json::Value::Bool(false)) {
+        let error = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("marmot_rejected");
+        if error.contains("retired operation") {
+            return marmot_hold("retired_operation_unrecorded", admitted);
+        }
+        return marmot_hold(error, admitted);
+    }
     let operation = watchdog_core::delivery::operation_from_transport(
         value,
         watchdog_core::delivery::TransportOrigin::CloudflareObject,
     );
+    if !watchdog_core::delivery::transport_identity_matches(&operation, project, operation_id) {
+        return marmot_hold("operation_identity_mismatch", admitted);
+    }
     let accepted = operation.message == Some(watchdog_core::delivery::MessageState::RelayAccepted);
     let settled = operation.disposition == watchdog_core::delivery::OperationDisposition::Settled;
     DeliveryOutcome {

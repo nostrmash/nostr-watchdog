@@ -143,11 +143,55 @@ jobs:
       - name: Workerd scheduled suite
         run: sh tests/runtime/worker-scheduled.sh
 
-  # These stay off this branch until the named tree is integrated here.
-  # Adding them now would fail for a missing workspace, not for a product defect:
-  # - Agent A's native Marmot helper tests and executable interoperability
-  # - the MDK engine probe as its own job (wasm-worker already checks probes/mdk-engine)
-  # - Agent B's Cloudflare Marmot workspace, the OpenMLS Durable Object probe,
-  #   and a workerd MDK conversation test
-  # The SQLCipher WASM compile probe is a known incompatibility and is not required.
-  # Public relay tests stay opt-in.
+  native-marmot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          components: llvm-tools
+
+      - name: Install pinned Odin
+        run: |
+          curl -fsSL -o /tmp/odin.tar.gz \
+            https://github.com/odin-lang/Odin/releases/download/dev-2026-10/odin-linux-amd64-dev-2026-10.tar.gz
+          echo "c3c8b095621fd0c75f7f73e3a0829f1b4d45324225f20ba11ed8dc4da310a8ab  /tmp/odin.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/odin-dev-2026-10"
+          tar -xzf /tmp/odin.tar.gz -C "$HOME/.local/odin-dev-2026-10" --strip-components=1
+          echo "ODIN=$HOME/.local/odin-dev-2026-10/odin" >> "$GITHUB_ENV"
+          "$HOME/.local/odin-dev-2026-10/odin" version | grep -E "dev-2026-10|84bc3fc"
+
+      - name: Test and build the helper
+        run: |
+          cargo test --manifest-path crates/watchdog-marmot/Cargo.toml --lib
+          cargo build --release --manifest-path crates/watchdog-marmot/Cargo.toml
+          test -x crates/watchdog-marmot/target/release/watchdog-marmot
+
+  cloudflare-marmot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          targets: wasm32-unknown-unknown
+          components: llvm-tools
+
+      - name: Test the Marmot Worker workspace
+        run: cargo test --manifest-path crates/watchdog-marmot-worker/Cargo.toml --workspace --lib
+
+      - name: Check the Durable Object for wasm
+        run: cargo check --manifest-path crates/watchdog-marmot-worker/worker/Cargo.toml --target wasm32-unknown-unknown
+
+  # The SQLCipher WASM compile probe is a known incompatibility and is not a required job.
+  # Public relay tests stay opt-in. The ignored workerd conversation test is not this
+  # workflow's operational two-Worker incident; that path is WorkerNotifier::deliver_marmot.

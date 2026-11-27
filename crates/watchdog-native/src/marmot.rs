@@ -852,6 +852,53 @@ async fn read_bounded_line(stream: &mut UnixStream, max: usize) -> Result<String
     String::from_utf8(bytes).map_err(|_| "marmot_response_invalid".to_string())
 }
 
+pub async fn operator_onboard(
+    vars: &HashMap<String, String>,
+    project_id: &str,
+    operation_id: &str,
+    replace: bool,
+) -> Result<Value, String> {
+    let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
+    let Some(project) = project_by_id(project_id) else {
+        return Err("project_invalid".to_string());
+    };
+    let nsec = get(project.sender_secret);
+    if nsec.is_empty() {
+        return Err("sender_key_missing".to_string());
+    }
+    let Some(recipient_raw) =
+        project_recipient(&get("PROJECT_RECIPIENTS"), &get("ADMIN_NPUB"), project.id)
+    else {
+        return Err("recipient_missing".to_string());
+    };
+    let recipient =
+        recipient_pubkey(&recipient_raw).map_err(|_| "recipient_invalid".to_string())?;
+    let Some(socket) = socket_path(vars) else {
+        return Err("marmot_helper_unconfigured".to_string());
+    };
+    ensure_helper(vars, &socket).await?;
+    let settings = load_settings(&get);
+    let setup = OnboardRequest {
+        operation_id: operation_id.to_string(),
+        replace,
+    };
+    let (account, group) = ensure_onboard(&socket, &nsec, &settings.bootstrap, &recipient, &setup)
+        .await
+        .map_err(|outcome| {
+            outcome
+                .error
+                .unwrap_or_else(|| "onboard_failed".to_string())
+        })?;
+    Ok(json!({
+        "ok": true,
+        "operationId": operation_id,
+        "phase": "established",
+        "accountPrefix": &account[..account.len().min(8)],
+        "group": group,
+        "replace": replace
+    }))
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

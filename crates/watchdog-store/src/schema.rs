@@ -49,9 +49,13 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0011_delivery_fencing",
         include_str!("../../../migrations/0011_delivery_fencing.sql"),
     ),
+    (
+        "0012_transport_evidence",
+        include_str!("../../../migrations/0012_transport_evidence.sql"),
+    ),
 ];
 
-pub const SCHEMA_VERSION: &str = "0011_delivery_fencing";
+pub const SCHEMA_VERSION: &str = "0012_transport_evidence";
 
 /// A row is due for terminal settlement when its immutable start is old enough
 /// or a transport-supplied counter has reached its own budget. `updated_at`
@@ -126,6 +130,10 @@ pub const REQUIRED_COLUMNS: &[(&str, &str)] = &[
     ("alert_outbox", "auth_token_waits"),
     ("alert_outbox", "auth_push_publications"),
     ("alert_outbox", "auth_push_reconciles"),
+    ("alert_outbox", "push_event_id"),
+    ("alert_outbox", "evidence"),
+    ("alert_outbox", "transport_disposition"),
+    ("alert_outbox", "transport_updated_at"),
     ("incidents", "decision_generation"),
     ("incidents", "acked_at"),
     ("scheduler_runs", "run_owner"),

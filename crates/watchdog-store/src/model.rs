@@ -118,6 +118,10 @@ pub struct OutboxRow {
     pub auth_token_waits: Option<i64>,
     pub auth_push_publications: Option<i64>,
     pub auth_push_reconciles: Option<i64>,
+    pub push_event_id: Option<String>,
+    pub evidence: Option<String>,
+    pub transport_disposition: Option<String>,
+    pub transport_updated_at: Option<i64>,
 }
 
 #[derive(Clone, Debug)]

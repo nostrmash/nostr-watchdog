@@ -106,6 +106,7 @@ pub enum EvidenceClass {
     TokenAvailabilityOnly,
     PublishErrorObserved,
     MdkDiscardsPublishResult,
+    PartialPush,
     NotObserved,
 }
 
@@ -118,6 +119,7 @@ impl EvidenceClass {
             Self::TokenAvailabilityOnly => "token_availability_only",
             Self::PublishErrorObserved => "publish_error_observed",
             Self::MdkDiscardsPublishResult => "mdk_discards_publish_result",
+            Self::PartialPush => "partial_push",
             Self::NotObserved => "not_observed",
         }
     }
@@ -136,6 +138,7 @@ impl EvidenceClass {
             "mdk_discards_publish_result" | "no_correlated_push_evidence" => {
                 Self::MdkDiscardsPublishResult
             }
+            "partial_push" => Self::PartialPush,
             _ => Self::NotObserved,
         }
     }
@@ -418,7 +421,23 @@ fn decide_lifecycle(
         Some(PushState::Rejected | PushState::Expired | PushState::TerminalFailure) => {
             LifecycleDecision::Accept
         }
-        Some(PushState::NotRequired | PushState::RelayAccepted) => LifecycleDecision::Accept,
+        Some(PushState::NotRequired) => LifecycleDecision::Accept,
+        Some(PushState::RelayAccepted)
+            if input.disposition != Some(OperationDisposition::Reconcile) =>
+        {
+            LifecycleDecision::Accept
+        }
+        Some(PushState::RelayAccepted) => {
+            let attempts = input
+                .counters
+                .push_reconciles
+                .or(input.counters.push_publications);
+            if attempts.is_some_and(|count| count >= 2) || input.age_ms >= 900_000 {
+                LifecycleDecision::Accept
+            } else {
+                retry(attempts.unwrap_or(0))
+            }
+        }
         Some(PushState::Unobservable) if input.permanent_push_uncertainty => {
             LifecycleDecision::Accept
         }
@@ -468,9 +487,17 @@ fn json_i64(value: &Value, keys: &[&str]) -> Option<i64> {
         if item.is_null() {
             return None;
         }
-        item.as_i64()
-            .or_else(|| item.as_u64().map(|number| number as i64))
+        if let Some(number) = item.as_i64() {
+            return Some(number);
+        }
+        item.as_u64().and_then(|number| i64::try_from(number).ok())
     })
+}
+
+/// A counter is an observed non-negative integer. A negative value, a
+/// fractional value, or a number that does not fit in `i64` is not stored.
+fn json_counter(value: &Value, keys: &[&str]) -> Option<i64> {
+    json_i64(value, keys).filter(|number| *number >= 0)
 }
 
 fn json_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -519,29 +546,110 @@ fn disposition_of(value: &Value) -> OperationDisposition {
 }
 
 fn counters_from(value: &Value, origin: TransportOrigin) -> AuthoritativeCounters {
-    let nested = value.get("operation").unwrap_or(&Value::Null);
-    let pick = |top: &[&str], camel: &[&str]| {
-        json_i64(nested, camel).or_else(|| json_i64(value, top).or_else(|| json_i64(value, camel)))
-    };
     match origin {
-        TransportOrigin::NativeHelper => AuthoritativeCounters {
-            message_submissions: pick(&["message_attempts"], &["messageAttempts"]),
-            message_publications: None,
-            message_reconciles: None,
-            ambiguous_reconciles: pick(&["unknown_attempts"], &["unknownAttempts"]),
-            token_waits: pick(&["token_wait_attempts"], &["tokenWaitAttempts"]),
-            push_publications: pick(&["push_attempts"], &["pushPublicationAttempts"]),
-            push_reconciles: pick(&["unobservable_attempts"], &["unobservableAttempts"]),
-        },
+        TransportOrigin::NativeHelper => {
+            let source = value
+                .get("operation")
+                .filter(|item| item.is_object())
+                .unwrap_or(value);
+            AuthoritativeCounters {
+                message_submissions: json_counter(source, &["messageSubmissions"]),
+                message_publications: json_counter(source, &["messagePublications"]),
+                message_reconciles: json_counter(source, &["messageReconciles"]),
+                ambiguous_reconciles: json_counter(source, &["ambiguousReconciles"]),
+                token_waits: json_counter(source, &["tokenWaits"]),
+                push_publications: json_counter(source, &["pushPublications"]),
+                push_reconciles: json_counter(source, &["pushReconciles"]),
+            }
+        }
         TransportOrigin::CloudflareObject => AuthoritativeCounters {
-            message_submissions: pick(&[], &["messageAttempts"]),
-            message_publications: None,
-            message_reconciles: None,
-            ambiguous_reconciles: None,
-            token_waits: None,
-            push_publications: pick(&[], &["pushAttempts"]),
-            push_reconciles: None,
+            message_submissions: json_counter(value, &["messageAttempts"]),
+            message_publications: json_counter(value, &["messagePublicationAttempts"]),
+            message_reconciles: json_counter(value, &["messageReconcileAttempts"]),
+            ambiguous_reconciles: json_counter(value, &["unknownAttempts"]),
+            token_waits: json_counter(value, &["tokenWaitAttempts"]),
+            push_publications: json_counter(value, &["pushPublicationAttempts"]),
+            push_reconciles: json_counter(value, &["unobservableAttempts"]),
         },
+    }
+}
+
+/// The Durable Object name and the request project are the same sender.
+/// The character set is the one the transport accepts, so the value can be
+/// placed in the query string without further encoding.
+pub fn marmot_sender_url(project: &str) -> Option<String> {
+    if (1..=128).contains(&project.len())
+        && project
+            .chars()
+            .all(|item| item.is_ascii_alphanumeric() || matches!(item, '_' | ':' | '-'))
+    {
+        Some(format!(
+            "https://marmot-sender.internal/marmot?sender={project}"
+        ))
+    } else {
+        None
+    }
+}
+
+/// A new alert is `deliver`. An operation the store has already admitted is
+/// `reconcile`, which does not encrypt another application message.
+pub fn marmot_transport_op(admitted: bool) -> &'static str {
+    if admitted {
+        "reconcile"
+    } else {
+        "deliver"
+    }
+}
+
+pub fn marmot_operation_admitted(
+    message_state: Option<&str>,
+    message_event_id: Option<&str>,
+    preserve_message: bool,
+) -> bool {
+    preserve_message
+        || message_event_id.is_some()
+        || matches!(
+            message_state,
+            Some(
+                "relay_accepted"
+                    | "accepted"
+                    | "accepted_pending"
+                    | "prepared"
+                    | "completion_unknown"
+                    | "rejected"
+            )
+        )
+}
+
+/// A response for another operation or project is not this alert's evidence.
+pub fn transport_identity_matches(
+    operation: &OperationResult,
+    project: &str,
+    operation_id: &str,
+) -> bool {
+    !operation.operation_id.is_empty()
+        && operation.operation_id == operation_id
+        && (operation.project_id.is_empty() || operation.project_id == project)
+}
+
+/// Sanitized fields the operational store keeps. This is not the transport body.
+pub fn transport_projection(operation: &OperationResult) -> String {
+    let text = json!({
+        "operationId": operation.operation_id,
+        "projectId": operation.project_id,
+        "messageEventId": operation.message_event_id,
+        "pushEventId": operation.push_event_id,
+        "evidence": operation.evidence.as_str(),
+        "disposition": operation.disposition.as_str(),
+        "startedAtMs": operation.started_at_ms,
+        "updatedAtMs": operation.updated_at_ms,
+        "error": operation.error,
+    })
+    .to_string();
+    if text.len() > 2_048 {
+        text.chars().take(2_048).collect()
+    } else {
+        text
     }
 }
 
@@ -902,14 +1010,16 @@ mod tests {
                 "message_state": "relay_accepted",
                 "message_event_id": "abc",
                 "push": "unobservable",
-                "push_attempts": null,
-                "message_attempts": 1,
-                "unknown_attempts": 0,
+                "message_attempts": 4,
+                "push_attempts": 9,
                 "settled": true,
                 "retryAtMs": 15_000,
                 "operation": {
-                    "retryAtMs": 1_700_000_000_000_i64,
-                    "pushPublicationAttempts": null
+                    "messageSubmissions": 1,
+                    "messagePublications": null,
+                    "pushPublications": null,
+                    "pushReconciles": 1,
+                    "retryAtMs": 1_700_000_000_000_i64
                 }
             }),
             TransportOrigin::NativeHelper,
@@ -917,25 +1027,45 @@ mod tests {
         assert_eq!(native.retry_after_ms, Some(15_000));
         assert!(native.permanent_push_uncertainty);
         assert_eq!(native.counters.message_submissions, Some(1));
+        assert!(native.counters.message_publications.is_none());
         assert!(native.counters.push_publications.is_none());
+        assert_eq!(native.counters.push_reconciles, Some(1));
         assert_eq!(native.disposition, OperationDisposition::Settled);
 
         let cloud = operation_from_transport(
             &json!({
                 "operationId": "alt_1",
+                "projectId": "smartflowsocial",
                 "messagePhase": "relay_accepted",
                 "pushPhase": "unobservable",
-                "settled": false,
+                "disposition": "reconcile",
                 "reconcileAfterMs": 15_000,
                 "messageAttempts": 1,
-                "pushAttempts": 1
+                "messagePublicationAttempts": 1,
+                "pushAttempts": 9,
+                "pushPublicationAttempts": 1,
+                "unobservableAttempts": 0,
+                "messagePublicationAttemptsNegative": -1
             }),
             TransportOrigin::CloudflareObject,
         );
         assert!(!cloud.permanent_push_uncertainty);
         assert_eq!(cloud.disposition, OperationDisposition::Reconcile);
+        assert_eq!(cloud.counters.message_submissions, Some(1));
+        assert_eq!(cloud.counters.message_publications, Some(1));
         assert_eq!(cloud.counters.push_publications, Some(1));
+        assert_eq!(cloud.counters.push_reconciles, Some(0));
         assert!(cloud.counters.token_waits.is_none());
+        let rejected = operation_from_transport(
+            &json!({
+                "operationId": "alt_1",
+                "messageAttempts": -1,
+                "pushPublicationAttempts": -3
+            }),
+            TransportOrigin::CloudflareObject,
+        );
+        assert!(rejected.counters.message_submissions.is_none());
+        assert!(rejected.counters.push_publications.is_none());
         assert_eq!(
             operation_from_transport(
                 &json!({"messagePhase": "not-a-state", "pushPhase": "rejected"}),
@@ -944,5 +1074,136 @@ mod tests {
             .message,
             None
         );
+    }
+
+    #[test]
+    fn native_fixtures_use_nested_counters_and_ignore_legacy_attempt_fields() {
+        let fixtures: Value =
+            serde_json::from_str(include_str!("../../../docs/native-operation-fixtures.json"))
+                .expect("fixtures");
+        let permanent = operation_from_transport(
+            &fixtures["permanentUnobservablePush"],
+            TransportOrigin::NativeHelper,
+        );
+        assert!(permanent.permanent_push_uncertainty);
+        assert_eq!(permanent.counters.message_submissions, Some(1));
+        assert!(permanent.counters.message_publications.is_none());
+        assert!(permanent.counters.push_publications.is_none());
+        assert_eq!(permanent.counters.push_reconciles, Some(1));
+        assert_eq!(
+            interpret(LifecycleInput {
+                destination: "marmot",
+                message_phase: permanent.message.map(MessageState::as_str),
+                push_phase: permanent.push.map(PushState::as_str),
+                counters: permanent.counters,
+                age_ms: 1_000,
+                hold: false,
+                terminal: false,
+                accepted: true,
+                ordinary_attempts: 0,
+                disposition: Some(permanent.disposition),
+                retry_after_ms: permanent.retry_after_ms,
+                permanent_push_uncertainty: permanent.permanent_push_uncertainty,
+            })
+            .decision,
+            LifecycleDecision::Accept
+        );
+
+        let pending = operation_from_transport(
+            &fixtures["messagePublicationUncertain"],
+            TransportOrigin::NativeHelper,
+        );
+        assert_eq!(pending.counters.message_submissions, Some(1));
+        assert_eq!(pending.counters.message_reconciles, Some(1));
+        assert!(pending.counters.message_publications.is_none());
+        assert_eq!(pending.retry_after_ms, Some(15_000));
+
+        let unknown = operation_from_transport(
+            &fixtures["completionUnknown"],
+            TransportOrigin::NativeHelper,
+        );
+        assert!(unknown.counters.message_submissions.is_none());
+        assert_eq!(unknown.counters.ambiguous_reconciles, Some(1));
+    }
+
+    #[test]
+    fn a_reconcile_disposition_does_not_settle_on_an_aggregate_push_label() {
+        let decision = interpret(LifecycleInput {
+            destination: "marmot",
+            message_phase: Some("relay_accepted"),
+            push_phase: Some("relay_accepted"),
+            counters: AuthoritativeCounters {
+                message_submissions: Some(1),
+                message_publications: Some(1),
+                message_reconciles: Some(0),
+                ambiguous_reconciles: Some(0),
+                token_waits: Some(0),
+                push_publications: Some(1),
+                push_reconciles: Some(0),
+            },
+            age_ms: 1_000,
+            hold: true,
+            terminal: false,
+            accepted: true,
+            ordinary_attempts: 0,
+            disposition: Some(OperationDisposition::Reconcile),
+            retry_after_ms: Some(15_000),
+            permanent_push_uncertainty: false,
+        });
+        assert_eq!(
+            decision.decision,
+            LifecycleDecision::Reconcile { retry_ms: 15_000 }
+        );
+    }
+
+    #[test]
+    fn cloudflare_recorded_push_attempts_are_not_publication_attempts() {
+        let value = json!({
+            "ok": true,
+            "operationId": "alert-1",
+            "projectId": "smartflowsocial",
+            "messagePhase": "relay_accepted",
+            "pushPhase": "unobservable",
+            "evidence": "partial_push",
+            "disposition": "reconcile",
+            "error": "publication_timeout",
+            "retryAfterMs": 15000,
+            "messageAttempts": 1,
+            "messagePublicationAttempts": 1,
+            "messageReconcileAttempts": 0,
+            "unknownAttempts": 0,
+            "tokenWaitAttempts": 0,
+            "pushAttempts": 4,
+            "pushPublicationAttempts": 1,
+            "unobservableAttempts": 1
+        });
+        let operation = operation_from_transport(&value, TransportOrigin::CloudflareObject);
+        assert_eq!(operation.evidence, EvidenceClass::PartialPush);
+        assert_eq!(operation.counters.push_publications, Some(1));
+        assert_eq!(operation.counters.push_reconciles, Some(1));
+        assert_ne!(operation.counters.push_publications, Some(4));
+        assert!(transport_identity_matches(
+            &operation,
+            "smartflowsocial",
+            "alert-1"
+        ));
+        assert!(!transport_identity_matches(
+            &operation,
+            "nostrmash",
+            "alert-1"
+        ));
+        assert_eq!(
+            marmot_sender_url("smartflowsocial").as_deref(),
+            Some("https://marmot-sender.internal/marmot?sender=smartflowsocial")
+        );
+        assert!(marmot_sender_url("bad project").is_none());
+        assert_eq!(marmot_transport_op(false), "deliver");
+        assert_eq!(marmot_transport_op(true), "reconcile");
+        assert!(marmot_operation_admitted(
+            Some("relay_accepted"),
+            None,
+            false
+        ));
+        assert!(!marmot_operation_admitted(None, None, false));
     }
 }

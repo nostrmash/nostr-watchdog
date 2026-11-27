@@ -469,7 +469,14 @@ async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>)
     let response = dispatch(
         &state,
         ApiRequest::Ready {
-            marmot_supported: true,
+            marmot_supported: state
+                .vars
+                .get("MARMOT_SOCKET")
+                .is_some_and(|value| !value.is_empty())
+                || state
+                    .vars
+                    .get("MARMOT_ROOT")
+                    .is_some_and(|value| !value.is_empty()),
             startup_grace: startup_grace(),
         },
         None,
@@ -616,10 +623,69 @@ async fn onboard(
         None,
     )
     .await;
-    (
-        StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        Json(response.body),
-    )
+    if response.status != 202 {
+        return (
+            StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Json(response.body),
+        );
+    }
+    let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let project = request
+        .get("projectId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let operation = request
+        .get("operationId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let replace = request
+        .get("replace")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut recorded = response.body;
+    match marmot::operator_onboard(&state.vars, project, operation, replace).await {
+        Ok(transport) => {
+            if let Some(object) = recorded.as_object_mut() {
+                object.insert("status".to_string(), json!("accepted"));
+                object.insert("connected".to_string(), json!(true));
+                object.insert(
+                    "phase".to_string(),
+                    transport
+                        .get("phase")
+                        .cloned()
+                        .unwrap_or(json!("established")),
+                );
+                object.insert(
+                    "accountPrefix".to_string(),
+                    transport
+                        .get("accountPrefix")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+                object.insert(
+                    "group".to_string(),
+                    transport.get("group").cloned().unwrap_or(Value::Null),
+                );
+                object.remove("dependency");
+                object.insert(
+                    "note".to_string(),
+                    json!("The helper recorded this onboarding operation. A group id is not proof the recipient accepted the Welcome."),
+                );
+            }
+        }
+        Err(error) => {
+            if let Some(object) = recorded.as_object_mut() {
+                object.insert("status".to_string(), json!("unavailable"));
+                object.insert("connected".to_string(), json!(false));
+                object.insert("error".to_string(), json!(error));
+                object.insert(
+                    "note".to_string(),
+                    json!("The operation id is stored. The helper did not establish the conversation."),
+                );
+            }
+        }
+    }
+    (StatusCode::ACCEPTED, Json(recorded))
 }
 
 async fn failed(

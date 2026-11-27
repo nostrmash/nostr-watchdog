@@ -66,19 +66,20 @@ The image runs as uid 10001 and keeps the database on `/data`. It contains `nost
 
 ## Cloudflare staging
 
-`wrangler.staging.toml` is the only Wrangler config for this branch's Worker. The existing `wrangler.jsonc` belongs to the TypeScript Worker. Do not deploy it from this branch over the production name.
+Two Workers. Neither has been deployed. The production Worker and production D1 database stay untouched. `wrangler.jsonc` belongs to the TypeScript Worker.
 
-```bash
-npx wrangler d1 create nostr-watchdog-rust-staging
-```
+1. Build the Marmot Worker with `crates/watchdog-marmot-worker/worker/build-release.sh`.
+2. Build the operational Worker with `worker-build --release` from `wrangler.staging.toml`.
+3. Create a staging D1 database named `nostr-watchdog-rust-staging`. Put only that id into `wrangler.staging.toml`.
+4. Apply `migrations/` to that database, including `0012_transport_evidence.sql`.
+5. Deploy `wrangler.marmot-staging.toml` first so class `MarmotSender` exists. Its migration tag is `v1`.
+6. Deploy `wrangler.staging.toml`. Its `MARMOT_SENDER` binding names script `nostr-watchdog-marmot-staging`.
+7. Store `MARMOT_OPERATOR_TOKEN` on the operational Worker and `MARMOT_STORAGE_KEY` on the Marmot Worker. Do not put the storage key on the operational Worker.
+8. Leave `WATCHDOG_ENABLED`, `ALERTS_ENABLED`, and `ENABLE_MARMOT` false until a deliberate activation.
 
-Put the new database id into `wrangler.staging.toml`. Leave the production id alone. Then:
+Local counterparts are `wrangler.marmot-local.toml` and `wrangler.rust-local.toml`. The runtime suite config does not declare the binding, so the scheduled suite does not call the Durable Object.
 
-```bash
-npx wrangler deploy --config wrangler.staging.toml
-```
-
-That deploy is manual. GitHub Actions on this branch does not publish a Worker. The staging config has not been deployed. A local workerd process has served health and readiness from `wrangler.rust-local.toml`. Do not bind production secrets to either config.
+That deploy is manual. GitHub Actions on this branch does not publish a Worker. Do not bind production secrets to either config.
 
 Building the Worker requires the `wasm32-unknown-unknown` target and `worker-build` 0.9. Wrangler is a Node tool used only at deploy time.
 
@@ -86,4 +87,4 @@ Building the Worker requires the `wasm32-unknown-unknown` target and `worker-bui
 
 No production traffic was measured. The native check loop is one process, one SQLite file, and one HTTP client. It does not keep relay sockets open between alerts. Vendor checks run hourly and store the GitHub JSON they parsed, bounded by the existing 7-day upstream retention.
 
-No Worker CPU sample exists. Local workerd has served health and the OpenMLS probe, and neither run was timed as a cost measurement. The TypeScript notes still apply to `main`: paid-plan cron CPU is required for gift-wrap work, and the free plan's 10 ms budget is not enough. The watchdog Worker does not construct a Durable Object. The OpenMLS probe does, and that cost was not measured. The native helper debug binary was about 222 MB; that is an unoptimized debug build, not a release size.
+No Worker CPU sample exists. Local workerd has served health and the OpenMLS probe, and neither run was timed as a cost measurement. The TypeScript notes still apply to `main`: paid-plan cron CPU is required for gift-wrap work, and the free plan's 10 ms budget is not enough. The operational Worker does not embed the Marmot class. It binds the class exported by the dedicated Marmot Worker. That cost was not measured. The native helper debug binary was about 222 MB; that is an unoptimized debug build, not a release size.

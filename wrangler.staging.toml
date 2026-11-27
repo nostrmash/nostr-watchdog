@@ -23,17 +23,17 @@ WATCHDOG_ENABLED = "false"
 ALERTS_ENABLED = "false"
 ENABLE_MARMOT = "false"
 ENABLE_NIP17 = "false"
-# Set these as secrets, not vars, before any Marmot staging run:
+# Set this as a secret on this Worker, not a var:
 #   MARMOT_OPERATOR_TOKEN
-#   MARMOT_STORAGE_KEY
-# Use a dedicated sender nsec and a dedicated recipient. Do not reuse production.
+# Do not put MARMOT_STORAGE_KEY on this Worker. That key belongs only to
+# nostr-watchdog-marmot-staging. Use a dedicated sender and recipient.
+# Do not reuse production identities.
 
-# D1 is omitted on purpose. Create a database named nostr-watchdog-rust-staging
-# and add it here only after the Worker actually runs the shared engine.
-# Do not paste the production database id into this file.
-#
-# The Marmot Durable Object class MarmotSender lives in
-# crates/watchdog-marmot-worker. It is not linked into this Worker yet, so
-# this file does not declare a MARMOT_SENDER binding. Adding the binding
-# before the class is exported by this script would fail deployment.
-# Keep ENABLE_MARMOT false until that link and a staging rehearsal exist.
+# D1 is omitted until a staging database is created. Do not paste the
+# production database id into this file. Alerts and Marmot stay off until
+# a deliberate staging activation.
+
+[[durable_objects.bindings]]
+name = "MARMOT_SENDER"
+class_name = "MarmotSender"
+script_name = "nostr-watchdog-marmot-staging"

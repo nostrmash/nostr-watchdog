@@ -139,6 +139,7 @@ pub trait OperationalStore {
         logical_id: Option<&str>,
         fallback: Option<&AlertDraft>,
         counters: &watchdog_core::delivery::AuthoritativeCounters,
+        projection: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError>;
     async fn retry_dead_letter(&self, id: &str, now: i64) -> Result<RetryMode, StoreError>;

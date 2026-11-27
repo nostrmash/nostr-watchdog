@@ -762,7 +762,16 @@ impl OperationalStore for D1Store<'_> {
             .run(
                 "UPDATE alert_outbox SET state = ?1, attempt_count = ?2, next_attempt_at = ?3, last_error = ?4,
                     accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL, claim_owner = NULL,
-                    message_phase = COALESCE(?7, message_phase), push_phase = COALESCE(?8, push_phase),
+                    message_phase = CASE
+                      WHEN ?7 IS NULL THEN message_phase
+                      WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
+                        AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_phase
+                      ELSE ?7 END,
+                    push_phase = CASE
+                      WHEN ?8 IS NULL THEN push_phase
+                      WHEN COALESCE(push_state, '') = 'relay_accepted'
+                        AND ?8 IN ('not_attempted', 'unknown', 'not_submitted', 'prepared') THEN push_phase
+                      ELSE ?8 END,
                     message_event_id = COALESCE(?9, message_event_id),
                     push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11
                  WHERE id = ?12 AND claim_token = ?13 AND claim_until IS NOT NULL AND claim_until >= ?11",
@@ -1275,6 +1284,7 @@ impl OperationalStore for D1Store<'_> {
         logical_id: Option<&str>,
         fallback: Option<&AlertDraft>,
         counters: &watchdog_core::delivery::AuthoritativeCounters,
+        projection: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError> {
         let completion = uuid::Uuid::new_v4().to_string();
@@ -1289,7 +1299,16 @@ impl OperationalStore for D1Store<'_> {
             "UPDATE alert_outbox
              SET state = ?1, attempt_count = ?2, next_attempt_at = ?3, last_error = ?4,
                  accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL,
-                 message_phase = COALESCE(?7, message_phase), push_phase = COALESCE(?8, push_phase),
+                 message_phase = CASE
+                   WHEN ?7 IS NULL THEN message_phase
+                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
+                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_phase
+                   ELSE ?7 END,
+                 push_phase = CASE
+                   WHEN ?8 IS NULL THEN push_phase
+                   WHEN COALESCE(push_state, '') = 'relay_accepted'
+                     AND ?8 IN ('not_attempted', 'unknown', 'not_submitted', 'prepared') THEN push_phase
+                   ELSE ?8 END,
                  message_event_id = COALESCE(?9, message_event_id),
                  push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11,
                  logical_id = COALESCE(logical_id, ?12),
@@ -1299,6 +1318,8 @@ impl OperationalStore for D1Store<'_> {
                    WHEN ?7 = 'accepted_pending' THEN 'accepted_pending'
                    WHEN ?7 = 'completion_unknown' THEN 'completion_unknown'
                    WHEN ?7 IN ('message_prepared', 'prepared') THEN 'prepared'
+                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
+                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_state
                    WHEN ?7 = 'not_submitted' THEN 'not_submitted'
                    WHEN ?7 IN ('rejected', 'failed') THEN 'rejected'
                    ELSE message_state END,
@@ -1307,6 +1328,8 @@ impl OperationalStore for D1Store<'_> {
                    WHEN ?8 IN ('relay_accepted', 'push_trigger_accepted') THEN 'relay_accepted'
                    WHEN ?8 = 'unknown' THEN 'unknown'
                    WHEN ?8 = 'not_required' THEN 'not_required'
+                   WHEN COALESCE(push_state, '') = 'relay_accepted'
+                     AND ?8 IN ('not_attempted', 'unknown', 'not_submitted', 'prepared') THEN push_state
                    WHEN ?8 = 'not_attempted' THEN 'not_attempted'
                    WHEN ?8 IN ('token_unavailable', 'push_token_unavailable') THEN 'token_unavailable'
                    WHEN ?8 IN ('prepared', 'push_trigger_prepared') THEN 'prepared'
@@ -1319,8 +1342,12 @@ impl OperationalStore for D1Store<'_> {
                    ELSE push_state END,
                  claim_owner = NULL,
                  completion_token = ?15,
-                 operation_started_at = COALESCE(operation_started_at, created_at),
+                 operation_started_at = COALESCE(operation_started_at, json_extract(?25, '$.startedAtMs'), created_at),
                  started_at_ms = COALESCE(started_at_ms, created_at),
+                 push_event_id = COALESCE(json_extract(?25, '$.pushEventId'), push_event_id),
+                 evidence = COALESCE(json_extract(?25, '$.evidence'), evidence),
+                 transport_disposition = COALESCE(json_extract(?25, '$.disposition'), transport_disposition),
+                 transport_updated_at = COALESCE(json_extract(?25, '$.updatedAtMs'), transport_updated_at),
                  message_phase_started_at = CASE
                    WHEN ?7 IS NOT NULL AND COALESCE(message_phase, '') != ?7 THEN ?11
                    ELSE message_phase_started_at END,
@@ -1393,6 +1420,7 @@ impl OperationalStore for D1Store<'_> {
                 optional_number(counters.push_reconciles),
                 number(require_fallback),
                 text(&fallback_logical),
+                optional_text(projection),
             ],
         )?;
         let mut statements = Vec::new();
@@ -1996,6 +2024,7 @@ pub async fn probe_completion_fence(store: &D1Store<'_>, now: i64) -> Result<Val
         Some("fence:src"),
         Some(&winner_fallback),
         &unknown,
+        None,
         now,
     )
     .await?;
@@ -2016,6 +2045,7 @@ pub async fn probe_completion_fence(store: &D1Store<'_>, now: i64) -> Result<Val
         Some("fence:src"),
         Some(&loser_fallback),
         &unknown,
+        None,
         now,
     )
     .await?;
@@ -2063,6 +2093,7 @@ pub async fn probe_completion_fence(store: &D1Store<'_>, now: i64) -> Result<Val
         Some("fence:block"),
         Some(&blocked_fallback),
         &unknown,
+        None,
         now,
     )
     .await?;
@@ -2243,5 +2274,9 @@ fn outbox_row(row: Value) -> OutboxRow {
         auth_token_waits: as_opt_i64(&row["auth_token_waits"]),
         auth_push_publications: as_opt_i64(&row["auth_push_publications"]),
         auth_push_reconciles: as_opt_i64(&row["auth_push_reconciles"]),
+        push_event_id: row["push_event_id"].as_str().map(str::to_string),
+        evidence: row["evidence"].as_str().map(str::to_string),
+        transport_disposition: row["transport_disposition"].as_str().map(str::to_string),
+        transport_updated_at: as_opt_i64(&row["transport_updated_at"]),
     }
 }

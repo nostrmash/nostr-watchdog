@@ -1,0 +1,18 @@
+# Local Marmot Worker for workerd. Do not deploy this file.
+# The operational Worker binds this script as MARMOT_SENDER.
+
+name = "nostr-watchdog-marmot-local"
+main = "crates/watchdog-marmot-worker/worker/build/worker/shim.mjs"
+compatibility_date = "2026-11-26"
+workers_dev = false
+
+[vars]
+MARMOT_ALLOW_LOOPBACK = "1"
+
+[[durable_objects.bindings]]
+name = "MARMOT_SENDER"
+class_name = "MarmotSender"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MarmotSender"]

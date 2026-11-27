@@ -783,7 +783,16 @@ impl SqliteStore {
             "UPDATE alert_outbox
              SET state = ?1, attempt_count = ?2, next_attempt_at = ?3, last_error = ?4,
                  accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL,
-                 message_phase = COALESCE(?7, message_phase), push_phase = COALESCE(?8, push_phase),
+                 message_phase = CASE
+                   WHEN ?7 IS NULL THEN message_phase
+                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
+                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_phase
+                   ELSE ?7 END,
+                 push_phase = CASE
+                   WHEN ?8 IS NULL THEN push_phase
+                   WHEN COALESCE(push_state, '') = 'relay_accepted'
+                     AND ?8 IN ('not_attempted', 'unknown', 'not_submitted', 'prepared') THEN push_phase
+                   ELSE ?8 END,
                  message_event_id = COALESCE(?9, message_event_id),
                  push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11,
                  message_state = CASE
@@ -792,6 +801,8 @@ impl SqliteStore {
                    WHEN ?7 = 'accepted_pending' THEN 'accepted_pending'
                    WHEN ?7 = 'completion_unknown' THEN 'completion_unknown'
                    WHEN ?7 IN ('message_prepared', 'prepared') THEN 'prepared'
+                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
+                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_state
                    WHEN ?7 = 'not_submitted' THEN 'not_submitted'
                    WHEN ?7 IN ('rejected', 'failed') THEN 'rejected'
                    ELSE message_state END,
@@ -1399,6 +1410,7 @@ impl SqliteStore {
             logical_id,
             fallback,
             &watchdog_core::delivery::AuthoritativeCounters::unknown(),
+            None,
             now,
         )
     }
@@ -1421,6 +1433,7 @@ impl SqliteStore {
         logical_id: Option<&str>,
         fallback: Option<&AlertDraft>,
         counters: &watchdog_core::delivery::AuthoritativeCounters,
+        projection: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError> {
         let completion = uuid::Uuid::new_v4().to_string();
@@ -1430,7 +1443,16 @@ impl SqliteStore {
             "UPDATE alert_outbox
              SET state = ?1, attempt_count = ?2, next_attempt_at = ?3, last_error = ?4,
                  accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL,
-                 message_phase = COALESCE(?7, message_phase), push_phase = COALESCE(?8, push_phase),
+                 message_phase = CASE
+                   WHEN ?7 IS NULL THEN message_phase
+                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
+                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_phase
+                   ELSE ?7 END,
+                 push_phase = CASE
+                   WHEN ?8 IS NULL THEN push_phase
+                   WHEN COALESCE(push_state, '') = 'relay_accepted'
+                     AND ?8 IN ('not_attempted', 'unknown', 'not_submitted', 'prepared') THEN push_phase
+                   ELSE ?8 END,
                  message_event_id = COALESCE(?9, message_event_id),
                  push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11,
                  logical_id = COALESCE(logical_id, ?12),
@@ -1440,6 +1462,8 @@ impl SqliteStore {
                    WHEN ?7 = 'accepted_pending' THEN 'accepted_pending'
                    WHEN ?7 = 'completion_unknown' THEN 'completion_unknown'
                    WHEN ?7 IN ('message_prepared', 'prepared') THEN 'prepared'
+                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
+                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_state
                    WHEN ?7 = 'not_submitted' THEN 'not_submitted'
                    WHEN ?7 IN ('rejected', 'failed') THEN 'rejected'
                    ELSE message_state END,
@@ -1448,6 +1472,8 @@ impl SqliteStore {
                    WHEN ?8 IN ('relay_accepted', 'push_trigger_accepted') THEN 'relay_accepted'
                    WHEN ?8 = 'unknown' THEN 'unknown'
                    WHEN ?8 = 'not_required' THEN 'not_required'
+                   WHEN COALESCE(push_state, '') = 'relay_accepted'
+                     AND ?8 IN ('not_attempted', 'unknown', 'not_submitted', 'prepared') THEN push_state
                    WHEN ?8 = 'not_attempted' THEN 'not_attempted'
                    WHEN ?8 IN ('token_unavailable', 'push_token_unavailable') THEN 'token_unavailable'
                    WHEN ?8 IN ('prepared', 'push_trigger_prepared') THEN 'prepared'
@@ -1460,8 +1486,12 @@ impl SqliteStore {
                    ELSE push_state END,
                  claim_owner = NULL,
                  completion_token = ?15,
-                 operation_started_at = COALESCE(operation_started_at, created_at),
+                 operation_started_at = COALESCE(operation_started_at, json_extract(?23, '$.startedAtMs'), created_at),
                  started_at_ms = COALESCE(started_at_ms, created_at),
+                 push_event_id = COALESCE(json_extract(?23, '$.pushEventId'), push_event_id),
+                 evidence = COALESCE(json_extract(?23, '$.evidence'), evidence),
+                 transport_disposition = COALESCE(json_extract(?23, '$.disposition'), transport_disposition),
+                 transport_updated_at = COALESCE(json_extract(?23, '$.updatedAtMs'), transport_updated_at),
                  message_phase_started_at = CASE
                    WHEN ?7 IS NOT NULL AND COALESCE(message_phase, '') != ?7 THEN ?11
                    ELSE message_phase_started_at END,
@@ -1528,6 +1558,7 @@ impl SqliteStore {
                 counters.token_waits,
                 counters.push_publications,
                 counters.push_reconciles,
+                projection,
             ],
         )?;
         if changed == 0 {
@@ -1947,7 +1978,8 @@ fn read_outbox(conn: &Connection, id: &str) -> Result<Option<OutboxRow>, StoreEr
                 message_phase_started_at, push_phase_started_at,
                 auth_message_submissions, auth_message_publications, auth_message_reconciles,
                 auth_ambiguous_reconciles, auth_token_waits, auth_push_publications,
-                auth_push_reconciles
+                auth_push_reconciles, push_event_id, evidence, transport_disposition,
+                transport_updated_at
          FROM alert_outbox WHERE id = ?1",
         params![id],
         |row| {
@@ -2006,6 +2038,10 @@ fn read_outbox(conn: &Connection, id: &str) -> Result<Option<OutboxRow>, StoreEr
                 auth_token_waits: row.get(51)?,
                 auth_push_publications: row.get(52)?,
                 auth_push_reconciles: row.get(53)?,
+                push_event_id: row.get(54)?,
+                evidence: row.get(55)?,
+                transport_disposition: row.get(56)?,
+                transport_updated_at: row.get(57)?,
             })
         },
     )
@@ -2242,6 +2278,7 @@ impl OperationalStore for SqliteStore {
         logical_id: Option<&str>,
         fallback: Option<&watchdog_core::domain::AlertDraft>,
         counters: &watchdog_core::delivery::AuthoritativeCounters,
+        projection: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError> {
         SqliteStore::finish_owned(
@@ -2261,6 +2298,7 @@ impl OperationalStore for SqliteStore {
             logical_id,
             fallback,
             counters,
+            projection,
             now,
         )
     }
@@ -3646,6 +3684,7 @@ mod tests {
                 None,
                 None,
                 &counters,
+                None,
                 20,
             )
             .unwrap());
@@ -3675,6 +3714,7 @@ mod tests {
                 None,
                 None,
                 &counters,
+                None,
                 30,
             )
             .unwrap());
@@ -3716,6 +3756,87 @@ mod tests {
     }
 
     #[test]
+    fn accepted_message_evidence_survives_a_later_incomplete_response() {
+        let store = SqliteStore::memory().unwrap();
+        store
+            .insert_alert(
+                &draft("alt_m", Destination::Marmot, "incident:keep:marmot"),
+                10,
+            )
+            .unwrap();
+        let claimed = store
+            .claim_outbox(10, 100, Some("marmot"), 1, "delivery", 0, "runtime-a")
+            .unwrap();
+        let token = claimed[0].claim_token.clone().unwrap();
+        let projection = r#"{"pushEventId":"push-1","evidence":"relay_acknowledgement","disposition":"reconcile","startedAtMs":10,"updatedAtMs":20}"#;
+        assert!(store
+            .finish_owned(
+                "alt_m",
+                &token,
+                DeliveryState::Retrying,
+                0,
+                30,
+                None,
+                None,
+                None,
+                Some("relay_accepted"),
+                Some("unobservable"),
+                Some("event-1"),
+                None,
+                Some("incident:keep"),
+                None,
+                &watchdog_core::delivery::AuthoritativeCounters {
+                    message_submissions: Some(1),
+                    message_publications: None,
+                    message_reconciles: None,
+                    ambiguous_reconciles: None,
+                    token_waits: None,
+                    push_publications: None,
+                    push_reconciles: Some(1),
+                },
+                Some(projection),
+                20,
+            )
+            .unwrap());
+        let claimed = store
+            .claim_outbox(40, 200, Some("marmot"), 1, "push", 0, "runtime-b")
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let token = claimed[0].claim_token.clone().unwrap();
+        let later = r#"{"startedAtMs":999,"updatedAtMs":50}"#;
+        assert!(store
+            .finish_owned(
+                "alt_m",
+                &token,
+                DeliveryState::Retrying,
+                0,
+                60,
+                Some("marmot_timeout"),
+                None,
+                None,
+                Some("not_submitted"),
+                Some("not_attempted"),
+                None,
+                None,
+                Some("incident:keep"),
+                None,
+                &watchdog_core::delivery::AuthoritativeCounters::unknown(),
+                Some(later),
+                50,
+            )
+            .unwrap());
+        let row = store.read_outbox_row("alt_m").unwrap().unwrap();
+        assert_eq!(row.message_state.as_deref(), Some("relay_accepted"));
+        assert_eq!(row.message_event_id.as_deref(), Some("event-1"));
+        assert_eq!(row.push_event_id.as_deref(), Some("push-1"));
+        assert_eq!(row.evidence.as_deref(), Some("relay_acknowledgement"));
+        assert_eq!(row.operation_started_at, Some(10));
+        assert_eq!(row.transport_updated_at, Some(50));
+        assert_eq!(row.auth_message_submissions, Some(1));
+        assert_eq!(row.auth_push_reconciles, Some(1));
+    }
+
+    #[test]
     fn an_interrupted_migration_does_not_leave_the_new_columns() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -3738,7 +3859,7 @@ mod tests {
         tx.execute_batch(last_sql).unwrap();
         tx.rollback().unwrap();
         let missing = conn
-            .prepare("SELECT completion_token FROM alert_outbox")
+            .prepare("SELECT push_event_id FROM alert_outbox")
             .is_err();
         assert!(missing);
         let tx = conn.unchecked_transaction().unwrap();

@@ -427,6 +427,7 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
                     Some(&logical_notification_key(&row.dedupe_key)),
                     fallback.as_ref(),
                     &watchdog_core::delivery::AuthoritativeCounters::unknown(),
+                    None,
                     now,
                 )
                 .await?;
@@ -573,36 +574,33 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
     } else {
         report.push.map(watchdog_core::delivery::PushState::as_str)
     };
-    let still_open = matches!(
-        report.decision,
-        watchdog_core::delivery::LifecycleDecision::Reconcile { .. }
-            | watchdog_core::delivery::LifecycleDecision::Retry { .. }
+    let needs_fallback = watchdog_core::settings::fallback_wanted(
+        settings,
+        get,
+        &row.project_id,
+        &row.destination,
+        severity,
+        &row.alert_class,
+    ) && fallback_required(
+        matches!(
+            report.decision,
+            watchdog_core::delivery::LifecycleDecision::Accept
+        ),
+        false,
+        message_phase,
+        push_phase,
+        &row.destination,
+        severity,
     );
-    let needs_fallback = !still_open
-        && watchdog_core::settings::fallback_wanted(
-            settings,
-            get,
-            &row.project_id,
-            &row.destination,
-            severity,
-            &row.alert_class,
-        )
-        && fallback_required(
-            matches!(
-                report.decision,
-                watchdog_core::delivery::LifecycleDecision::Accept
-            ),
-            false,
-            message_phase,
-            push_phase,
-            &row.destination,
-            severity,
-        );
     let fallback = if needs_fallback {
         fallback_draft(settings, get, row, finished)
     } else {
         None
     };
+    let projection = outcome
+        .operation
+        .as_ref()
+        .map(watchdog_core::delivery::transport_projection);
     let _owned = store
         .finish_with_fallback(
             &row.id,
@@ -625,6 +623,7 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
             Some(&logical_notification_key(&row.dedupe_key)),
             fallback.as_ref(),
             &report.counters,
+            projection.as_deref(),
             finished,
         )
         .await?;
