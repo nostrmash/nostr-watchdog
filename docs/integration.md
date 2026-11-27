@@ -21,7 +21,136 @@ No newer commit was on either agent branch at the last fetch. Those four merges 
 
 The files touched by the three snapshots do not overlap. Git reported no conflicts.
 
-## Qualification
+## Final release qualification
+
+All six expanded GitHub Actions jobs passed on implementation `5a8175536d0e1c6f249f66e92ec72c1e070e0b8c`. The run used Ubuntu amd64, Rust 1.100.0, Node 22, Odin `dev-2026-10` revision `84bc3fc`, the locked Marmot MDK revision `ca52a04718628f08ed76b777df9c444594074182`, and patched SQLCipher. [Expanded CI run](https://github.com/nostrmash/nostr-watchdog/actions/runs/46008823008)
+
+### Native synchronization
+
+The reviewed Ubuntu run failed in the standalone official MarmotApp decryption test and the packaged official MarmotApp Welcome test. The optimized diagnostic run reproduced the decryption failure. Its loopback relay delivered the recipient token event and the alert event with the same timestamp. It returned both events in finite `#h` queries, then left two `NEG-OPEN` comparisons unanswered for the shared timestamp. The pinned transport treats the unanswered boundary as inconclusive and can hold the group while that boundary remains unproven. This accounts for the alert being relay-accepted while its recipient message projection was still empty. The separate official SQLite MDK recipient does not need the app runtime's history coverage decision. [Reviewed native failure](https://github.com/nostrmash/nostr-watchdog/actions/runs/45986345284/job/140462843442) · [Instrumented Ubuntu failure](https://github.com/nostrmash/nostr-watchdog/actions/runs/46000741408/job/140511430147)
+
+The fixture relay now publishes its NIP-11 capabilities, enforces the advertised 500-event replay limit for each NIP-01 filter, and returns a protocol refusal for unsupported NIP-77 comparisons. This gives the app runtime the relay's actual coverage capabilities. Its normal relay retrieval and official decryption assertions remain in place. Both native scenarios now independently verify the accepted signed Welcome and its intended sender and recipient before asserting that the MarmotApp recipient joined. The signed-event verification never feeds the recipient's runtime. Failure traces report event sequence, kind, timestamp and filter shape without keys, tokens or message bodies.
+
+The next Ubuntu run reproduced the packaged Welcome failure with the relay capability correction in place. Its trace shows one live delivery of the Welcome and 20 replays on renewed account inbox subscriptions, each ending in EOSE. The recipient had been configured with `CursorPersistence::Frozen`, the pinned MDK's short-lived notification-wake mode. Each catch-up in that mode reactivates the inbox, replacing the current subscription attempt and resetting replay coverage. The packaged test models a recipient that stays open throughout the incident and sender restarts. It now uses the normal advancing cursor and checks network readiness before onboarding. The signed Welcome still travels through the real relay and the independent official recipient still supplies the canonical group admission and decryption evidence. The corrected local fixture passed and issued two inbox requests across the complete incident, helper restart and crash exercise. The private MDK disposition of the earlier Welcome remains unobserved. [Reproduced packaged failure](https://github.com/nostrmash/nostr-watchdog/actions/runs/46003594793/job/140521102254) · [Pinned activation and catch-up policy](https://github.com/marmot-protocol/mdk/blob/ca52a04718628f08ed76b777df9c444594074182/crates/marmot-app/src/client/sync.rs#L1352)
+
+Two Ubuntu runs joined the conversation and decrypted both the outage and recovery. The helper reached the accepted-send crash marker in one run and the submitted-send marker in the other. In both cases it then logged an OpenSSL HMAC provider failure and ended by signal. The old fault hook used normal process exit, which invokes native teardown while MDK workers can still be using SQLCipher. The fault hooks now use POSIX `_exit(75)` to model abrupt loss at the same durable boundary. The tests still require that status, recover exactly one accepted operation, and verify independent decryption. The SQLCipher and SQLite versions remain 4.20.0 and 3.54.1. [Accepted-send log](https://github.com/nostrmash/nostr-watchdog/actions/runs/46005053707/job/140526012788) · [Submitted-send log](https://github.com/nostrmash/nostr-watchdog/actions/runs/46007339979/job/140533728940)
+
+```bash
+export ODIN="$HOME/.local/odin-dev-2026-10/odin"
+cargo build --release --locked -p watchdog-native
+cargo build --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml
+cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml --lib
+export WATCHDOG_TEST_BINARY="$PWD/target/release/nostr-watchdog"
+for run in 1 2 3; do
+  cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
+    --test fixture_exchange -- --test-threads=1 || exit 1
+done
+cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
+  --test fixture_exchange whitenoise_script_onboards_and_reuses_the_conversation \
+  -- --ignored --exact
+```
+
+### Staging artifacts
+
+Both actual deployment configurations passed Wrangler 4.166.0 dry runs using the optimized bundles.
+
+| Worker | Total upload | Gzipped upload |
+| --- | ---: | ---: |
+| Operational Worker | 3,986.58 KiB | 2,054.53 KiB |
+| Private Marmot Worker | 10,754.13 KiB | 4,126.85 KiB |
+
+The private binding, dedicated resources, authorization, migration order, rollback, and remote measurement steps are in [the staging runbook](deployment.md#isolated-cloudflare-staging). Native and Cloudflare locked-iPhone procedures are in [WhiteNoise acceptance](acceptance.md).
+
+### Cloudflare account capacity
+
+The authenticated Marmot readiness response reports `authority.storageCapacity` with live used and limit counters. It lists a warning once a counter reaches 80% of its limit. The sealed account supplies the committed plaintext byte count after authenticated decompression. The sealed row length includes a 34-byte envelope and authentication tag for format 2. The response reports the largest history bucket and total retired operations from SQLite. These counts describe capacity. Operation lookups still verify the bucket commitment and record MAC. The capacity query leaves state unchanged.
+
+| Limit | Current bound |
+| --- | ---: |
+| Accounts per Durable Object | 1 |
+| Groups per account | 64 |
+| Message records per group | 4,096 |
+| OpenMLS provider entries per account | 20,000 |
+| Snapshots and checkpoints per group | 32 each |
+| Serialized plaintext account document | 8,388,608 bytes |
+| Sealed account row, application cap | 1,500,000 bytes |
+| Active publication journal | 64 target, 128 hard cap |
+| Authenticated historical index | 256 buckets, 256 records per bucket |
+| Rolling ingress markers | 4,096 |
+
+The platform documents an 8 MB maximum row or BLOB and a 10 GB limit per paid SQLite Durable Object. The Watchdog applies the smaller account cap above. A full bucket can stop retirement before the total historical index reaches 65,536 entries. [Cloudflare Durable Object limits](https://developers.cloudflare.com/durable-objects/platform/limits/)
+
+The controlled local workerd scenarios used generated identities and loopback relays. The operations used actual MDK encryption, SQLite persistence and relay acknowledgement. The autonomous test filled the journal with 62 settled alerts, changed and revoked recipient tokens, interrupted and retried retirement, restarted workerd and recovered the original accepted event ID. The wider sequence recorded 11 committed retirements after restart. A separate conversation verified three consecutive MLS epoch transitions, subsequent alert decryption, and incoming recipient messages. The scheduled incident scenario also went through both Worker bundles and actual D1.
+
+| Sample | Plain / compressed / sealed bytes | Message records | MLS entries | Snapshots / checkpoints | Journal / retired / peak history bucket |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before the 62 sends | 181,585 / 50,533 / 50,567 | 5 | 13 | 1 / 0 | 2 / 0 / 0 |
+| Journal target reached | 3,117,368 / 995,634 / 995,668 | 129 | 13 | 1 / 0 | 64 / 0 / 0 |
+| After eight actual retirements | 3,172,524 / 1,007,623 / 1,007,657 | 145 | 13 | 1 / 0 | 64 / 8 / 1 |
+| After token changes and restart | 3,173,189 / 1,005,207 / 1,005,241 | 153 | 13 | 1 / 0 | 64 / 11 / 1 |
+| Before epoch changes in second conversation | 214,923 / 55,651 / 55,685 | 12 | 14 | 1 / 0 | 7 / 0 / 0 |
+| After three epoch changes and incoming traffic | 600,593 / 117,185 / 117,219 | 24 | 14 | 4 / 3 | 11 / 0 / 0 |
+
+The 62 sends took 18.6 seconds total, with a 298 ms median and 517 ms p95. Readiness took 14–38 ms. Workerd RSS peaked at 438 MiB for one local process and 518 MiB across simultaneous local workerd processes. These process figures include the local runtime and its isolates. Cloudflare gives each isolate a 128 MB memory limit. Measure remote resource use and network latency during isolated staging. [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/#memory)
+
+At the journal target, the sealed account had 504,332 bytes of room and the plaintext account had 5,271,240 bytes of room. The sealed account was the closest hard limit at roughly 66% used. The journal is designed to hold steady at its target when publications settle. Larger messages, multiple push destinations and retained epoch snapshots can exhaust sealed bytes sooner. A stalled journal or a busy epoch history can change which bound is reached first. The 4,096 message-record bound counts storage records, including protocol activity. A mixed workload's safe lifetime depends on the traffic and state composition.
+
+The storage-only regression exercised 4,100 historical identities and prevented re-encryption when the associated index was missing. Separately, hashing sequential synthetic IDs `alt_capacity_fixture_00001` and onward into the real 256 SHA-256 partitions produced a largest bucket of 29 at 4,100 entries, the first 80% warning at 43,127 entries, and a first rejected insertion at 55,314. In an in-memory SQLite model with the same bucket JSON shape, the readiness query's median was 0.17 ms at 4,100 identities and 2.18 ms at 55,313 identities. At the latter point the bucket JSON totaled 5.31 MB. The model uses synthetic IDs and digests and excludes authenticated operation rows, MLS processing, persistence and remote I/O. Actual bucket capacity depends on the ID distribution.
+
+MDK already prunes old replay anchors and state checkpoints within its canonical convergence policy. Its group message retention features do not authorize clearing raw transport replay state or retired application identities. The Worker retains its existing maintenance policy and authenticated history. Capacity warnings and the documented rotation procedure preserve original operation IDs and avoid re-encrypting old outbox rows. [Operator procedure](deployment.md#capacity-and-staging-measurements)
+
+### Current dependency review
+
+All three lockfiles passed `cargo audit` and `cargo deny` (advisories, dependency bans, licenses and sources). The repository remains Unlicensed. Existing upstream licenses and attribution remain in place.
+
+| Warning | Path and disposition |
+| --- | --- |
+| `chrono` 0.4.45 | Unmaintained runtime dependency in the three workspaces. No patched version is listed. The existing advisory-specific policy remains in place. |
+| `heapless` 0.8.0 | Nine unsoundness warnings. The locked graph reaches it through `nostr → faster-hex` on Linux and WASM. All production builds enable `faster-hex/alloc`, which compiles out its heapless code. The affected APIs have no production caller in this graph. `faster-hex` 0.10 requires heapless 0.8 for its non-alloc implementation. |
+| `instant` 0.1.13 | Unmaintained WASM-only dependency of a second upstream Nostr crate in the helper lockfile. It is absent from the Linux native graph and both deployed WASM workspaces. |
+| `proc-macro-error2` 2.0.1 | Unmaintained build-time macro support through the upstream libcrux/Hax path. It has no request-time call site. |
+| `zbus_names`, `zvariant`, `zvariant_derive` | Unmaintained. The first two are Linux helper native dependencies through MDK's Secret Service keyring and also support host macros. The derive crate only runs at build time. The Workers have no D-Bus dependency. |
+
+The compatibility crate re-exports the upstream FFI and forwards the selected bundled SQLCipher and OpenSSL features. It declares no separate `links` value and runs no build script. The locked native graphs have one SQLite link provider, upstream `libsqlite3-sys` 0.40.0. The optimized helper fixture verifies the linked SQLCipher 4.20.0 and SQLite 3.54.1. The Cloudflare release has no SQLCipher linkage. The Cloudflare workspace uses the adapter for native MDK interoperability tests. No new suppression or dependency upgrade was required for the warnings above.
+
+### Expanded CI
+
+| Job | Result | Evidence |
+| --- | --- | --- |
+| `rust` | Passed | Locked workspace and SQLite tests, Clippy, release build, and dependency, license and advisory checks for all three lockfiles. [Job](https://github.com/nostrmash/nostr-watchdog/actions/runs/46008823008/job/140538754918) |
+| `wasm-worker` | Passed | Operational Worker and pinned MDK engine WASM compilation. [Job](https://github.com/nostrmash/nostr-watchdog/actions/runs/46008823008/job/140538754914) |
+| `workerd` | Passed | Actual D1 migrations, scheduled operation, interrupted fallback, claim fences, and incident acknowledgement during a probe. [Job](https://github.com/nostrmash/nostr-watchdog/actions/runs/46008823008/job/140538755007) |
+| `cloudflare-marmot` | Passed | 29 runtime tests, 8 storage tests, 4 native MDK interoperability tests and 3 actual workerd scenarios. The paired Worker incident reached and decrypted at the independent recipient. The capacity run independently retained 11 retired operations after restart. [Job](https://github.com/nostrmash/nostr-watchdog/actions/runs/46008823008/job/140538755367) |
+| `native-marmot` | Passed | All 24 helper library tests, three consecutive complete optimized suites, linked SQLCipher and SQLite version checks, and the owner acceptance-script fixture. [Job](https://github.com/nostrmash/nostr-watchdog/actions/runs/46008823008/job/140538754460) |
+| `image` | Passed | Linux amd64 startup, UID 10001, directory mode 0700, linked libraries, and actual container replacement with an independent official SQLite MDK recipient in 129.91 seconds. [Job](https://github.com/nostrmash/nostr-watchdog/actions/runs/46008823008/job/140538755215) |
+
+Ubuntu completed the three optimized exchanges in 153.82, 154.44 and 154.69 seconds. Each run verified both official recipients, linked SQLCipher, and the accepted, intent and submitted crash boundaries. The separate owner acceptance-script fixture finished in 75.87 seconds. [Native test log](https://github.com/nostrmash/nostr-watchdog/actions/runs/46008823008/job/140538754460)
+
+### Release gates
+
+| Gate | Status | Evidence or remaining condition |
+| --- | --- | --- |
+| Q1 Native Ubuntu diagnosis | Diagnosed | The relay trace identified incomplete same-second coverage in the standalone scenario and repeated wake-mode inbox activation in the packaged scenario. The internal disposition of the individual Welcome remains unobserved. |
+| Q2 Both official MarmotApp scenarios | Passed | Final Ubuntu CI verified standalone decryption and packaged signed Welcome admission, outage and recovery. |
+| Q3 Repeated optimized Ubuntu qualification | Passed | Three consecutive runs of the complete optimized native fixture suite passed in the same Ubuntu job. |
+| Q4 Owner acceptance script in CI | Passed | The final Ubuntu job verified onboarding, token readiness and two independently decrypted alerts in the original conversation across a restart. |
+| Q5 Integrated two-Worker incident | Passed | The final paired workerd job verified actual D1, independent recipient decryption, push, fallback and subsequent recovery. |
+| Q6 Historical-operation integrity and restart | Passed | Workerd CI verified transactional retirement, restart, original operation identity and rejection after history corruption. |
+| Q7 Capacity and operational limits | Passed | Actual sends, token updates, retirements, epochs and local resource measurements are above. Remote capacity is a staging measurement. |
+| Q8 Native security limitations | Constrained | Use a dedicated two-account conversation with stable membership while dispatch is enabled. Native push acceptance remains `unobservable`. [Operating constraints](deployment.md#native-process) |
+| Q9 Dependency and license checks | Passed | RustSec and dependency policy checks passed for all three exact lockfiles. Remaining warnings are classified above. |
+| Q10 Docker conversation persistence | Passed | Final image CI recovered both runtimes on the same volume, kept the original application event, and independently decrypted the outage and recovery. |
+| Q11 Six expanded jobs on one SHA | Passed | [Implementation workflow](https://github.com/nostrmash/nostr-watchdog/actions/runs/46008823008) |
+| Q12 Optimized staging artifacts | Passed | Both deployment manifests passed Wrangler dry-run bundling on the implementation. |
+| Q13 Native phone procedure | Ready | [Native acceptance](acceptance.md#native) |
+| Q14 Cloudflare phone procedure | Ready | [Cloudflare acceptance](acceptance.md#cloudflare) |
+| Q15 Observed iPhone notification | Pending | Requires the owner's dedicated account and physical test iPhone. |
+
+### Staging assessment
+
+The implementation is ready for separately authorized isolated Cloudflare staging. The owner can use the staged deployment and WhiteNoise runbooks to check remote CPU, memory, D1 convergence, Durable Object storage, and locked-screen delivery. Native operation requires a dedicated two-account group with stable membership and reports alert-specific push acknowledgement as `unobservable`. The qualification used private fixtures and GitHub Actions. Staging, production and the physical acceptance session are still pending.
+
+## Previous integration qualification
 
 Implementation tested by the runs below is `be486a8ea6fa20e1d5dc40e1ae78d1062989235a`. Later commits containing only documentation record the results.
 
@@ -44,57 +173,6 @@ An operation is absent only when the sealed snapshot's commitment and the bounde
 The active journal retains unresolved operations. Compaction excludes the current mutation and the Welcome needed for onboarding evidence. Accepted operations with unresolved push work expire at the authority age limit, including when the caller stops polling. Version 2 snapshots use bounded compression before authenticated encryption, which allowed the runtime test to reach the journal retirement threshold. The history retains operation identities for as long as a replay can arrive. The per-bucket and snapshot limits are fail-closed capacity limits. Monitor long-lived account size before rollout.
 
 A legacy snapshot without authenticated history metadata requires recovery or deliberate re-onboarding. Preserve the full state and its history together. A complete point-in-time rollback can restore mutually consistent old records and snapshots. Treat a known restore as an operator recovery event and follow the fencing procedure in [deployment.md](deployment.md). The service has no independent witness for a complete rollback.
-
-### Cloudflare account capacity
-
-The authenticated Marmot readiness response reports `authority.storageCapacity` with live used and limit counters. It lists a warning once a counter reaches 80% of its limit. The sealed account supplies the committed plaintext byte count after authenticated decompression. The sealed row length includes a 34-byte envelope and authentication tag for format 2. The response reports the largest history bucket and total retired operations from SQLite. These counts describe capacity. Operation lookups still verify the bucket commitment and record MAC. The capacity query leaves state unchanged.
-
-| Limit | Current bound |
-| --- | ---: |
-| Accounts per Durable Object | 1 |
-| Groups per account | 64 |
-| Message records per group | 4,096 |
-| OpenMLS provider entries per account | 20,000 |
-| Snapshots and checkpoints per group | 32 each |
-| Serialized plaintext account document | 8,388,608 bytes |
-| Sealed account row, application cap | 1,500,000 bytes |
-| Active publication journal | 64 target, 128 hard cap |
-| Authenticated historical index | 256 buckets, 256 records per bucket |
-| Rolling ingress markers | 4,096 |
-
-The platform documents an 8 MB maximum row or BLOB and a 10 GB limit per paid SQLite Durable Object. The Watchdog applies the smaller account cap above. A full bucket can stop retirement before the total historical index reaches 65,536 entries. [Cloudflare Durable Object limits](https://developers.cloudflare.com/durable-objects/platform/limits/)
-
-The controlled local workerd scenarios used generated identities and loopback relays. The operations used actual MDK encryption, SQLite persistence and relay acknowledgement. The autonomous test filled the journal with 62 settled alerts, changed and revoked recipient tokens, interrupted and retried retirement, restarted workerd and recovered the original accepted event ID. A separate conversation verified three consecutive MLS epoch transitions, subsequent alert decryption, and incoming recipient messages. The scheduled incident scenario also went through both Worker bundles and actual D1.
-
-| Sample | Plain / sealed bytes | Message records | MLS entries | Snapshots / checkpoints | Journal / retired / peak history bucket |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Before the 62 sends | 181,703 / 52,073 | 5 | 13 | 1 / 0 | 2 / 0 / 0 |
-| Journal target reached | 3,118,049 / 997,747 | 129 | 13 | 1 / 0 | 64 / 0 / 0 |
-| After retirement, token changes and restart | 3,126,332 / 997,205 | 139 | 13 | 1 / 0 | 64 / 1 / 1 |
-| Before epoch changes in second conversation | 214,329 / 55,443 | 12 | 14 | 1 / 0 | 7 / 0 / 0 |
-| After three epoch changes and incoming traffic | 597,897 / 116,785 | 24 | 14 | 4 / 3 | 11 / 0 / 0 |
-
-The 62 sends took 21.6 seconds total, with a 355 ms median and a 569 ms p95. Readiness probes took 14–40 ms. The highest sampled local workerd process RSS was 374 MiB. This process includes the local runtime and its isolates. Remote isolate memory, CPU and network latency require staging measurements.
-
-At the journal target, the sealed account had 502,253 bytes of room and the plaintext account had 5,270,559 bytes of room. The sealed account was the closest hard limit at roughly 66% used. The journal is designed to hold steady at its target when publications settle. Larger messages, multiple push destinations and retained epoch snapshots can exhaust sealed bytes sooner. A stalled journal or a busy epoch history can change which bound is reached first. The 4,096 message-record bound counts storage records, including protocol activity. A mixed workload's safe lifetime depends on the traffic and state composition.
-
-The storage-only regression exercised 4,100 historical identities and prevented re-encryption when the associated index was missing. Separately, hashing sequential synthetic IDs `alt_capacity_fixture_00001` and onward into the real 256 SHA-256 partitions produced a largest bucket of 29 at 4,100 entries, the first 80% warning at 43,127 entries, and a first rejected insertion at 55,314. This sample only measures partition distribution. It uses no cryptographic messages or SQLite transactions and gives no guaranteed count before a bucket fills.
-
-MDK already prunes old replay anchors and state checkpoints within its canonical convergence policy. Its group message retention features do not authorize clearing raw transport replay state or retired application identities. The Worker retains its existing maintenance policy and authenticated history. Capacity warnings and the documented rotation procedure preserve original operation IDs and avoid re-encrypting old outbox rows. [Operator procedure](deployment.md#capacity-and-staging-measurements)
-
-### Current dependency review
-
-All three lockfiles passed `cargo audit` and `cargo deny` (advisories, dependency bans, licenses and sources). The repository remains Unlicensed. Existing upstream licenses and attribution remain in place.
-
-| Warning | Path and disposition |
-| --- | --- |
-| `chrono` 0.4.45 | Unmaintained runtime dependency in the three workspaces. No patched version is listed. The existing advisory-specific policy remains in place. |
-| `heapless` 0.8.0 | Nine unsoundness warnings. The locked graph reaches it through `nostr → faster-hex` on Linux and WASM. All production builds enable `faster-hex/alloc`, which compiles out its heapless code. The affected APIs have no production caller in this graph. `faster-hex` 0.10 requires heapless 0.8 for its non-alloc implementation. |
-| `instant` 0.1.13 | Unmaintained WASM-only dependency of a second upstream Nostr crate in the helper lockfile. It is absent from the Linux native graph and both deployed WASM workspaces. |
-| `proc-macro-error2` 2.0.1 | Unmaintained build-time macro support through the upstream libcrux/Hax path. It has no request-time call site. |
-| `zbus_names`, `zvariant`, `zvariant_derive` | Unmaintained. The first two are Linux helper native dependencies through MDK's Secret Service keyring and also support host macros. The derive crate only runs at build time. The Workers have no D-Bus dependency. |
-
-The compatibility crate re-exports the upstream FFI and forwards the selected bundled SQLCipher and OpenSSL features. It declares no separate `links` value and runs no build script. The locked native graphs have one SQLite link provider, upstream `libsqlite3-sys` 0.40.0. The optimized helper fixture verifies the linked SQLCipher 4.20.0 and SQLite 3.54.1. The Cloudflare release has no SQLCipher linkage. The Cloudflare workspace uses the adapter for native MDK interoperability tests. No new suppression or dependency upgrade was required for the warnings above.
 
 ### Executed tests
 
@@ -160,7 +238,7 @@ The recipient history-repair run confirmed the image published an independently 
 
 The image job now runs the packaged watchdog and helper against a dedicated official SQLite MDK recipient. It publishes a key package with the native profile's required proposals, retrieves the signed relay Welcome, and decrypts the exact group events from the scheduled outage and recovery. The test checks the watchdog's stored receipt and the helper's journal before and after removing and replacing the container on the same mount. The recipient checks for a duplicate outage by comparing decrypted content among newly published group messages. The full native `MarmotApp` fixture covers token readiness, trigger evidence, and crash boundaries separately. The same direct-recipient test passed in 124.91 seconds against the local optimized process pair and persistent directory. The image job is the evidence for container replacement.
 
-The latest implementation run uses the exact commit above. It covers Rust, audits, WASM compilation, operational workerd, container replacement, and the native and paired Worker fixtures. [Implementation run](https://github.com/nostrmash/nostr-watchdog/actions/runs/45986345284)
+The reviewed baseline run uses the implementation SHA in this section. It covers Rust, audits, WASM compilation, operational workerd, container replacement, and the native and paired Worker fixtures. [Implementation run](https://github.com/nostrmash/nostr-watchdog/actions/runs/45986345284)
 
 | Job | Conclusion | Evidence |
 | --- | --- | --- |
@@ -172,7 +250,7 @@ The latest implementation run uses the exact commit above. It covers Rust, audit
 | `image` | Passed | Linux amd64 startup, UID 10001, directory mode 0700, runtime libraries, and direct-recipient exchange across container replacement in 129.88 seconds. [Job log](https://github.com/nostrmash/nostr-watchdog/actions/runs/45986345284/job/140462843368) |
 
 
-### Release gates
+### Previous release gates
 
 | Gate | Status | Evidence or remaining condition |
 | --- | --- | --- |
@@ -196,7 +274,7 @@ The latest implementation run uses the exact commit above. It covers Rust, audit
 | G18 Native physical WhiteNoise | Untested | Requires an observed test iPhone notification. |
 | G19 Cloudflare physical WhiteNoise | Blocked | Requires authorized isolated staging and an observed test iPhone notification. |
 
-### Release assessment
+### Previous release assessment
 
 The decisive incident path is working locally in both deployment shapes. The native MDK API can acknowledge the group message without exposing alert-specific push acknowledgement. The native helper also checks canonical membership before calling the upstream kind-9 send. A membership change between those operations remains possible because the pinned native API has no atomic guarded send. These upstream limitations remain visible in deployment and acceptance decisions.
 

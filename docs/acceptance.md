@@ -28,11 +28,13 @@ If `conversation` reports an unavailable conversation index, leave the helper ru
 
 ## Cloudflare
 
-Use the isolated Worker pair from [deployment.md](deployment.md) after staging deployment is authorized. Onboard the dedicated sender using `POST /v1/diagnostics/marmot/onboard`. Wait for the authenticated `GET /v1/diagnostics/marmot?project=<id>` response to show Welcome acceptance, recipient participation and token readiness. Enable alerts only for the configured staging project. For each phone state, send one `POST /v1/diagnostics/test-alert` with the same project and `transport=marmot`. Record the outbox ID and observe the phone before moving to the next state. Rehearse a deployment restart against the same Durable Object and D1 state. Once the test-alert rate window permits another send, repeat the locked-screen alert in the same conversation.
+Use the isolated Worker pair from [deployment.md](deployment.md) after staging deployment is authorized. Onboard the dedicated sender using `POST /v1/diagnostics/marmot/onboard`. Wait for the authenticated `GET /v1/diagnostics/marmot?project=<id>` response to show Welcome acceptance, recipient participation and token readiness. Enable alerts only for the configured staging project. For each phone state, send one `POST /v1/diagnostics/test-alert` with the same project and `transport=marmot`. Record the outbox ID and observe the phone before moving to the next state. Within the authorized staging rehearsal, redeploy the tested private Marmot Worker from the same staging manifest. Keep the private namespace, storage key and sender, along with the operational Worker's D1 binding. Check readiness for the same group before continuing. Once the test-alert rate window permits another send, repeat the locked-screen alert in the same conversation.
 
 This example assumes the SmartFlowSocial staging identity and the authorized staging Worker URL. Load the staging operator token into `watchdog_acceptance_token` in the current shell with a hidden prompt or the staging secret manager.
 
 ```bash
+# Enter the staging operator token at the hidden prompt.
+read -r -s watchdog_acceptance_token
 watchdog_staging_url="https://nostr-watchdog-rust-staging.<account>.workers.dev"
 watchdog_staging_request() {
   printf 'Authorization: Bearer %s\n' "$watchdog_acceptance_token" |
@@ -60,4 +62,4 @@ watchdog_staging_request "$watchdog_staging_url/v1/outbox/<alert-id>"
 
 For each foreground, background, locked-screen and post-restart send, record the returned `alertId` (the delivery operation ID), phone state, send time, observation time, elapsed seconds and duplicate count. Record any missing notification and keep accepted event IDs when available. A phone notification is the physical acceptance criterion. Automated relay and decryption tests are supporting evidence.
 
-After the first successful physical test, request separate authorization for the 100-send qualification. Targets are at least 99 observed deliveries under normal connectivity, median observed latency below 5 seconds, 95th-percentile latency below 15 seconds, zero unexplained duplicates, and intact cryptographic state across restart.
+After the first successful physical test, request separate authorization for the 100-send qualification. At the existing limit of three sends per project in a rolling hour, allow 34 rate-limit windows. Include foreground, background, locked-screen and post-restart sends. Targets are at least 99 observed deliveries under normal connectivity, median observed latency below 5 seconds, 95th-percentile latency below 15 seconds, zero unexplained duplicates, and intact cryptographic state across restart.
