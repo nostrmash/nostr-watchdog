@@ -4,12 +4,12 @@
 # GitHub Actions does not deploy this.
 
 name = "nostr-watchdog-rust-staging"
-main = "build/worker/shim.mjs"
+main = "crates/watchdog-worker/build/worker/shim.mjs"
 compatibility_date = "2026-11-22"
 workers_dev = true
 
 [build]
-command = "worker-build --release"
+command = "worker-build --release crates/watchdog-worker -- --locked"
 
 [limits]
 cpu_ms = 30000

@@ -1,5 +1,7 @@
 use nostr::nips::nip59::{GiftWrapBuilder, UnwrappedGift};
-use nostr::prelude::{Event, FinalizeEvent, Keys, Kind, PublicKey, Tag, Timestamp, UnsignedEvent};
+use nostr::prelude::{
+    Event, FinalizeEvent, Keys, Kind, PublicKey, SecretKey, Tag, Timestamp, UnsignedEvent,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -15,12 +17,14 @@ pub enum Nip17Error {
 }
 
 pub fn recipient_pubkey(value: &str) -> Result<String, Nip17Error> {
-    let trimmed = value.trim();
-    if trimmed.len() == 64 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Ok(trimmed.to_ascii_lowercase());
-    }
-    let key = PublicKey::parse(trimmed).map_err(|_| Nip17Error::Recipient)?;
+    let key = PublicKey::parse(value.trim()).map_err(|_| Nip17Error::Recipient)?;
+    key.xonly().map_err(|_| Nip17Error::Recipient)?;
     Ok(key.to_hex())
+}
+
+pub fn normalize_sender_secret(value: &str) -> Result<String, Nip17Error> {
+    let key = SecretKey::parse(value.trim()).map_err(|_| Nip17Error::Sender)?;
+    Ok(key.to_secret_hex())
 }
 
 pub fn public_key_hex(nsec: &str) -> Result<String, Nip17Error> {
@@ -74,6 +78,30 @@ pub fn parse_event(json: &str) -> Result<Event, Nip17Error> {
 mod tests {
     use super::*;
     use nostr::prelude::ToBech32;
+
+    #[test]
+    fn validates_and_normalizes_standard_key_formats() {
+        let keys = Keys::generate();
+        let secret = keys.secret_key();
+        let pubkey = keys.public_key();
+        assert_eq!(
+            normalize_sender_secret(&secret.to_bech32().unwrap()).unwrap(),
+            secret.to_secret_hex()
+        );
+        assert_eq!(
+            normalize_sender_secret(&secret.to_secret_hex()).unwrap(),
+            secret.to_secret_hex()
+        );
+        assert_eq!(
+            recipient_pubkey(&pubkey.to_bech32().unwrap()).unwrap(),
+            pubkey.to_hex()
+        );
+        assert_eq!(recipient_pubkey(&pubkey.to_hex()).unwrap(), pubkey.to_hex());
+        assert!(normalize_sender_secret(&"0".repeat(64)).is_err());
+        assert!(normalize_sender_secret("invalid").is_err());
+        assert!(recipient_pubkey(&"f".repeat(64)).is_err());
+        assert!(recipient_pubkey("invalid").is_err());
+    }
 
     #[test]
     fn gift_wrap_round_trip_hides_plaintext_from_the_published_event() {

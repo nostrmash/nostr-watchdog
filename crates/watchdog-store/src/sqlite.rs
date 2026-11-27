@@ -634,17 +634,14 @@ impl SqliteStore {
                     AND NOT (
                       destination = 'marmot'
                       AND COALESCE(message_state, '') IN ('relay_accepted', 'accepted', 'accepted_pending')
-                      AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')
+                      AND (transport_disposition = 'reconcile' OR (transport_disposition IS NULL AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')))
                     )
                     AND (?3 != 'delivery-critical' OR severity = 'critical')
                     AND (?3 != 'delivery-other' OR severity != 'critical'))
                  OR (?3 = 'push'
                     AND destination = 'marmot'
                     AND COALESCE(message_state, '') IN ('relay_accepted', 'accepted', 'accepted_pending')
-                    AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')
-                    AND (auth_push_publications IS NULL OR auth_push_publications < 2)
-                    AND (auth_push_reconciles IS NULL OR auth_push_reconciles < 2)
-                    AND (auth_token_waits IS NULL OR auth_token_waits < 2)
+                    AND (transport_disposition = 'reconcile' OR (transport_disposition IS NULL AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')))
                     AND COALESCE(operation_started_at, created_at) >= ?4)
                )
              ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, created_at
@@ -785,24 +782,23 @@ impl SqliteStore {
                  accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL,
                  message_phase = CASE
                    WHEN ?7 IS NULL THEN message_phase
-                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
-                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_phase
+                   WHEN COALESCE(message_state, message_phase, '') IN ('relay_accepted', 'accepted', 'message_accepted', 'published')
+                     AND ?7 NOT IN ('relay_accepted', 'accepted', 'message_accepted', 'published') THEN message_phase
                    ELSE ?7 END,
                  push_phase = CASE
                    WHEN ?8 IS NULL THEN push_phase
                    WHEN COALESCE(push_state, '') = 'relay_accepted'
                      AND ?8 IN ('not_attempted', 'unknown', 'not_submitted', 'prepared') THEN push_phase
                    ELSE ?8 END,
-                 message_event_id = COALESCE(?9, message_event_id),
+                 message_event_id = COALESCE(message_event_id, ?9),
                  push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11,
                  message_state = CASE
                    WHEN ?7 IS NULL THEN message_state
-                   WHEN ?7 IN ('relay_accepted', 'message_accepted', 'accepted', 'published') THEN 'relay_accepted'
+                   WHEN COALESCE(message_state, message_phase, '') IN ('relay_accepted', 'message_accepted', 'accepted', 'published')
+                     OR ?7 IN ('relay_accepted', 'message_accepted', 'accepted', 'published') THEN 'relay_accepted'
                    WHEN ?7 = 'accepted_pending' THEN 'accepted_pending'
                    WHEN ?7 = 'completion_unknown' THEN 'completion_unknown'
                    WHEN ?7 IN ('message_prepared', 'prepared') THEN 'prepared'
-                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
-                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_state
                    WHEN ?7 = 'not_submitted' THEN 'not_submitted'
                    WHEN ?7 IN ('rejected', 'failed') THEN 'rejected'
                    ELSE message_state END,
@@ -821,7 +817,8 @@ impl SqliteStore {
                  message_updated_at = CASE WHEN ?7 IS NOT NULL THEN ?11 ELSE message_updated_at END,
                  push_updated_at = CASE WHEN ?8 IS NOT NULL THEN ?11 ELSE push_updated_at END,
                  terminal_reason = COALESCE(?4, terminal_reason)
-             WHERE id = ?12 AND claim_token = ?13 AND claim_until IS NOT NULL AND claim_until >= ?11",
+             WHERE id = ?12 AND claim_token = ?13 AND claim_until IS NOT NULL AND claim_until >= ?11
+                   AND (?9 IS NULL OR message_event_id IS NULL OR message_event_id = ?9)",
             params![
                 state.as_str(),
                 attempt_count,
@@ -1445,25 +1442,24 @@ impl SqliteStore {
                  accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL,
                  message_phase = CASE
                    WHEN ?7 IS NULL THEN message_phase
-                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
-                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_phase
+                   WHEN COALESCE(message_state, message_phase, '') IN ('relay_accepted', 'accepted', 'message_accepted', 'published')
+                     AND ?7 NOT IN ('relay_accepted', 'accepted', 'message_accepted', 'published') THEN message_phase
                    ELSE ?7 END,
                  push_phase = CASE
                    WHEN ?8 IS NULL THEN push_phase
                    WHEN COALESCE(push_state, '') = 'relay_accepted'
                      AND ?8 IN ('not_attempted', 'unknown', 'not_submitted', 'prepared') THEN push_phase
                    ELSE ?8 END,
-                 message_event_id = COALESCE(?9, message_event_id),
+                 message_event_id = COALESCE(message_event_id, ?9),
                  push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11,
                  logical_id = COALESCE(logical_id, ?12),
                  message_state = CASE
                    WHEN ?7 IS NULL THEN message_state
-                   WHEN ?7 IN ('relay_accepted', 'message_accepted', 'accepted', 'published') THEN 'relay_accepted'
+                   WHEN COALESCE(message_state, message_phase, '') IN ('relay_accepted', 'message_accepted', 'accepted', 'published')
+                     OR ?7 IN ('relay_accepted', 'message_accepted', 'accepted', 'published') THEN 'relay_accepted'
                    WHEN ?7 = 'accepted_pending' THEN 'accepted_pending'
                    WHEN ?7 = 'completion_unknown' THEN 'completion_unknown'
                    WHEN ?7 IN ('message_prepared', 'prepared') THEN 'prepared'
-                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
-                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_state
                    WHEN ?7 = 'not_submitted' THEN 'not_submitted'
                    WHEN ?7 IN ('rejected', 'failed') THEN 'rejected'
                    ELSE message_state END,
@@ -1488,10 +1484,12 @@ impl SqliteStore {
                  completion_token = ?15,
                  operation_started_at = COALESCE(operation_started_at, json_extract(?23, '$.startedAtMs'), created_at),
                  started_at_ms = COALESCE(started_at_ms, created_at),
-                 push_event_id = COALESCE(json_extract(?23, '$.pushEventId'), push_event_id),
+                 push_event_id = COALESCE(push_event_id, json_extract(?23, '$.pushEventId')),
                  evidence = COALESCE(json_extract(?23, '$.evidence'), evidence),
                  transport_disposition = COALESCE(json_extract(?23, '$.disposition'), transport_disposition),
-                 transport_updated_at = COALESCE(json_extract(?23, '$.updatedAtMs'), transport_updated_at),
+                 transport_updated_at = CASE
+                   WHEN transport_updated_at IS NULL THEN json_extract(?23, '$.updatedAtMs')
+                   ELSE MAX(transport_updated_at, COALESCE(json_extract(?23, '$.updatedAtMs'), 0)) END,
                  message_phase_started_at = CASE
                    WHEN ?7 IS NOT NULL AND COALESCE(message_phase, '') != ?7 THEN ?11
                    ELSE message_phase_started_at END,
@@ -1534,7 +1532,8 @@ impl SqliteStore {
                  message_updated_at = CASE WHEN ?7 IS NOT NULL THEN ?11 ELSE message_updated_at END,
                  push_updated_at = CASE WHEN ?8 IS NOT NULL THEN ?11 ELSE push_updated_at END,
                  terminal_reason = COALESCE(?4, terminal_reason)
-             WHERE id = ?13 AND claim_token = ?14 AND claim_until IS NOT NULL AND claim_until >= ?11",
+             WHERE id = ?13 AND claim_token = ?14 AND claim_until IS NOT NULL AND claim_until >= ?11
+               AND (?9 IS NULL OR message_event_id IS NULL OR message_event_id = ?9)",
             params![
                 state.as_str(),
                 attempt_count,
@@ -3791,8 +3790,8 @@ mod tests {
                     message_reconciles: None,
                     ambiguous_reconciles: None,
                     token_waits: None,
-                    push_publications: None,
-                    push_reconciles: Some(1),
+                    push_publications: Some(5),
+                    push_reconciles: Some(2),
                 },
                 Some(projection),
                 20,
@@ -3814,7 +3813,7 @@ mod tests {
                 Some("marmot_timeout"),
                 None,
                 None,
-                Some("not_submitted"),
+                Some("accepted_pending"),
                 Some("not_attempted"),
                 None,
                 None,
@@ -3833,7 +3832,8 @@ mod tests {
         assert_eq!(row.operation_started_at, Some(10));
         assert_eq!(row.transport_updated_at, Some(50));
         assert_eq!(row.auth_message_submissions, Some(1));
-        assert_eq!(row.auth_push_reconciles, Some(1));
+        assert_eq!(row.auth_push_publications, Some(5));
+        assert_eq!(row.auth_push_reconciles, Some(2));
     }
 
     #[test]

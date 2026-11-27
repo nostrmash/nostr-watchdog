@@ -13,8 +13,8 @@ use std::time::Duration;
 use base64::Engine;
 use cgka_traits::GroupId;
 use marmot_app::{
-    AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppConfig, PushPlatform,
-    PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION,
+    AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppConfig, PUSH_ENCRYPTED_TOKEN_LEN,
+    PUSH_VERSION, PushPlatform,
 };
 use nostr::event::FinalizeEvent;
 use nostr::nips::nip59::UnwrappedGift;
@@ -30,10 +30,7 @@ fn exclusive_fixture() -> MutexGuard<'static, ()> {
 fn temp_root(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "watchdog-{label}-{}-{n}",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("watchdog-{label}-{}-{n}", std::process::id()))
 }
 
 struct Relay {
@@ -49,7 +46,10 @@ impl Drop for Relay {
 }
 
 fn start_relay() -> Relay {
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fixture-relay.mjs");
+    let repository = std::env::var_os("WATCHDOG_TEST_REPO_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    let script = repository.join("scripts/fixture-relay.mjs");
     let mut child = Command::new("node")
         .arg(script)
         .stdout(Stdio::piped())
@@ -213,7 +213,10 @@ async fn exchange() {
         .tag(Tag::public_key(server.public_key()))
         .finalize(&Keys::generate())
         .expect("decoy");
-    post_json(&format!("{}/event", http_base(&relay.url)), &serde_json::to_value(&decoy).expect("decoy json"));
+    post_json(
+        &format!("{}/event", http_base(&relay.url)),
+        &serde_json::to_value(&decoy).expect("decoy json"),
+    );
     let alien = EventBuilder::new(Kind::Custom(445), "bm90LXRoZS1hbGVydC1ldmVudA==")
         .tag(Tag::parse(["h", "00"]).expect("alien tag"))
         .finalize(&Keys::generate())
@@ -283,7 +286,9 @@ async fn exchange() {
         Some("relay_accepted"),
         "the helper cannot observe push relay acceptance"
     );
-    assert!(first.get("push_event_id").is_none() || first.get("push_event_id") == Some(&Value::Null));
+    assert!(
+        first.get("push_event_id").is_none() || first.get("push_event_id") == Some(&Value::Null)
+    );
     let trigger = wait_for_trigger(&relay.url, &server, &decoy.id.to_string(), baseline)
         .expect("kind 446 trigger");
     assert!(trigger.seq > baseline);
@@ -306,7 +311,12 @@ async fn exchange() {
         alien_id,
         "an unrelated group event satisfied the alert check"
     );
-    assert!(session.group_was_accepted(&account, &group).await.expect("delivery"));
+    assert!(
+        session
+            .group_was_accepted(&account, &group)
+            .await
+            .expect("delivery")
+    );
     let rows = runtime
         .messages_with_query(
             &recipient_hex,
@@ -323,9 +333,18 @@ async fn exchange() {
             && row.sender.eq_ignore_ascii_case(&account)
             && row.group_id_hex.eq_ignore_ascii_case(&group)
             && row.kind == 9
-            && first_ids.iter().any(|id| id.as_str() == Some(row.message_id_hex.as_str()))
+            && first_ids
+                .iter()
+                .any(|id| id.as_str() == Some(row.message_id_hex.as_str()))
     }));
-    assert_routed_token(&runtime, &recipient_hex, &group_id, &server_hex, b"fixture-token").await;
+    assert_routed_token(
+        &runtime,
+        &recipient_hex,
+        &group_id,
+        &server_hex,
+        b"fixture-token",
+    )
+    .await;
 
     session.shutdown().await.expect("shutdown");
     drop(session);
@@ -340,15 +359,27 @@ async fn exchange() {
         .cloned()
         .unwrap_or_default();
     assert_eq!(first_ids, second_ids);
-    assert_eq!(second.get("operation_id").and_then(Value::as_str), Some(alert));
+    assert_eq!(
+        second.get("operation_id").and_then(Value::as_str),
+        Some(alert)
+    );
     let mismatch = resumed
-        .send_once(alert, &account, &group, "a different payload", &[recipient_hex.clone()])
+        .send_once(
+            alert,
+            &account,
+            &group,
+            "a different payload",
+            &[recipient_hex.clone()],
+        )
         .await;
     assert!(
         matches!(mismatch, Err(error) if error == "alert_identity_mismatch"),
         "a reused alert id accepted a different payload"
     );
-    assert_eq!(plaintext_count(&runtime, &recipient_hex, &group, "a different payload").await, 0);
+    assert_eq!(
+        plaintext_count(&runtime, &recipient_hex, &group, "a different payload").await,
+        0
+    );
 
     tokio::time::sleep(Duration::from_millis(20)).await;
     let replacement = runtime
@@ -361,8 +392,7 @@ async fn exchange() {
         )
         .await
         .expect("replace token");
-    let expected =
-        marmot_app::push_token_fingerprint(PushPlatform::Fcm, b"fixture-token-replaced");
+    let expected = marmot_app::push_token_fingerprint(PushPlatform::Fcm, b"fixture-token-replaced");
     assert_eq!(
         replacement.registration.token_fingerprint, expected,
         "replacement registration fingerprint diverged from the official helper"
@@ -401,9 +431,12 @@ async fn exchange() {
         &recipient_hex,
     )
     .await;
-    let replaced_trigger = wait_for_new_trigger(&relay.url, &server, &before_replace)
-        .expect("replacement trigger");
-    assert_ne!(replaced_trigger.id, trigger.id, "replacement reused the gift-wrap id");
+    let replaced_trigger =
+        wait_for_new_trigger(&relay.url, &server, &before_replace).expect("replacement trigger");
+    assert_ne!(
+        replaced_trigger.id, trigger.id,
+        "replacement reused the gift-wrap id"
+    );
     assert!(
         replaced_trigger.content != trigger.content,
         "replacement rumor did not change"
@@ -455,7 +488,8 @@ async fn exchange() {
     assert!(
         !gift_wraps(&relay.url)
             .into_iter()
-            .any(|(_seq, event)| p_tag(&event).eq_ignore_ascii_case(&unrelated.public_key().to_hex())),
+            .any(|(_seq, event)| p_tag(&event)
+                .eq_ignore_ascii_case(&unrelated.public_key().to_hex())),
         "a gift wrap was addressed to an unregistered server"
     );
 
@@ -494,7 +528,15 @@ async fn exchange() {
         "a relay refusal is not an alert-specific push result"
     );
     assert!(rejected.get("push_event_id").is_none_or(Value::is_null));
-    assert!(wait_plaintext(&runtime, &recipient_hex, &group, "watchdog rejected trigger").await);
+    assert!(
+        wait_plaintext(
+            &runtime,
+            &recipient_hex,
+            &group,
+            "watchdog rejected trigger"
+        )
+        .await
+    );
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(max_seq_kind(&relay.url, 1059), before_reject);
     post_json(
@@ -546,13 +588,7 @@ async fn exchange() {
         let alert_id = format!("alt_crash_{point}");
         let body = format!("watchdog crash {point}");
         let recovered = resumed
-            .send_once(
-                &alert_id,
-                &account,
-                &group,
-                &body,
-                &[recipient_hex.clone()],
-            )
+            .send_once(&alert_id, &account, &group, &body, &[recipient_hex.clone()])
             .await
             .unwrap_or_else(|error| panic!("{point} recovery failed: {error}"));
         let ids = recovered
@@ -676,7 +712,8 @@ fn validated_rumor(server: &Keys, event: &Event) -> Option<String> {
     {
         return None;
     }
-    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(unwrapped.rumor.content.as_bytes())
+    let Ok(raw) =
+        base64::engine::general_purpose::STANDARD.decode(unwrapped.rumor.content.as_bytes())
     else {
         return None;
     };
@@ -761,7 +798,10 @@ fn alert_group_event(url: &str, server: &Keys, group_hex: &str, baseline: u64) -
                     None
                 }
             });
-            if route.as_deref().is_none_or(|value| !value.eq_ignore_ascii_case(group_hex)) {
+            if route
+                .as_deref()
+                .is_none_or(|value| !value.eq_ignore_ascii_case(group_hex))
+            {
                 notes.push(format!(
                     "seq {seq} group tag {:?} is not this alert",
                     route.as_deref().unwrap_or("")
@@ -778,11 +818,16 @@ fn alert_group_event(url: &str, server: &Keys, group_hex: &str, baseline: u64) -
                     base64::engine::general_purpose::STANDARD_NO_PAD.decode(event.content.as_str())
                 });
             let Ok(decoded) = decoded else {
-                notes.push(format!("seq {seq} content is not the pinned base64 framing"));
+                notes.push(format!(
+                    "seq {seq} content is not the pinned base64 framing"
+                ));
                 continue;
             };
             if decoded.len() < 28 {
-                notes.push(format!("seq {seq} framed payload is {} bytes", decoded.len()));
+                notes.push(format!(
+                    "seq {seq} framed payload is {} bytes",
+                    decoded.len()
+                ));
                 continue;
             }
             let followed = triggers.iter().any(|(trigger_seq, trigger)| {
@@ -933,11 +978,7 @@ async fn wait_until_tokens(
             .readiness(account, recipient, group)
             .await
             .expect("readiness");
-        if ready
-            .get("active_recipient_tokens")
-            .and_then(Value::as_i64)
-            == Some(expected)
-        {
+        if ready.get("active_recipient_tokens").and_then(Value::as_i64) == Some(expected) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1160,7 +1201,7 @@ fn endpoints_of(relays: &[String]) -> Vec<cgka_traits::TransportEndpoint> {
 }
 
 #[test]
-fn packaged_binaries_deliver_reconcile_and_send_again() {
+fn packaged_binaries_deliver_monitor_incident_reconcile_and_send_recovery() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_stack_size(8 * 1024 * 1024)
@@ -1182,14 +1223,19 @@ async fn executable_exchange() {
         .expect("recipient bech32");
     let sender_hex = sender_keys.public_key().to_hex();
     let recipient_hex = recipient_keys.public_key().to_hex();
-    let root = temp_root("exec-sender");
+    let db_dir = Path::new("/tmp").join(temp_root("exec-data").file_name().unwrap());
+    let root = db_dir.join("marmot");
     let recipient_root = temp_root("exec-recipient");
-    let db_dir = temp_root("exec-db");
     let db = db_dir.join("watchdog.sqlite");
     let socket = root.join("watchdog.sock");
     let log = db_dir.join("watchdog.log");
+    let mut container = DockerFixture::from_environment(&db_dir);
     let helper_bin = PathBuf::from(env!("CARGO_BIN_EXE_watchdog-marmot"));
-    let watchdog_bin = watchdog_binary();
+    let watchdog_bin = if container.is_some() {
+        PathBuf::from("/usr/local/bin/nostr-watchdog")
+    } else {
+        watchdog_binary()
+    };
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");
     let operator = "fixture-operator-token";
@@ -1212,7 +1258,8 @@ async fn executable_exchange() {
         .expect("recipient import");
     assert_eq!(imported.account.account_id_hex, recipient_hex);
 
-    let mut helper = start_helper(&helper_bin, &root, &socket, &relay.url);
+    let mut helper =
+        start_fixture_helper(container.as_ref(), &helper_bin, &root, &socket, &relay.url);
     wait_health(&root.join("health.sock"));
     let mut group = String::new();
     let mut account = String::new();
@@ -1252,8 +1299,14 @@ async fn executable_exchange() {
         let _ = runtime.catch_up_accounts().await;
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
-    assert_eq!(account, sender_hex, "the packaged helper imported a different sender");
-    assert!(!group.is_empty(), "the packaged helper did not establish a conversation");
+    assert_eq!(
+        account, sender_hex,
+        "the packaged helper imported a different sender"
+    );
+    assert!(
+        !group.is_empty(),
+        "the packaged helper did not establish a conversation"
+    );
     let again = helper_ipc(
         &socket,
         serde_json::json!({
@@ -1266,12 +1319,19 @@ async fn executable_exchange() {
         }),
     );
     assert_eq!(again.get("reused"), Some(&Value::Bool(true)));
-    assert_eq!(again.get("group").and_then(Value::as_str), Some(group.as_str()));
+    assert_eq!(
+        again.get("group").and_then(Value::as_str),
+        Some(group.as_str())
+    );
     let group_id = GroupId::new(hex::decode(&group).expect("group hex"));
     let mut welcomed = false;
     for _ in 0..20 {
         let _ = runtime.catch_up_accounts().await;
-        if runtime.group_members(&recipient_hex, &group_id).await.is_ok() {
+        if runtime
+            .group_members(&recipient_hex, &group_id)
+            .await
+            .is_ok()
+        {
             welcomed = true;
             break;
         }
@@ -1331,6 +1391,7 @@ async fn executable_exchange() {
     );
     let baseline = max_seq(&relay.url);
     let mut watchdog = start_watchdog(
+        container.as_ref(),
         &watchdog_bin,
         &listen,
         &db,
@@ -1344,20 +1405,14 @@ async fn executable_exchange() {
         &log,
     );
     wait_http(&format!("http://{listen}/healthz"));
-    let first = post_alert(&listen, operator);
-    let alert = first
-        .get("alertId")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    assert!(
-        alert.starts_with("alt_"),
-        "alert was not accepted ({})",
-        first.get("error").and_then(Value::as_str).unwrap_or("no_alert")
-    );
+    let alert = wait_monitor_alert(&db, false).await;
+    wait_outbox_settled(&db, &alert).await;
     let text = sql_value(
         &db,
-        &format!("select payload_text from alert_outbox where id = '{}'", sql_id(&alert)),
+        &format!(
+            "select payload_text from alert_outbox where id = '{}'",
+            sql_id(&alert)
+        ),
     );
     assert!(!text.is_empty(), "the queued alert has no text");
     assert!(
@@ -1412,19 +1467,46 @@ async fn executable_exchange() {
         ),
     );
     assert_eq!(recorded, ids[0]);
+    let fallback_query = format!(
+        "SELECT f.id FROM alert_outbox f JOIN alert_outbox m ON f.incident_id = m.incident_id
+         WHERE m.id = '{}' AND f.destination = 'telegram' AND f.logical_id LIKE 'fallback:%'",
+        sql_id(&alert)
+    );
+    let fallback = sql_value(&db, &fallback_query);
+    assert!(fallback.starts_with("alt_"));
+    wait_outbox_settled(&db, &fallback).await;
+    assert_eq!(
+        sql_value(
+            &db,
+            &format!(
+                "SELECT message_state || ':' || push_state FROM alert_outbox WHERE id = '{}'",
+                sql_id(&alert),
+            )
+        ),
+        "relay_accepted:unobservable"
+    );
 
     watchdog.stop();
     helper.stop();
+    if let Some(container) = &mut container {
+        container.replace();
+    }
     sql_exec(
         &db,
         &format!(
-            "update alert_outbox set next_attempt_at = 0 where id = '{}'",
+            "update alert_outbox set state = 'retrying', settled_at = null, next_attempt_at = 0 where id = '{}';
+             update monitor_state set last_check_at = 0 where monitor_id = 'sfs-web'",
             sql_id(&alert)
         ),
     );
-    helper = start_helper(&helper_bin, &root, &socket, &relay.url);
+    post_json(
+        &format!("{}/control", http_base(&relay.url)),
+        &serde_json::json!({"healthReady": true}),
+    );
+    helper = start_fixture_helper(container.as_ref(), &helper_bin, &root, &socket, &relay.url);
     wait_health(&root.join("health.sock"));
     watchdog = start_watchdog(
+        container.as_ref(),
         &watchdog_bin,
         &listen,
         &db,
@@ -1438,6 +1520,7 @@ async fn executable_exchange() {
         &log,
     );
     wait_http(&format!("http://{listen}/healthz"));
+    wait_outbox_settled(&db, &alert).await;
     let mut reconciled = false;
     for _ in 0..40 {
         let _ = runtime.catch_up_accounts().await;
@@ -1449,7 +1532,10 @@ async fn executable_exchange() {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    assert!(reconciled, "restart changed the original application message");
+    assert!(
+        reconciled,
+        "restart changed the original application message"
+    );
     assert_eq!(
         sql_value(
             &db,
@@ -1461,13 +1547,9 @@ async fn executable_exchange() {
         ids[0]
     );
 
-    let second = post_alert(&listen, operator);
-    let second_alert = second
-        .get("alertId")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    assert!(second_alert.starts_with("alt_") && second_alert != alert);
+    let second_alert = wait_monitor_alert(&db, true).await;
+    wait_outbox_settled(&db, &second_alert).await;
+    assert_ne!(second_alert, alert);
     let second_text = sql_value(
         &db,
         &format!(
@@ -1485,6 +1567,13 @@ async fn executable_exchange() {
 
     watchdog.stop();
     helper.stop();
+    if container.is_some() {
+        drop(container);
+        let _ = runtime.shutdown_and_close().await;
+        let _ = std::fs::remove_dir_all(&recipient_root);
+        let _ = std::fs::remove_dir_all(&db_dir);
+        return;
+    }
     let crash_text = "process crash boundary";
     let mut crashing = start_crash_helper(&helper_bin, &root, &socket, &relay.url);
     wait_health(&root.join("health.sock"));
@@ -1505,7 +1594,11 @@ async fn executable_exchange() {
         "the helper answered after it was told to stop"
     );
     let status = crashing.0.wait().expect("crash wait");
-    assert_eq!(status.code(), Some(75), "the helper did not exit at the crash boundary");
+    assert_eq!(
+        status.code(),
+        Some(75),
+        "the helper did not exit at the crash boundary"
+    );
     let recovered_helper = start_helper(&helper_bin, &root, &socket, &relay.url);
     wait_health(&root.join("health.sock"));
     let recovered = helper_ipc(
@@ -1526,7 +1619,10 @@ async fn executable_exchange() {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    assert!(!recovered_ids.is_empty(), "restart did not recover the submitted message");
+    assert!(
+        !recovered_ids.is_empty(),
+        "restart did not recover the submitted message"
+    );
     let repeated = helper_ipc(
         &socket,
         serde_json::json!({
@@ -1594,18 +1690,43 @@ async fn executable_exchange() {
     let _ = std::fs::remove_dir_all(&db_dir);
 }
 
-fn watchdog_binary() -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/nostr-watchdog");
-    if path.exists() {
-        return path;
+async fn wait_monitor_alert(db: &Path, resolved: bool) -> String {
+    let state = if resolved { "closed" } else { "open" };
+    let suffix = if resolved { "close" } else { "open" };
+    let query = format!(
+        "SELECT o.id FROM alert_outbox o JOIN incidents i ON o.incident_id = i.id
+         WHERE i.monitor_id = 'sfs-web' AND i.status = '{state}' AND o.destination = 'marmot'
+           AND o.dedupe_key LIKE '%:{suffix}:marmot'"
+    );
+    for _ in 0..60 {
+        let alert = sql_value(db, &query);
+        if alert.starts_with("alt_") {
+            return alert;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    panic!("no Marmot outbox entry for the {state} monitor incident");
+}
+
+fn watchdog_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("WATCHDOG_TEST_BINARY") {
+        return PathBuf::from(path);
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let status = Command::new("cargo")
-        .args(["build", "-p", "watchdog-native", "--bin", "nostr-watchdog"])
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args([
+            "build",
+            "--locked",
+            "-p",
+            "watchdog-native",
+            "--bin",
+            "nostr-watchdog",
+        ])
+        .current_dir(&root)
         .status()
         .expect("cargo");
     assert!(status.success(), "nostr-watchdog did not build");
-    path
+    root.join("target/debug/nostr-watchdog")
 }
 
 fn free_port() -> u16 {
@@ -1626,6 +1747,126 @@ impl Drop for OwnedProc {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+struct DockerFixture {
+    name: String,
+    image: String,
+    directory: PathBuf,
+    user: String,
+    running: bool,
+}
+
+impl DockerFixture {
+    fn from_environment(directory: &Path) -> Option<Self> {
+        let image = std::env::var("WATCHDOG_TEST_IMAGE").ok()?;
+        let id = |flag| {
+            let output = Command::new("id").arg(flag).output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let uid = id("-u");
+        assert_ne!(
+            uid, "0",
+            "the Docker qualification driver must use an unprivileged host user"
+        );
+        let mut fixture = Self {
+            name: format!("watchdog-fixture-{}", std::process::id()),
+            image,
+            directory: directory.to_owned(),
+            user: format!("{uid}:{}", id("-g")),
+            running: false,
+        };
+        std::fs::create_dir_all(directory).unwrap();
+        fixture.start();
+        Some(fixture)
+    }
+
+    fn start(&mut self) {
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "--detach",
+                "--network",
+                "host",
+                "--name",
+                &self.name,
+                "--user",
+                &self.user,
+            ])
+            .args([
+                "--mount",
+                &format!("type=bind,src={},dst=/data", self.directory.display()),
+            ])
+            .args(["--entrypoint", "/bin/sleep", &self.image, "infinity"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "start image fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.running = true;
+    }
+
+    fn remove(&mut self) {
+        if self.running {
+            let status = Command::new("docker")
+                .args(["rm", "--force", &self.name])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "remove image fixture");
+            self.running = false;
+        }
+    }
+
+    fn replace(&mut self) {
+        self.remove();
+        self.start();
+    }
+}
+
+impl Drop for DockerFixture {
+    fn drop(&mut self) {
+        if self.running {
+            let _ = Command::new("docker")
+                .args(["rm", "--force", &self.name])
+                .stdout(Stdio::null())
+                .status();
+        }
+    }
+}
+
+fn start_fixture_helper(
+    container: Option<&DockerFixture>,
+    binary: &Path,
+    root: &Path,
+    socket: &Path,
+    relay: &str,
+) -> OwnedProc {
+    let Some(container) = container else {
+        return start_helper(binary, root, socket, relay);
+    };
+    let child = Command::new("docker")
+        .args([
+            "exec",
+            &container.name,
+            "/usr/local/bin/watchdog-marmot",
+            "--root",
+            "/data/marmot",
+            "--socket",
+            "/data/marmot/watchdog.sock",
+            "--allow-loopback",
+            "--relay",
+            relay,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("image helper");
+    OwnedProc(child)
 }
 
 fn start_helper(binary: &Path, root: &Path, socket: &Path, relay: &str) -> OwnedProc {
@@ -1666,6 +1907,7 @@ fn spawn_helper(
 }
 
 fn start_watchdog(
+    container: Option<&DockerFixture>,
     binary: &Path,
     listen: &str,
     db: &Path,
@@ -1683,33 +1925,91 @@ fn start_watchdog(
     }
     let log_file = std::fs::File::create(log).expect("log");
     let err = log_file.try_clone().expect("log");
-    let child = Command::new(binary)
-        .env_clear()
-        .env(
-            "PATH",
-            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
-        )
-        .env(
-            "HOME",
-            std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
-        )
-        .env(
-            "TMPDIR",
-            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
-        )
-        .env("OPERATOR_TOKEN", operator)
-        .env("DATABASE_PATH", db)
-        .env("LISTEN_ADDR", listen)
-        .env("MARMOT_ROOT", root)
-        .env("MARMOT_SOCKET", socket)
-        .env("MARMOT_HELPER", helper)
-        .env("ENABLE_MARMOT", "true")
-        .env("ENABLE_NIP17", "false")
-        .env("ALERTS_ENABLED", "true")
-        .env("WATCHDOG_ENABLED", "true")
-        .env("BOOTSTRAP_RELAYS", relay)
-        .env("SFS_BOT_NSEC", sender_nsec)
-        .env("ADMIN_NPUB", recipient)
+    let relay_health = format!("{}/healthcheck", http_base(relay));
+    let telegram_endpoint = format!("{}/telegram", http_base(relay));
+    let vars = [
+        ("OPERATOR_TOKEN", operator),
+        (
+            "DATABASE_PATH",
+            if container.is_some() {
+                "/data/watchdog.sqlite"
+            } else {
+                db.to_str().unwrap()
+            },
+        ),
+        ("LISTEN_ADDR", listen),
+        (
+            "MARMOT_ROOT",
+            if container.is_some() {
+                "/data/marmot"
+            } else {
+                root.to_str().unwrap()
+            },
+        ),
+        (
+            "MARMOT_SOCKET",
+            if container.is_some() {
+                "/data/marmot/watchdog.sock"
+            } else {
+                socket.to_str().unwrap()
+            },
+        ),
+        (
+            "MARMOT_HELPER",
+            if container.is_some() {
+                "/usr/local/bin/watchdog-marmot"
+            } else {
+                helper.to_str().unwrap()
+            },
+        ),
+        ("ENABLE_MARMOT", "true"),
+        ("ENABLE_NIP17", "false"),
+        ("ALERTS_ENABLED", "true"),
+        ("WATCHDOG_ENABLED", "true"),
+        ("ENVIRONMENT", "test"),
+        ("TELEGRAM_CRITICAL_MODE", "nostr_fallback"),
+        ("TELEGRAM_BOT_TOKEN", "local-fixture"),
+        ("TELEGRAM_CHAT_IDS", r#"{"smartflowsocial":"1"}"#),
+        ("WATCHDOG_TEST_TELEGRAM_ENDPOINT", &telegram_endpoint),
+        ("ENABLE_SFS_WEB", "true"),
+        ("FAILURE_THRESHOLD", "1"),
+        ("RECOVERY_THRESHOLD", "1"),
+        ("PRIVATE_NETWORK_PROFILE", "true"),
+        ("SFS_WEB_READY_URL", &relay_health),
+        ("BOOTSTRAP_RELAYS", relay),
+        ("SFS_BOT_NSEC", sender_nsec),
+        ("ADMIN_NPUB", recipient),
+    ];
+    let mut command = if let Some(container) = container {
+        let mut command = Command::new("docker");
+        command.arg("exec");
+        for (name, _) in vars {
+            command.args(["--env", name]);
+        }
+        command
+            .args(["--env", "HOME=/tmp", &container.name])
+            .arg(binary);
+        command
+    } else {
+        let mut command = Command::new(binary);
+        command
+            .env_clear()
+            .env(
+                "PATH",
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            )
+            .env(
+                "HOME",
+                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+            )
+            .env(
+                "TMPDIR",
+                std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()),
+            );
+        command
+    };
+    let child = command
+        .envs(vars)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(err))
@@ -1770,25 +2070,20 @@ fn helper_ipc_result(socket: &Path, request: Value) -> Result<Value, String> {
     serde_json::from_str(&line).map_err(|error| error.to_string())
 }
 
-fn post_alert(listen: &str, operator: &str) -> Value {
-    let output = Command::new("curl")
-        .args([
-            "-sS",
-            "--max-time",
-            "120",
-            "-X",
-            "POST",
-            "-H",
-            &format!("authorization: Bearer {operator}"),
-            "-H",
-            "content-type: application/json",
-            "-d",
-            r#"{"projectId":"smartflowsocial","transport":"marmot"}"#,
-            &format!("http://{listen}/v1/diagnostics/test-alert"),
-        ])
-        .output()
-        .expect("curl");
-    serde_json::from_slice(&output.stdout).unwrap_or(Value::Null)
+async fn wait_outbox_settled(db: &Path, alert: &str) {
+    let query = format!(
+        "SELECT state || ':' || COALESCE(last_error, '') FROM alert_outbox WHERE id = '{}'",
+        sql_id(alert)
+    );
+    let mut state = String::new();
+    for _ in 0..170 {
+        state = sql_value(db, &query);
+        if state.starts_with("relay_accepted:") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("watchdog did not settle the monitor alert: {state}");
 }
 
 fn sql_id(id: &str) -> String {
@@ -1802,6 +2097,8 @@ fn sql_id(id: &str) -> String {
 
 fn sql_value(db: &Path, statement: &str) -> String {
     let output = Command::new("sqlite3")
+        .arg("-cmd")
+        .arg(".timeout 2500")
         .arg(db)
         .arg(statement)
         .output()
@@ -1867,9 +2164,16 @@ async fn crash_and_reconcile(
             "allow": [recipient]
         }),
     );
-    assert!(crashed.is_err(), "{point} returned a response after process exit");
+    assert!(
+        crashed.is_err(),
+        "{point} returned a response after process exit"
+    );
     let status = crashing.0.wait().expect("wait");
-    assert_eq!(status.code(), Some(75), "{point} did not exit at the boundary");
+    assert_eq!(
+        status.code(),
+        Some(75),
+        "{point} did not exit at the boundary"
+    );
     let helper = start_helper(helper_bin, root, socket, relay);
     wait_health(&root.join("health.sock"));
     let recovered = helper_ipc(
@@ -1884,10 +2188,17 @@ async fn crash_and_reconcile(
             "allow": [recipient]
         }),
     );
-    assert_eq!(recovered.get("ok"), Some(&Value::Bool(true)), "{point} did not reconcile");
+    assert_eq!(
+        recovered.get("ok"),
+        Some(&Value::Bool(true)),
+        "{point} did not reconcile"
+    );
     if point != "intent" {
         let ids = recovered.get("message_ids").and_then(Value::as_array);
-        assert!(ids.is_some_and(|items| !items.is_empty()), "{point} lost the admitted message");
+        assert!(
+            ids.is_some_and(|items| !items.is_empty()),
+            "{point} lost the admitted message"
+        );
     }
     let repeated = helper_ipc(
         socket,

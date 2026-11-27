@@ -26,7 +26,8 @@ ENABLE_MARMOT = "false"
 ENABLE_NIP17 = "false"
 
 # Private cross-script binding. The class is exported by the Marmot Worker,
-# not by this script. Start that Worker from wrangler.marmot-local.toml first.
+# not by this script. Start both Workers with one command:
+# wrangler dev -c wrangler.rust-local.toml -c wrangler.marmot-local.toml
 # MARMOT_OPERATOR_TOKEN is a local secret. MARMOT_STORAGE_KEY stays on the
 # Marmot Worker.
 

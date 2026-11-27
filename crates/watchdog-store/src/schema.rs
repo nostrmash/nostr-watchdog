@@ -82,21 +82,17 @@ state IN ('queued', 'retrying')
    )
    OR (
      COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
-     AND COALESCE(push_state, '') IN (
-       'unknown', '', 'not_attempted', 'token_unavailable', 'unobservable',
-       'publication_attempted', 'prepared', 'pending'
-     )
      AND (
-       (auth_push_publications IS NOT NULL AND auth_push_publications >= 2)
-       OR (auth_push_reconciles IS NOT NULL AND auth_push_reconciles >= 2)
-       OR (
-         COALESCE(push_state, '') = 'token_unavailable'
-         AND auth_token_waits IS NOT NULL AND auth_token_waits >= 2
+       transport_disposition = 'reconcile'
+       OR COALESCE(push_state, '') IN (
+         'unknown', '', 'not_attempted', 'token_unavailable', 'unobservable',
+         'publication_attempted', 'prepared', 'pending'
        )
-       OR COALESCE(operation_started_at, created_at) < ?1 - 900000
      )
+     AND COALESCE(operation_started_at, created_at) < ?1 - 900000
    )
-   OR COALESCE(push_state, '') IN ('rejected', 'terminal_failure', 'expired')
+   OR (COALESCE(transport_disposition, '') != 'reconcile'
+       AND COALESCE(push_state, '') IN ('rejected', 'terminal_failure', 'expired'))
  )";
 
 /// Columns the running binary selects. A ledger entry without the column is

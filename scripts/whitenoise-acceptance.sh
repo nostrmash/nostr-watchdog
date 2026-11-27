@@ -1,7 +1,7 @@
 #!/bin/sh
 # Isolated WhiteNoise acceptance for one test phone.
 # This script never sends an alert unless you run alert-foreground or
-# alert-locked yourself. It does not read the parent shell's secrets.
+# alert-background or alert-locked yourself. It does not read the parent shell's secrets.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
@@ -26,7 +26,8 @@ Usage: scripts/whitenoise-acceptance.sh <command>
   conversation          Establish the direct conversation. Idempotent.
   status                Show group and token readiness. No token bytes.
   alert-foreground      Send one test alert while the phone is unlocked.
-  alert-locked          Ask for confirmation, then send one locked-screen alert.
+  alert-background      Confirm the app is in the background, then send one alert.
+  alert-locked          Confirm the phone is locked, then send one alert.
   restart               Stop both processes and start them again. Nothing is sent.
   stop                  Stop the isolated watchdog and its helper.
 
@@ -44,8 +45,8 @@ require_binaries() {
   fi
   if [ ! -x "$helper" ] || [ ! -x "$watchdog" ]; then
     echo "Build both executables first:" >&2
-    echo "  ODIN=$odin cargo build --manifest-path crates/watchdog-marmot/Cargo.toml --release" >&2
-    echo "  cargo build --release -p watchdog-native" >&2
+    echo "  ODIN=$odin cargo build --locked --manifest-path crates/watchdog-marmot/Cargo.toml --release" >&2
+    echo "  cargo build --locked --release -p watchdog-native" >&2
     exit 1
   fi
 }
@@ -124,7 +125,6 @@ sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 try:
     sock.settimeout(1)
     sock.connect(path)
-    sock.sendall(b'{"op":"ping"}\n')
     data = b""
     while b"\n" not in data:
         chunk = sock.recv(4096)
@@ -434,12 +434,16 @@ PY
     fi
     ;;
   alert-foreground) send_alert ;;
-  alert-locked)
+  alert-background|alert-locked)
     if [ ! -t 0 ]; then
-      echo "alert-locked must be run from a terminal so it cannot send unattended." >&2
+      echo "$1 must be run from a terminal." >&2
       exit 1
     fi
-    echo "Lock the test phone. Type send to publish one alert, or anything else to stop."
+    case "$1" in
+      alert-background) echo "Put WhiteNoise in the background on the test phone." ;;
+      alert-locked) echo "Lock the test phone." ;;
+    esac
+    echo "Type send to publish one alert, or anything else to stop."
     read -r answer
     if [ "$answer" != "send" ]; then
       echo "No alert was sent."

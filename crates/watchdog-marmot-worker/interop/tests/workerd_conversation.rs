@@ -1586,6 +1586,7 @@ async fn scheduled_incident_reaches_official_recipient_via_both_workers() {
 
     let original = fs::read_to_string(root.join("wrangler.rust-local.toml")).unwrap();
     let config = original
+        .replace("ENVIRONMENT = \"development\"", "ENVIRONMENT = \"test\"")
         .replace("crates/watchdog-worker/build/worker/shim.mjs", root.join("crates/watchdog-worker/build/worker/shim.mjs").to_str().unwrap())
         .replace("migrations_dir = \"migrations\"", &format!("migrations_dir = \"{}\"", root.join("migrations").display()))
         .replace("ALERTS_ENABLED = \"false\"", "ALERTS_ENABLED = \"true\"")
@@ -1599,8 +1600,8 @@ async fn scheduled_incident_reaches_official_recipient_via_both_workers() {
         "nostrmash": other_recipient.public_key_hex(),
     });
     fs::write(scratch.0.join(".dev.vars"), format!(
-        "OPERATOR_TOKEN={TOKEN}\nMARMOT_OPERATOR_TOKEN={TOKEN}\nSFS_BOT_NSEC={}\nNOSTRMASH_BOT_NSEC={}\nPROJECT_RECIPIENTS='{}'\n",
-        sender.secret_key().to_bech32().unwrap(), other_sender.secret_key().to_secret_hex(), recipients,
+        "OPERATOR_TOKEN={TOKEN}\nMARMOT_OPERATOR_TOKEN={TOKEN}\nSFS_BOT_NSEC={}\nNOSTRMASH_BOT_NSEC={}\nPROJECT_RECIPIENTS='{}'\nTELEGRAM_CRITICAL_MODE=nostr_fallback\nTELEGRAM_BOT_TOKEN=local-fixture\nTELEGRAM_CHAT_IDS='{{\"smartflowsocial\":\"1\"}}'\nWATCHDOG_TEST_TELEGRAM_ENDPOINT={}/telegram\n",
+        sender.secret_key().to_bech32().unwrap(), other_sender.secret_key().to_secret_hex(), recipients, relay.http,
     )).unwrap();
     let config = fs::read_to_string(root.join("wrangler.marmot-local.toml")).unwrap();
     fs::write(
@@ -1793,6 +1794,13 @@ async fn scheduled_incident_reaches_official_recipient_via_both_workers() {
          ORDER BY a.created_at, a.id"
     )
     };
+    let fallback = || {
+        query(
+            "SELECT state FROM alert_outbox WHERE destination = 'telegram'
+        AND logical_id LIKE 'fallback:%:open'",
+        )
+    };
+    assert_eq!(fallback(), json!([{"state": "relay_accepted"}]));
     let first = read_alerts();
     let row = first
         .get(0)
@@ -1849,6 +1857,7 @@ async fn scheduled_incident_reaches_official_recipient_via_both_workers() {
         query("UPDATE monitor_state SET last_check_at = 0");
         tick();
     }
+    assert_eq!(fallback(), json!([{"state": "relay_accepted"}]));
     let after = read_alerts();
     assert_eq!(
         after[0]["message_event_id"], first[0]["message_event_id"],

@@ -287,11 +287,19 @@ async fn ping_health(vars: &HashMap<String, String>) -> Result<(), String> {
     let Some(socket) = health_socket(vars) else {
         return Err("marmot_helper_unavailable".to_string());
     };
-    if !socket.exists() {
-        return Err("marmot_helper_unavailable".to_string());
-    }
-    let value = call(&socket, json!({"op": "ping"}), Duration::from_secs(1)).await?;
-    if value.get("ok") == Some(&Value::Bool(true)) {
+    let value: Value = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut stream = UnixStream::connect(socket)
+            .await
+            .map_err(|_| "marmot_helper_unavailable")?;
+        // The health socket greets the client and closes without reading a request.
+        let line = read_bounded_line(&mut stream, 1024)
+            .await
+            .map_err(|_| "marmot_helper_unavailable")?;
+        serde_json::from_str(&line).map_err(|_| "marmot_helper_unavailable")
+    })
+    .await
+    .map_err(|_| "marmot_helper_unavailable")??;
+    if value["ok"] == true && value["pong"] == true {
         Ok(())
     } else {
         Err("marmot_helper_unavailable".to_string())

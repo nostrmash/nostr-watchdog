@@ -26,6 +26,15 @@ COPY migrations ./migrations
 RUN cargo build --release --locked -p watchdog-native \
     && cargo build --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml --bin watchdog-marmot
 
+# Optional build target for the Linux image qualification driver.
+FROM build AS image-test-driver
+RUN mkdir -p /out \
+    && cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
+         --test fixture_exchange --no-run \
+    && driver="$(find crates/watchdog-marmot/target/release/deps -maxdepth 1 -type f -name 'fixture_exchange-*' -perm /111)" \
+    && test -x "$driver" \
+    && cp "$driver" /out/fixture_exchange
+
 FROM --platform=linux/amd64 debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

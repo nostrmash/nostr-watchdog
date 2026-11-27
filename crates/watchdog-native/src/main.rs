@@ -382,19 +382,21 @@ async fn push_loop(
 }
 
 async fn sync_loop(state: Arc<AppState>, stop: Arc<std::sync::atomic::AtomicBool>) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(60));
+    let get = |key: &str| state.vars.get(key).cloned().unwrap_or_default();
+    let settings = load_settings(&get);
+    if !watchdog_core::catalog::PROJECTS
+        .iter()
+        .any(|project| watchdog_core::settings::marmot_enabled_for(&settings, &get, project.id))
+    {
+        return;
+    }
+    let mut ticker =
+        tokio::time::interval(Duration::from_secs(settings.sync_interval_seconds as u64));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        if stop.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
         ticker.tick().await;
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             break;
-        }
-        let settings = load_settings(|key| state.vars.get(key).cloned().unwrap_or_default());
-        if !settings.marmot_enabled {
-            continue;
         }
         if let Err(error) = marmot::sync(&state.vars).await {
             tracing::warn!(%error, "marmot sync failed");
@@ -875,20 +877,27 @@ async fn deliver_telegram(
     }
     let budget = Duration::from_millis(timeout_ms.max(1) as u64);
     let started = std::time::Instant::now();
-    let Ok(address) = net::resolve_pinned("api.telegram.org", 443, false, budget).await else {
-        return retry_error("telegram_failed");
+    let fixture = watchdog_core::settings::telegram_fixture_url(
+        &get("ENVIRONMENT"),
+        &get("WATCHDOG_TEST_TELEGRAM_ENDPOINT"),
+    );
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    let url = if let Some(fixture) = fixture {
+        fixture.to_string()
+    } else {
+        let Ok(address) = net::resolve_pinned("api.telegram.org", 443, false, budget).await else {
+            return retry_error("telegram_failed");
+        };
+        builder = builder.resolve("api.telegram.org", address);
+        format!("https://api.telegram.org/bot{token}/sendMessage")
     };
     let remaining = budget.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         return retry_error("telegram_failed");
     }
-    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .resolve("api.telegram.org", address)
-        .timeout(remaining)
-        .build();
+    let client = builder.timeout(remaining).build();
     let Ok(client) = client else {
         return retry_error("telegram_failed");
     };

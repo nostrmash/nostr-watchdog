@@ -384,8 +384,15 @@ fn decide_lifecycle(
             LifecycleDecision::Fail
         };
     }
-    if input.permanent_push_uncertainty && message == Some(MessageState::RelayAccepted) {
-        return LifecycleDecision::Accept;
+    if message == Some(MessageState::RelayAccepted) {
+        if input.permanent_push_uncertainty || input.age_ms >= 900_000 {
+            return LifecycleDecision::Accept;
+        }
+        // The cryptographic authority owns target attempts. Its explicit
+        // reconciliation decision takes priority over any aggregate push label.
+        if input.disposition == Some(OperationDisposition::Reconcile) {
+            return retry(input.counters.push_reconciles.unwrap_or(0));
+        }
     }
     match message {
         Some(MessageState::Rejected) => return LifecycleDecision::Fail,
@@ -418,66 +425,14 @@ fn decide_lifecycle(
         }
     }
     match push {
-        Some(PushState::Rejected | PushState::Expired | PushState::TerminalFailure) => {
-            LifecycleDecision::Accept
-        }
-        Some(PushState::NotRequired) => LifecycleDecision::Accept,
-        Some(PushState::RelayAccepted)
-            if input.disposition != Some(OperationDisposition::Reconcile) =>
-        {
-            LifecycleDecision::Accept
-        }
-        Some(PushState::RelayAccepted) => {
-            let attempts = input
-                .counters
-                .push_reconciles
-                .or(input.counters.push_publications);
-            if attempts.is_some_and(|count| count >= 2) || input.age_ms >= 900_000 {
-                LifecycleDecision::Accept
-            } else {
-                retry(attempts.unwrap_or(0))
-            }
-        }
-        Some(PushState::Unobservable) if input.permanent_push_uncertainty => {
-            LifecycleDecision::Accept
-        }
-        Some(PushState::Unobservable) => {
-            let attempts = input
-                .counters
-                .push_reconciles
-                .or(input.counters.push_publications);
-            if attempts.is_some_and(|count| count >= 2) || input.age_ms >= 900_000 {
-                LifecycleDecision::Accept
-            } else {
-                retry(attempts.unwrap_or(0))
-            }
-        }
-        Some(PushState::TokenUnavailable) => {
-            let waits = input.counters.token_waits;
-            if waits.is_some_and(|count| count >= 2) || input.age_ms >= 900_000 {
-                LifecycleDecision::Accept
-            } else {
-                retry(waits.unwrap_or(0))
-            }
-        }
         Some(
-            PushState::PublicationAttempted
-            | PushState::Prepared
-            | PushState::Pending
-            | PushState::NotAttempted
-            | PushState::Unknown,
-        )
-        | None => {
-            let attempts = input
-                .counters
-                .push_publications
-                .or(input.counters.push_reconciles);
-            if attempts.is_some_and(|count| count >= 2) || input.age_ms >= 900_000 {
-                LifecycleDecision::Accept
-            } else {
-                retry(attempts.unwrap_or(0))
-            }
-        }
+            PushState::RelayAccepted
+            | PushState::Rejected
+            | PushState::Expired
+            | PushState::TerminalFailure
+            | PushState::NotRequired,
+        ) => LifecycleDecision::Accept,
+        _ => retry(input.counters.push_reconciles.unwrap_or(0)),
     }
 }
 
@@ -529,16 +484,11 @@ fn relative_delay(value: &Value) -> Option<i64> {
 
 fn disposition_of(value: &Value) -> OperationDisposition {
     let nested = value.get("operation").unwrap_or(&Value::Null);
-    if value.get("settled").and_then(Value::as_bool) == Some(true) {
-        return OperationDisposition::Settled;
-    }
     let label = json_str(value, &["disposition"]).or_else(|| json_str(nested, &["disposition"]));
     match label {
         Some("settled") => OperationDisposition::Settled,
         Some("reconcile") => OperationDisposition::Reconcile,
-        _ if value.get("terminal").and_then(Value::as_bool) == Some(true)
-            && value.get("hold").and_then(Value::as_bool) != Some(true) =>
-        {
+        _ if value["settled"] == true || (value["terminal"] == true && value["hold"] != true) => {
             OperationDisposition::Settled
         }
         _ => OperationDisposition::Reconcile,
@@ -627,9 +577,9 @@ pub fn transport_identity_matches(
     project: &str,
     operation_id: &str,
 ) -> bool {
-    !operation.operation_id.is_empty()
+    !operation_id.is_empty()
         && operation.operation_id == operation_id
-        && (operation.project_id.is_empty() || operation.project_id == project)
+        && operation.project_id == project
 }
 
 /// Sanitized fields the operational store keeps. This is not the transport body.
@@ -1138,8 +1088,8 @@ mod tests {
                 message_reconciles: Some(0),
                 ambiguous_reconciles: Some(0),
                 token_waits: Some(0),
-                push_publications: Some(1),
-                push_reconciles: Some(0),
+                push_publications: Some(5),
+                push_reconciles: Some(4),
             },
             age_ms: 1_000,
             hold: true,

@@ -262,8 +262,21 @@ function readBody(request) {
   });
 }
 
+let healthReady = false;
 const server = createServer(async (request, response) => {
   const url = new URL(request.url || "/", "http://127.0.0.1");
+  if (request.method === "POST" && url.pathname === "/telegram") {
+    const message = JSON.parse(await readBody(request));
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ ok: message.chat_id === "1" && Boolean(message.text) }));
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/healthcheck") {
+    response.statusCode = healthReady ? 200 : 503;
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ status: healthReady ? "ok" : "down" }));
+    return;
+  }
   if (request.method === "GET" && url.pathname === "/stats") {
     const counts = {};
     const giftWraps = [];
@@ -316,6 +329,7 @@ const server = createServer(async (request, response) => {
   if (request.method === "POST" && url.pathname === "/control") {
     try {
       const body = JSON.parse(await readBody(request));
+      if (typeof body.healthReady === "boolean") healthReady = body.healthReady;
       rejectKinds.clear();
       for (const kind of body.rejectKinds || []) rejectKinds.add(kind);
       response.setHeader("content-type", "application/json");

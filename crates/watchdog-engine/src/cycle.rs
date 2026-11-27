@@ -462,14 +462,8 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
     {
         return Ok(());
     }
-    let outcome = match Destination::parse(&row.destination) {
+    let mut outcome = match Destination::parse(&row.destination) {
         Some(Destination::Telegram) => notifier.deliver_telegram(row).await,
-        Some(Destination::Marmot)
-            if row.message_state.as_deref() == Some("accepted")
-                || row.message_state.as_deref() == Some("accepted_pending") =>
-        {
-            notifier.deliver_marmot(row, &token).await
-        }
         Some(Destination::Marmot) => notifier.deliver_marmot(row, &token).await,
         Some(Destination::Nostr) => notifier.deliver_nostr(row, &token).await,
         None => DeliveryOutcome {
@@ -486,13 +480,14 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
             operation: None,
         },
     };
+    if row.destination == "marmot" {
+        merge_marmot_observation(row, &mut outcome);
+    }
     let finished = clock.unix_ms();
-    let started_at = outcome
-        .operation
-        .as_ref()
-        .and_then(|operation| operation.started_at_ms)
-        .or(row.operation_started_at)
-        .unwrap_or(row.created_at);
+    let started_at = row
+        .operation_started_at
+        .unwrap_or(row.created_at)
+        .min(row.created_at);
     let counters = outcome
         .operation
         .as_ref()
@@ -521,7 +516,17 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
         disposition: outcome
             .operation
             .as_ref()
-            .map(|operation| operation.disposition),
+            .map(|operation| operation.disposition)
+            .or_else(|| {
+                if row.destination != "marmot" || !outcome.accepted {
+                    return None;
+                }
+                Some(if row.transport_disposition.as_deref() == Some("settled") {
+                    watchdog_core::delivery::OperationDisposition::Settled
+                } else {
+                    watchdog_core::delivery::OperationDisposition::Reconcile
+                })
+            }),
         retry_after_ms: outcome
             .operation
             .as_ref()
@@ -628,6 +633,57 @@ async fn deliver_one<S: OperationalStore, N: Notifier, C: Clock>(
         )
         .await?;
     Ok(())
+}
+
+fn merge_marmot_observation(row: &OutboxRow, outcome: &mut DeliveryOutcome) {
+    use watchdog_core::delivery::MessageState;
+
+    let message = outcome
+        .operation
+        .as_ref()
+        .and_then(|item| item.message)
+        .or_else(|| {
+            outcome
+                .message_phase
+                .as_deref()
+                .and_then(MessageState::parse)
+        });
+    let incoming_id = outcome
+        .operation
+        .as_ref()
+        .and_then(|op| op.message_event_id.as_deref())
+        .or(outcome.message_event_id.as_deref());
+    let conflicts = row
+        .message_event_id
+        .as_deref()
+        .zip(incoming_id)
+        .is_some_and(|(stored, incoming)| stored != incoming);
+    let stale = outcome
+        .operation
+        .as_ref()
+        .and_then(|op| op.updated_at_ms)
+        .zip(row.transport_updated_at)
+        .is_some_and(|(incoming, stored)| incoming < stored);
+    let previously_accepted = row
+        .message_state
+        .as_deref()
+        .or(row.message_phase.as_deref())
+        .and_then(MessageState::parse)
+        == Some(MessageState::RelayAccepted);
+    if conflicts || stale || (previously_accepted && message != Some(MessageState::RelayAccepted)) {
+        outcome.operation = None;
+        outcome.message_phase = row
+            .message_state
+            .clone()
+            .or_else(|| row.message_phase.clone());
+        outcome.push_phase = row.push_state.clone().or_else(|| row.push_phase.clone());
+        outcome.message_event_id = row.message_event_id.clone();
+        outcome.accepted = previously_accepted;
+        outcome.terminal = false;
+        if conflicts {
+            outcome.error = Some("message_event_identity_conflict".into());
+        }
+    }
 }
 
 fn availability_for(get: &impl Fn(&str) -> String, destination: &str) -> TransportAvailability {

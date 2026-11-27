@@ -1,7 +1,11 @@
 target
+**/target
+**/build
+**/.wrangler
 .git
 .github
 node_modules
+**/node_modules
 probes
 tests
 src

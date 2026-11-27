@@ -50,6 +50,54 @@ impl<'a> D1Store<'a> {
             .unwrap_or(0))
     }
 
+    pub(crate) async fn complete_onboarding(
+        &self,
+        project: &str,
+        operation: &str,
+        account: &str,
+        recipient: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let updated = self
+            .run(
+                "UPDATE marmot_projects SET
+                    pubkey = ?3, peer_pubkey = ?4, engine_status = 'account_initialized',
+                    conversation_id = CASE WHEN pubkey = ?3 AND peer_pubkey = ?4 THEN conversation_id END,
+                    group_id_hex = CASE WHEN pubkey = ?3 AND peer_pubkey = ?4 THEN group_id_hex END,
+                    updated_at = MAX(updated_at, ?5)
+                 WHERE project_id = ?1 AND onboard_idempotency_key = ?2",
+                &[text(project), text(operation), text(account), text(recipient), number(now)],
+            )
+            .await?;
+        if updated == 0 {
+            return Ok(false);
+        }
+        self.run(
+            "UPDATE marmot_onboard_history SET engine_status = 'account_initialized'
+             WHERE project_id = ?1 AND operation_id = ?2",
+            &[text(project), text(operation)],
+        )
+        .await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn record_marmot_sync(
+        &self,
+        project: &str,
+        sender: &str,
+        recipient: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.run(
+            "UPDATE marmot_projects SET last_sync_at = MAX(COALESCE(last_sync_at, 0), ?4),
+               last_sync_error = NULL, updated_at = MAX(updated_at, ?4)
+             WHERE project_id = ?1 AND pubkey = ?2 AND peer_pubkey = ?3",
+            &[text(project), text(sender), text(recipient), number(now)],
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn first(&self, sql: &str, binds: &[JsValue]) -> Result<Option<Value>, StoreError> {
         self.prepare(sql, binds)?
             .first(None)
@@ -67,6 +115,17 @@ impl<'a> D1Store<'a> {
             .results()
             .map_err(|error| StoreError::Database(error.to_string()))
     }
+}
+
+fn finish_statement_error(error: worker::Error) -> Result<bool, StoreError> {
+    let message = error.to_string();
+    if ["NULL", "constraint", "Constraint", "UNIQUE"]
+        .iter()
+        .any(|part| message.contains(part))
+    {
+        return Ok(false);
+    }
+    Err(StoreError::Database(message))
 }
 
 fn text(value: &str) -> JsValue {
@@ -627,17 +686,14 @@ impl OperationalStore for D1Store<'_> {
                         AND NOT (
                           destination = 'marmot'
                           AND COALESCE(message_state, '') IN ('relay_accepted', 'accepted', 'accepted_pending')
-                          AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')
+                          AND (transport_disposition = 'reconcile' OR (transport_disposition IS NULL AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')))
                         )
                         AND (?3 != 'delivery-critical' OR severity = 'critical')
                         AND (?3 != 'delivery-other' OR severity != 'critical'))
                      OR (?3 = 'push'
                         AND destination = 'marmot'
                         AND COALESCE(message_state, '') IN ('relay_accepted', 'accepted', 'accepted_pending')
-                        AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')
-                        AND (auth_push_publications IS NULL OR auth_push_publications < 2)
-                        AND (auth_push_reconciles IS NULL OR auth_push_reconciles < 2)
-                        AND (auth_token_waits IS NULL OR auth_token_waits < 2)
+                        AND (transport_disposition = 'reconcile' OR (transport_disposition IS NULL AND COALESCE(push_state, 'unknown') IN ('unknown', 'pending', 'unobservable', 'not_attempted', 'token_unavailable', 'prepared', 'publication_attempted', '')))
                         AND COALESCE(operation_started_at, created_at) >= ?4)
                    )
                  ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, created_at
@@ -764,17 +820,18 @@ impl OperationalStore for D1Store<'_> {
                     accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL, claim_owner = NULL,
                     message_phase = CASE
                       WHEN ?7 IS NULL THEN message_phase
-                      WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
-                        AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_phase
+                      WHEN COALESCE(message_state, message_phase, '') IN ('relay_accepted', 'accepted', 'message_accepted', 'published')
+                        AND ?7 NOT IN ('relay_accepted', 'accepted', 'message_accepted', 'published') THEN message_phase
                       ELSE ?7 END,
                     push_phase = CASE
                       WHEN ?8 IS NULL THEN push_phase
                       WHEN COALESCE(push_state, '') = 'relay_accepted'
                         AND ?8 IN ('not_attempted', 'unknown', 'not_submitted', 'prepared') THEN push_phase
                       ELSE ?8 END,
-                    message_event_id = COALESCE(?9, message_event_id),
+                    message_event_id = COALESCE(message_event_id, ?9),
                     push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11
-                 WHERE id = ?12 AND claim_token = ?13 AND claim_until IS NOT NULL AND claim_until >= ?11",
+                 WHERE id = ?12 AND claim_token = ?13 AND claim_until IS NOT NULL AND claim_until >= ?11
+                   AND (?9 IS NULL OR message_event_id IS NULL OR message_event_id = ?9)",
                 &[
                     text(state.as_str()),
                     number(attempt_count),
@@ -1301,25 +1358,24 @@ impl OperationalStore for D1Store<'_> {
                  accepted_relays = ?5, failed_relays = ?6, claim_until = NULL, claim_token = NULL,
                  message_phase = CASE
                    WHEN ?7 IS NULL THEN message_phase
-                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
-                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_phase
+                   WHEN COALESCE(message_state, message_phase, '') IN ('relay_accepted', 'accepted', 'message_accepted', 'published')
+                     AND ?7 NOT IN ('relay_accepted', 'accepted', 'message_accepted', 'published') THEN message_phase
                    ELSE ?7 END,
                  push_phase = CASE
                    WHEN ?8 IS NULL THEN push_phase
                    WHEN COALESCE(push_state, '') = 'relay_accepted'
                      AND ?8 IN ('not_attempted', 'unknown', 'not_submitted', 'prepared') THEN push_phase
                    ELSE ?8 END,
-                 message_event_id = COALESCE(?9, message_event_id),
+                 message_event_id = COALESCE(message_event_id, ?9),
                  push_envelope_json = COALESCE(?10, push_envelope_json), updated_at = ?11,
                  logical_id = COALESCE(logical_id, ?12),
                  message_state = CASE
                    WHEN ?7 IS NULL THEN message_state
-                   WHEN ?7 IN ('relay_accepted', 'message_accepted', 'accepted', 'published') THEN 'relay_accepted'
+                   WHEN COALESCE(message_state, message_phase, '') IN ('relay_accepted', 'message_accepted', 'accepted', 'published')
+                     OR ?7 IN ('relay_accepted', 'message_accepted', 'accepted', 'published') THEN 'relay_accepted'
                    WHEN ?7 = 'accepted_pending' THEN 'accepted_pending'
                    WHEN ?7 = 'completion_unknown' THEN 'completion_unknown'
                    WHEN ?7 IN ('message_prepared', 'prepared') THEN 'prepared'
-                   WHEN COALESCE(message_state, '') IN ('relay_accepted', 'accepted')
-                     AND ?7 IN ('not_submitted', 'completion_unknown', 'prepared', 'not_published') THEN message_state
                    WHEN ?7 = 'not_submitted' THEN 'not_submitted'
                    WHEN ?7 IN ('rejected', 'failed') THEN 'rejected'
                    ELSE message_state END,
@@ -1344,10 +1400,12 @@ impl OperationalStore for D1Store<'_> {
                  completion_token = ?15,
                  operation_started_at = COALESCE(operation_started_at, json_extract(?25, '$.startedAtMs'), created_at),
                  started_at_ms = COALESCE(started_at_ms, created_at),
-                 push_event_id = COALESCE(json_extract(?25, '$.pushEventId'), push_event_id),
+                 push_event_id = COALESCE(push_event_id, json_extract(?25, '$.pushEventId')),
                  evidence = COALESCE(json_extract(?25, '$.evidence'), evidence),
                  transport_disposition = COALESCE(json_extract(?25, '$.disposition'), transport_disposition),
-                 transport_updated_at = COALESCE(json_extract(?25, '$.updatedAtMs'), transport_updated_at),
+                 transport_updated_at = CASE
+                   WHEN transport_updated_at IS NULL THEN json_extract(?25, '$.updatedAtMs')
+                   ELSE MAX(transport_updated_at, COALESCE(json_extract(?25, '$.updatedAtMs'), 0)) END,
                  message_phase_started_at = CASE
                    WHEN ?7 IS NOT NULL AND COALESCE(message_phase, '') != ?7 THEN ?11
                    ELSE message_phase_started_at END,
@@ -1391,6 +1449,7 @@ impl OperationalStore for D1Store<'_> {
                  push_updated_at = CASE WHEN ?8 IS NOT NULL THEN ?11 ELSE push_updated_at END,
                  terminal_reason = COALESCE(?4, terminal_reason)
              WHERE id = ?13 AND claim_token = ?14 AND claim_until IS NOT NULL AND claim_until >= ?11
+               AND (?9 IS NULL OR message_event_id IS NULL OR message_event_id = ?9)
                AND (?23 = 0 OR EXISTS (
                  SELECT 1 FROM alert_outbox AS fallback_row
                  WHERE fallback_row.destination = 'telegram' AND fallback_row.logical_id = ?24
@@ -1423,11 +1482,10 @@ impl OperationalStore for D1Store<'_> {
                 optional_text(projection),
             ],
         )?;
-        let mut statements = Vec::new();
         if let Some(alert) = fallback {
             let logical =
                 watchdog_core::settings::logical_notification_key(&alert.dedupe_key).to_string();
-            statements.push(self.prepare(
+            let insert = self.prepare(
                 "INSERT INTO alert_outbox (
                     id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
                     state, payload_text, attempt_count, next_attempt_at, created_at, updated_at, logical_id
@@ -1436,10 +1494,10 @@ impl OperationalStore for D1Store<'_> {
                  FROM alert_outbox AS live
                  WHERE live.id = ?12 AND live.claim_token = ?13
                    AND live.claim_until IS NOT NULL AND live.claim_until >= ?10
+                   AND (?14 IS NULL OR live.message_event_id IS NULL OR live.message_event_id = ?14)
                    AND NOT EXISTS (
                      SELECT 1 FROM alert_outbox AS existing
                      WHERE existing.destination = 'telegram' AND existing.logical_id = ?11
-                       AND existing.id != ?1
                    )",
                 &[
                     text(&alert.id),
@@ -1455,20 +1513,17 @@ impl OperationalStore for D1Store<'_> {
                     text(&logical),
                     text(id),
                     text(token),
+                    optional_text(message_event_id),
                 ],
-            )?);
-        }
-        statements.push(update);
-        if let Err(error) = self.db.batch(statements).await {
-            let message = error.to_string();
-            if message.contains("NULL")
-                || message.contains("constraint")
-                || message.contains("Constraint")
-                || message.contains("UNIQUE")
-            {
-                return Ok(false);
+            )?;
+            // Durable fallback first. A later fenced update can safely resume
+            // against the same logical Telegram row after interruption.
+            if let Err(error) = insert.run().await {
+                return finish_statement_error(error);
             }
-            return Err(StoreError::Database(message));
+        }
+        if let Err(error) = update.run().await {
+            return finish_statement_error(error);
         }
         let won = self
             .first(
@@ -1735,7 +1790,6 @@ impl OperationalStore for D1Store<'_> {
                        AND NOT EXISTS (
                          SELECT 1 FROM alert_outbox AS existing
                          WHERE existing.destination = 'telegram' AND existing.logical_id = ?11
-                           AND existing.id != ?1
                        )"
                 ),
                 &[
@@ -1832,7 +1886,9 @@ impl OperationalStore for D1Store<'_> {
              ON CONFLICT(project_id) DO UPDATE SET
                onboard_idempotency_key = excluded.onboard_idempotency_key,
                onboard_requested_at = excluded.onboard_requested_at,
-               engine_status = 'onboard_requested',
+               engine_status = CASE
+                 WHEN marmot_projects.onboard_idempotency_key = excluded.onboard_idempotency_key
+                 THEN marmot_projects.engine_status ELSE 'onboard_requested' END,
                updated_at = excluded.updated_at
              WHERE marmot_projects.onboard_idempotency_key IS NULL
                 OR marmot_projects.onboard_idempotency_key = excluded.onboard_idempotency_key
@@ -2108,6 +2164,72 @@ pub async fn probe_completion_fence(store: &D1Store<'_>, now: i64) -> Result<Val
             && row["state"].as_str() == Some("retrying")
     });
 
+    let interrupted = fence_alert("alt_fence_retry", "fence:retry:marmot", "marmot");
+    let retry_fallback = fence_alert(
+        "alt_fence_retry_tg",
+        "fence:retry:fallback:telegram",
+        "telegram",
+    );
+    OperationalStore::insert_alert(store, &interrupted, now).await?;
+    store
+        .run(
+            "UPDATE alert_outbox SET state = 'retrying', claim_token = 'fence-retry',
+         claim_until = ?1, message_state = 'relay_accepted', message_phase = 'relay_accepted',
+         message_event_id = 'accepted-event' WHERE id = 'alt_fence_retry'",
+            &[number(now + 60_000)],
+        )
+        .await?;
+    store.run(
+        "CREATE TRIGGER fixture_abort_completion BEFORE UPDATE OF completion_token ON alert_outbox
+         WHEN NEW.id = 'alt_fence_retry'
+         BEGIN SELECT RAISE(ABORT, 'fixture completion constraint'); END",
+        &[],
+    ).await?;
+    let complete_retry = || {
+        OperationalStore::finish_with_fallback(
+            store,
+            "alt_fence_retry",
+            "fence-retry",
+            DeliveryState::Retrying,
+            0,
+            now + 15_000,
+            Some("marmot_timeout"),
+            None,
+            None,
+            Some("accepted_pending"),
+            Some("unobservable"),
+            Some("accepted-event"),
+            None,
+            Some("fence:retry"),
+            Some(&retry_fallback),
+            &unknown,
+            None,
+            now,
+        )
+    };
+    let update_interrupted = complete_retry().await;
+    store
+        .run("DROP TRIGGER fixture_abort_completion", &[])
+        .await?;
+    let update_interrupted = !update_interrupted?;
+    let fallback_persisted = store.read_alert(&retry_fallback.id).await?.is_some();
+    let retry_won = complete_retry().await?;
+    let retry_row = store.read_alert("alt_fence_retry").await?;
+    let retry_preserved = retry_row.is_some_and(|row| {
+        row.message_state.as_deref() == Some("relay_accepted")
+            && row.message_event_id.as_deref() == Some("accepted-event")
+            && row.claim_token.is_none()
+    });
+    let retry_fallback_count = store
+        .first(
+            "SELECT COUNT(*) AS n FROM alert_outbox WHERE destination = 'telegram'
+         AND logical_id = 'fence:retry:fallback'",
+            &[],
+        )
+        .await?
+        .map(|row| as_i64(&row["n"]))
+        .unwrap_or(0);
+
     let aged = fence_alert("alt_fence_age", "fence:age:marmot", "marmot");
     let aged_fallback = fence_alert(
         "alt_fence_age_tg",
@@ -2194,6 +2316,11 @@ pub async fn probe_completion_fence(store: &D1Store<'_>, now: i64) -> Result<Val
         "telegramRows": telegram,
         "rolledBack": rolled_back,
         "rollbackPreserved": rollback_preserved,
+        "updateInterrupted": update_interrupted,
+        "fallbackPersisted": fallback_persisted,
+        "retryWon": retry_won,
+        "retryPreserved": retry_preserved,
+        "retryFallbackCount": retry_fallback_count,
         "settled": settled,
         "settledAgain": settled_again,
         "settlementTelegram": settlement_telegram,

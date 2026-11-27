@@ -82,6 +82,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+    def do_POST(self):
+        if self.path != "/telegram":
+            self.send_response(404)
+            self.end_headers()
+            return
+        message = json.loads(self.rfile.read(int(self.headers.get("content-length", "0"))))
+        body = json.dumps({"ok": message.get("chat_id") == "1" and bool(message.get("text"))}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
     def log_message(self, fmt, *args):
         return
 server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
@@ -107,6 +118,7 @@ sed \
   -e "s#migrations_dir = \"migrations\"#migrations_dir = \"${root}/migrations\"#" \
   -e "s#main = \"crates/watchdog-worker/build/worker/shim.mjs\"#main = \"${root}/crates/watchdog-worker/build/worker/shim.mjs\"#" \
   wrangler.runtime-test.toml >"$config"
+printf 'WATCHDOG_TEST_TELEGRAM_ENDPOINT = "http://127.0.0.1:%s/telegram"\n' "$fixture_port" >> "$config"
 db=nostr-watchdog-runtime-test
 echo "fixture http://${fixture_host}:${fixture_port}/healthcheck"
 
@@ -125,9 +137,9 @@ fi
 test -f crates/watchdog-worker/build/worker/shim.mjs
 
 echo "applying D1 migrations"
-npx --yes wrangler@4 d1 migrations apply "$db" --local --persist-to "$persist" --config "$config"
+npx --yes wrangler@4.166.0 d1 migrations apply "$db" --local --persist-to "$persist" --config "$config"
 
-npx --yes wrangler@4 dev --test-scheduled --config "$config" --port "$worker_port" --ip 127.0.0.1 --persist-to "$persist" >"$persist/wrangler.log" 2>&1 &
+npx --yes wrangler@4.166.0 dev --test-scheduled --config "$config" --port "$worker_port" --ip 127.0.0.1 --persist-to "$persist" >"$persist/wrangler.log" 2>&1 &
 worker_pid=$!
 
 i=0
@@ -155,7 +167,7 @@ assert body["scheduler"] == "uninitialized"
 PY
 
 d1() {
-  npx --yes wrangler@4 d1 execute "$db" --local --persist-to "$persist" --config "$config" --json --command "$1"
+  npx --yes wrangler@4.166.0 d1 execute "$db" --local --persist-to "$persist" --config "$config" --json --command "$1"
 }
 
 # The catalog interval is 60s. Rewinding the stored check time makes the next
@@ -170,7 +182,7 @@ import json, subprocess, sys
 persist, config = sys.argv[1], sys.argv[2]
 def query(sql):
     raw = subprocess.check_output([
-        "npx", "--yes", "wrangler@4", "d1", "execute", "nostr-watchdog-runtime-test",
+        "npx", "--yes", "wrangler@4.166.0", "d1", "execute", "nostr-watchdog-runtime-test",
         "--local", "--persist-to", persist, "--config", config,
         "--json", "--command", sql,
     ], text=True)
@@ -224,7 +236,7 @@ import json, subprocess, sys
 persist, config = sys.argv[1], sys.argv[2]
 def query(sql):
     raw = subprocess.check_output([
-        "npx", "--yes", "wrangler@4", "d1", "execute", "nostr-watchdog-runtime-test",
+        "npx", "--yes", "wrangler@4.166.0", "d1", "execute", "nostr-watchdog-runtime-test",
         "--local", "--persist-to", persist, "--config", config,
         "--json", "--command", sql,
     ], text=True)
@@ -268,7 +280,7 @@ import json, subprocess, sys
 persist, config = sys.argv[1], sys.argv[2]
 def query(sql):
     raw = subprocess.check_output([
-        "npx", "--yes", "wrangler@4", "d1", "execute", "nostr-watchdog-runtime-test",
+        "npx", "--yes", "wrangler@4.166.0", "d1", "execute", "nostr-watchdog-runtime-test",
         "--local", "--persist-to", persist, "--config", config,
         "--json", "--command", sql,
     ], text=True)
@@ -360,6 +372,11 @@ assert body["loser"] is False, body
 assert body["telegramRows"] == 1, body
 assert body["rolledBack"] is True, body
 assert body["rollbackPreserved"] is True, body
+assert body["updateInterrupted"] is True, body
+assert body["fallbackPersisted"] is True, body
+assert body["retryWon"] is True, body
+assert body["retryPreserved"] is True, body
+assert body["retryFallbackCount"] == 1, body
 assert body["generationFirst"] is True, body
 assert body["generationSecond"] is False, body
 assert body["settled"] is True, body

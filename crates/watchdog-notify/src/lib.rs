@@ -15,8 +15,8 @@ pub use inbox::{
     select_inbox, sign_inbox, validate_inbox_relays, verify_inbox_event, VerifiedInbox,
 };
 pub use nip17::{
-    build_gift_wrap, event_json, open_gift_wrap, parse_event, public_key_hex, recipient_pubkey,
-    Nip17Error,
+    build_gift_wrap, event_json, normalize_sender_secret, open_gift_wrap, parse_event,
+    public_key_hex, recipient_pubkey, Nip17Error,
 };
 pub use nip17_flow::{
     auth_event_id, auth_frame, definitive_negative, discovery_relays, fold_discovery,

@@ -146,6 +146,14 @@ server.on("request", async (request, response) => {
     }
     return;
   }
+  if (request.method === "POST" && request.url === "/telegram") {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    const message = JSON.parse(body);
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ ok: message.chat_id === "1" && Boolean(message.text) }));
+    return;
+  }
   if (request.url === "/healthcheck") {
     response.statusCode = ++probeCount <= 2 ? 503 : 200;
     response.setHeader("content-type", "application/json");

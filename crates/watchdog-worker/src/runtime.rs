@@ -1,12 +1,15 @@
 //! Worker fetch, scheduled monitoring, and notification I/O.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Duration;
 
 use futures_util::{future::Either, StreamExt};
 use serde_json::Value;
 use watchdog_core::clock::SystemClock;
-use watchdog_core::settings::{config_alias, load_settings, CONFIG_KEYS};
+use watchdog_core::settings::{
+    config_alias, load_settings, marmot_enabled_for, Settings, CONFIG_KEYS,
+};
 use watchdog_engine::{
     deliver_nip17, dispatch_transport, handle, run_check_cycle, run_update_cycle, ApiRequest,
     ApiResponse, DeliveryOutcome, HttpClient, InboxFrames, Notifier, ProbeRequest, ProbeResponse,
@@ -58,7 +61,8 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
     let notifier = WorkerNotifier {
         db: env.d1("DB")?,
         vars: vars.clone(),
-        timeout_ms: settings.timeout_ms.clamp(1_000, 15_000) as u64,
+        timeout_ms: settings.timeout_ms as u64,
+        deadline_ms: Cell::new(i64::MAX),
         marmot,
     };
     let get = |key: &str| vars.get(key).cloned().unwrap_or_default();
@@ -73,7 +77,7 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
         return runtime_fence(&store, now_ms()).await;
     }
     if req.method() == Method::Get && path == "/readyz" {
-        let response = handle(
+        let mut response = handle(
             &store,
             &settings,
             &get,
@@ -86,13 +90,45 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
             &SystemClock,
         )
         .await;
+        let observations = futures_util::future::join_all(
+            watchdog_core::catalog::PROJECTS
+                .iter()
+                .filter(|project| marmot_enabled_for(&settings, &get, project.id))
+                .map(|project| notifier.marmot_evidence(project.id)),
+        )
+        .await;
+        if !observations.is_empty() {
+            let conversations_ready = observations
+                .iter()
+                .all(|view| view["conversationReady"] == true);
+            let connected = observations
+                .iter()
+                .all(|view| view["binding"] == "authenticated");
+            let tokens_ready = observations
+                .iter()
+                .all(|view| view["recipientTokenReady"] == true);
+            response.body["transports"]["marmot"] = serde_json::json!(if conversations_ready {
+                "ready"
+            } else if connected {
+                "waiting"
+            } else {
+                "unavailable"
+            });
+            response.body["pushTokens"] =
+                serde_json::json!(if tokens_ready { "ready" } else { "missing" });
+            if !conversations_ready {
+                response.status = 503;
+                response.body["ready"] = serde_json::json!(false);
+            }
+            response.body_bytes = encode_body(&response.body)?;
+        }
         return exact_json(response);
     }
     let request = match api_request(&mut req, &get("OPERATOR_TOKEN")).await {
         Some(request) => request,
         None => return Response::error("not_found", 404),
     };
-    let response = handle(
+    let mut response = handle(
         &store,
         &settings,
         &get,
@@ -102,15 +138,29 @@ pub async fn fetch(mut req: Request, env: Env) -> Result<Response> {
         &SystemClock,
     )
     .await;
-    if let ApiRequest::Onboard { body, .. } = request {
-        if response.status == 202 {
-            return exact_json(cloudflare_onboard(&notifier, &body, response).await);
+    match request {
+        ApiRequest::Onboard { body, .. } if response.status == 202 => {
+            response = cloudflare_onboard(&store, &notifier, &body, response).await;
+            response.body_bytes = encode_body(&response.body)?;
         }
+        ApiRequest::MarmotDiagnostic { project, .. } if response.status == 200 => {
+            response.body["authority"] = notifier.marmot_evidence(&project).await;
+            if response.body["authority"]["binding"] == "authenticated" {
+                response
+                    .body
+                    .as_object_mut()
+                    .expect("diagnostics object")
+                    .remove("dependency");
+            }
+            response.body_bytes = encode_body(&response.body)?;
+        }
+        _ => {}
     }
     exact_json(response)
 }
 
 async fn cloudflare_onboard(
+    store: &D1Store<'_>,
     notifier: &WorkerNotifier,
     body: &[u8],
     mut response: ApiResponse,
@@ -121,6 +171,7 @@ async fn cloudflare_onboard(
     let project = value.get("projectId").and_then(Value::as_str).unwrap_or("");
     let operation = value
         .get("operationId")
+        .or_else(|| value.get("idempotencyKey"))
         .and_then(Value::as_str)
         .unwrap_or("");
     let replace = value
@@ -140,34 +191,10 @@ async fn cloudflare_onboard(
     let Some(url) = watchdog_core::delivery::marmot_sender_url(project) else {
         return onboard_note(response, "invalid_project", false);
     };
-    let recipient = watchdog_core::catalog::project_recipient(
-        notifier
-            .vars
-            .get("PROJECT_RECIPIENTS")
-            .map(String::as_str)
-            .unwrap_or(""),
-        notifier
-            .vars
-            .get("ADMIN_NPUB")
-            .map(String::as_str)
-            .unwrap_or(""),
-        project,
-    );
-    let Some(recipient) = recipient.filter(|value| value.len() == 64) else {
-        return onboard_note(response, "recipient_unconfigured", false);
+    let (secret, expected_account, recipient) = match notifier.marmot_identity(project) {
+        Ok(identity) => identity,
+        Err(error) => return onboard_note(response, error, false),
     };
-    let secret = watchdog_core::catalog::project_by_id(project)
-        .map(|item| {
-            notifier
-                .vars
-                .get(item.sender_secret)
-                .map(String::as_str)
-                .unwrap_or("")
-        })
-        .unwrap_or("");
-    if secret.starts_with("nsec1") {
-        return onboard_note(response, "sender_secret_must_be_hex", false);
-    }
     let relays: Vec<&str> = notifier
         .vars
         .get("BOOTSTRAP_RELAYS")
@@ -179,17 +206,15 @@ async fn cloudflare_onboard(
                 .collect()
         })
         .unwrap_or_default();
-    let mut command = serde_json::json!({
+    let command = serde_json::json!({
         "op": "onboard",
         "operationId": operation,
         "projectId": project,
         "recipient": recipient,
         "replace": replace,
-        "relays": relays
+        "relays": relays,
+        "senderSecretHex": secret
     });
-    if secret.len() == 64 && secret.chars().all(|item| item.is_ascii_hexdigit()) {
-        command["senderSecretHex"] = serde_json::json!(secret);
-    }
     match post_marmot(
         namespace,
         token,
@@ -200,16 +225,20 @@ async fn cloudflare_onboard(
     .await
     {
         MarmotCall::Response(status, transport) if (200..300).contains(&status) => {
-            let returned = transport
-                .get("operationId")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let returned_project = transport
-                .get("projectId")
-                .and_then(Value::as_str)
-                .unwrap_or(project);
-            if !returned.is_empty() && (returned != operation || returned_project != project) {
+            if transport["ok"] != true
+                || transport["operationId"].as_str() != Some(operation)
+                || transport["projectId"].as_str() != Some(project)
+                || transport["pubkey"].as_str() != Some(expected_account.as_str())
+            {
                 return onboard_note(response, "operation_identity_mismatch", false);
+            }
+            match store
+                .complete_onboarding(project, operation, &expected_account, &recipient, now_ms())
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return onboard_note(response, "onboarding_superseded", false),
+                Err(_) => return onboard_note(response, "onboarding_persistence_failed", false),
             }
             if let Some(object) = response.body.as_object_mut() {
                 object.insert("status".to_string(), serde_json::json!("accepted"));
@@ -228,12 +257,14 @@ async fn cloudflare_onboard(
                         .cloned()
                         .unwrap_or(serde_json::json!(false)),
                 );
-                if let Some(pubkey) = transport.get("pubkey").and_then(Value::as_str) {
-                    object.insert(
-                        "accountPrefix".to_string(),
-                        serde_json::json!(&pubkey[..pubkey.len().min(8)]),
-                    );
-                }
+                object.insert(
+                    "accountPrefix".to_string(),
+                    serde_json::json!(&expected_account[..8]),
+                );
+                object.insert(
+                    "engineStatus".to_string(),
+                    serde_json::json!("account_initialized"),
+                );
                 if let Some(onboarding) =
                     transport.get("onboarding").filter(|item| item.is_object())
                 {
@@ -283,7 +314,8 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
     let notifier = WorkerNotifier {
         db: env.d1("DB")?,
         vars: vars.clone(),
-        timeout_ms: settings.timeout_ms.clamp(1_000, 15_000) as u64,
+        timeout_ms: settings.timeout_ms as u64,
+        deadline_ms: Cell::new(i64::MAX),
         marmot: env.durable_object("MARMOT_SENDER").ok(),
     };
     let http = WorkerHttp;
@@ -311,13 +343,29 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
         }
         return Ok(());
     }
+    futures_util::join!(
+        run_operational_cycle(&store, &notifier, &settings, &get, started),
+        drive_marmot_lifecycle(&store, &notifier, &settings, &get, started),
+    );
+    Ok(())
+}
+
+async fn run_operational_cycle(
+    store: &D1Store<'_>,
+    notifier: &WorkerNotifier,
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    started: i64,
+) {
+    let http = WorkerHttp;
     let health_deadline = started + 12_000;
+    notifier.deadline_ms.set(health_deadline);
     if let Err(error) = run_check_cycle(
-        &store,
-        &settings,
-        &get,
+        store,
+        settings,
+        get,
         &http,
-        &notifier,
+        notifier,
         started,
         &SystemClock,
         health_deadline,
@@ -327,6 +375,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
         console_log!("monitoring cycle failed: {error}");
     }
     let message_deadline = started + 17_000;
+    notifier.deadline_ms.set(message_deadline);
     for (destination, critical, other) in [
         ("telegram", 2_usize, 1_usize),
         ("nostr", 2, 1),
@@ -336,10 +385,10 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
             break;
         }
         if let Err(error) = dispatch_transport(
-            &store,
-            &settings,
-            &get,
-            &notifier,
+            store,
+            settings,
+            get,
+            notifier,
             &SystemClock,
             destination,
             critical,
@@ -354,12 +403,30 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
         }
     }
     let push_deadline = started + 20_000;
+    notifier.deadline_ms.set(push_deadline);
+    if let Err(error) = dispatch_transport(
+        store,
+        settings,
+        get,
+        notifier,
+        &SystemClock,
+        "telegram",
+        1,
+        0,
+        push_deadline,
+        "delivery",
+        "worker",
+    )
+    .await
+    {
+        console_log!("critical fallback dispatch failed: {error}");
+    }
     if push_deadline.saturating_sub(now_ms()) >= 1_500 {
         if let Err(error) = dispatch_transport(
-            &store,
-            &settings,
-            &get,
-            &notifier,
+            store,
+            settings,
+            get,
+            notifier,
             &SystemClock,
             "marmot",
             1,
@@ -373,70 +440,92 @@ pub async fn scheduled(event: ScheduledEvent, env: Env) -> Result<()> {
             console_log!("push reconciliation failed: {error}");
         }
     }
-    if push_deadline.saturating_sub(now_ms()) >= 1_500 {
-        drive_marmot_lifecycle(&notifier, now_ms()).await;
-    }
-    Ok(())
 }
 
-async fn drive_marmot_lifecycle(notifier: &WorkerNotifier, now: i64) {
-    let Some(namespace) = &notifier.marmot else {
+async fn drive_marmot_lifecycle(
+    store: &D1Store<'_>,
+    notifier: &WorkerNotifier,
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    started: i64,
+) {
+    let (Some(namespace), Some(token)) = (&notifier.marmot, notifier.marmot_token()) else {
         return;
     };
-    if notifier.vars.get("ENABLE_MARMOT").map(String::as_str) != Some("true") {
-        return;
-    }
-    let Some(token) = notifier
-        .vars
-        .get("MARMOT_OPERATOR_TOKEN")
-        .filter(|token| !token.is_empty())
-    else {
-        return;
-    };
-    let relays: Vec<String> = notifier
-        .vars
-        .get("BOOTSTRAP_RELAYS")
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let maintain = (now / 3_600_000) % 6 == 0 && (now / 60_000) % 60 == 0;
-    for project in watchdog_core::catalog::PROJECTS {
-        let Some(url) = watchdog_core::delivery::marmot_sender_url(project.id) else {
-            continue;
-        };
-        let _ = post_marmot(
-            namespace,
-            token,
-            &url,
-            serde_json::json!({"op": "establish", "relays": relays}).to_string(),
-            notifier.timeout_ms,
-        )
-        .await;
-        let _ = post_marmot(
-            namespace,
-            token,
-            &url,
-            serde_json::json!({"op": "sync"}).to_string(),
-            notifier.timeout_ms,
-        )
-        .await;
-        if maintain {
-            let _ = post_marmot(
-                namespace,
-                token,
-                &url,
-                serde_json::json!({"op": "maintain"}).to_string(),
-                notifier.timeout_ms,
-            )
-            .await;
-        }
-    }
+    let deadline = started + 18_000;
+    futures_util::future::join_all(watchdog_core::catalog::PROJECTS.iter().map(
+        |project| async move {
+            if !marmot_enabled_for(settings, get, project.id) {
+                return;
+            }
+            let Ok((_, sender, recipient)) = notifier.marmot_identity(project.id) else {
+                return;
+            };
+            let Ok(Some(row)) = store.marmot_project(project.id).await else {
+                return;
+            };
+            if row.pubkey.as_deref() != Some(sender.as_str())
+                || row.peer_pubkey.as_deref() != Some(recipient.as_str())
+            {
+                return;
+            }
+            let Some(url) = watchdog_core::delivery::marmot_sender_url(project.id) else {
+                return;
+            };
+            let owner = uuid::Uuid::new_v4().to_string();
+            let now = now_ms();
+            if !store
+                .acquire_lease(
+                    &format!("marmot-sync:{}", project.id),
+                    &owner,
+                    now + settings.sync_interval_seconds * 1_000,
+                    now,
+                )
+                .await
+                .unwrap_or(false)
+            {
+                return;
+            }
+
+            let call = |op, publish| {
+                post_marmot(namespace, token, &url, serde_json::json!({
+            "op": op, "projectId": project.id, "senderPubkey": sender, "recipient": recipient,
+            "publish": publish,
+        }).to_string(), remaining_timeout(deadline, notifier.timeout_ms))
+            };
+            let _ = call("establish", false).await;
+            let synced = call("sync", false).await;
+            if let MarmotCall::Response(200, value) = synced {
+                if value["ok"] == true && value["projectId"].as_str() == Some(project.id) {
+                    let _ = store
+                        .record_marmot_sync(project.id, &sender, &recipient, now_ms())
+                        .await;
+                }
+            }
+            let now = now_ms();
+            if remaining_timeout(deadline, notifier.timeout_ms) >= 1_500
+                && store
+                    .acquire_lease(
+                        &format!("marmot-maintain:{}", project.id),
+                        &owner,
+                        now + 6 * 3_600_000,
+                        now,
+                    )
+                    .await
+                    .unwrap_or(false)
+            {
+                let _ = call("maintain", true).await;
+            }
+        },
+    ))
+    .await;
+}
+
+fn remaining_timeout(deadline_ms: i64, configured_ms: u64) -> u64 {
+    deadline_ms
+        .saturating_sub(now_ms())
+        .max(0)
+        .min(configured_ms as i64) as u64
 }
 
 struct WorkerHttp;
@@ -459,13 +548,88 @@ struct WorkerNotifier {
     db: D1Database,
     vars: HashMap<String, String>,
     timeout_ms: u64,
+    deadline_ms: Cell<i64>,
     marmot: Option<ObjectNamespace>,
+}
+
+impl WorkerNotifier {
+    async fn marmot_evidence(&self, project: &str) -> Value {
+        let Some(namespace) = &self.marmot else {
+            return serde_json::json!({"binding": "missing"});
+        };
+        let Some(token) = self.marmot_token() else {
+            return serde_json::json!({"binding": "credentials_missing"});
+        };
+        let Ok((_, sender, recipient)) = self.marmot_identity(project) else {
+            return serde_json::json!({"binding": "identity_invalid"});
+        };
+        let Some(url) = watchdog_core::delivery::marmot_sender_url(project) else {
+            return serde_json::json!({"binding": "invalid_project"});
+        };
+        let command = serde_json::json!({"op": "readiness", "projectId": project});
+        let reply = post_marmot(namespace, token, &url, command.to_string(), 2_000).await;
+        let MarmotCall::Response(200, value) = reply else {
+            return serde_json::json!({"binding": if matches!(reply, MarmotCall::Response(401, _)) {
+                "unauthorized"
+            } else { "unavailable" }});
+        };
+        if value["ok"] != true
+            || value["projectId"].as_str() != Some(project)
+            || value["pubkey"].as_str() != Some(sender.as_str())
+            || value["recipient"].as_str() != Some(recipient.as_str())
+        {
+            return serde_json::json!({"binding": "identity_mismatch"});
+        }
+        serde_json::json!({
+            "binding": "authenticated",
+            "accountInitialized": true,
+            "groupPersisted": value["groupBound"] == true,
+            "welcomeAccepted": value["onboarding"]["welcomeAccepted"] == true,
+            "recipientParticipationObserved": value["onboarding"]["recipientParticipationObserved"] == true,
+            "conversationReady": value["onboarding"]["conversationReady"] == true && value["canonicalMembership"] == true,
+            "canonicalMembership": value["canonicalMembership"] == true,
+            "keyPackageReady": value["keyPackagePublished"] == true,
+            "recipientTokenReady": value["recipientTokenCount"].as_u64().is_some_and(|count| count > 0),
+            "storageIntegrity": value["storageIntegrity"] == "checked",
+        })
+    }
+
+    fn request_timeout_ms(&self) -> u64 {
+        remaining_timeout(self.deadline_ms.get(), self.timeout_ms)
+    }
+
+    fn marmot_token(&self) -> Option<&str> {
+        self.vars
+            .get("MARMOT_OPERATOR_TOKEN")
+            .map(String::as_str)
+            .filter(|token| !token.is_empty())
+    }
+
+    fn marmot_identity(
+        &self,
+        project: &str,
+    ) -> std::result::Result<(String, String, String), &'static str> {
+        let config = watchdog_core::catalog::project_by_id(project).ok_or("invalid_project")?;
+        let get = |key| self.vars.get(key).map(String::as_str).unwrap_or_default();
+        let recipient = watchdog_core::catalog::project_recipient(
+            get("PROJECT_RECIPIENTS"),
+            get("ADMIN_NPUB"),
+            project,
+        )
+        .ok_or("recipient_unconfigured")?;
+        let recipient =
+            watchdog_notify::recipient_pubkey(&recipient).map_err(|_| "recipient_invalid")?;
+        let secret = watchdog_notify::normalize_sender_secret(get(config.sender_secret))
+            .map_err(|_| "sender_identity_invalid")?;
+        let sender =
+            watchdog_notify::public_key_hex(&secret).map_err(|_| "sender_identity_invalid")?;
+        Ok((secret, sender, recipient))
+    }
 }
 
 impl Notifier for WorkerNotifier {
     async fn deliver_nostr(&self, row: &OutboxRow, claim: &str) -> DeliveryOutcome {
         let get = |key: &str| self.vars.get(key).cloned().unwrap_or_default();
-        let settings = load_settings(&get);
         let store = D1Store::new(&self.db);
         deliver_nip17(
             &store,
@@ -473,7 +637,7 @@ impl Notifier for WorkerNotifier {
             &get,
             row,
             claim,
-            settings.timeout_ms,
+            self.request_timeout_ms() as i64,
             &SystemClock,
         )
         .await
@@ -497,7 +661,13 @@ impl Notifier for WorkerNotifier {
         if token.is_empty() {
             return terminal("telegram_unavailable");
         }
-        let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+        let get = |key| self.vars.get(key).map(String::as_str).unwrap_or_default();
+        let url = watchdog_core::settings::telegram_fixture_url(
+            get("ENVIRONMENT"),
+            get("WATCHDOG_TEST_TELEGRAM_ENDPOINT"),
+        )
+        .map(|url| url.to_string())
+        .unwrap_or_else(|| format!("https://api.telegram.org/bot{token}/sendMessage"));
         let body = serde_json::json!({
             "chat_id": chat,
             "text": row.payload_text,
@@ -511,7 +681,7 @@ impl Notifier for WorkerNotifier {
             &url,
             &headers,
             Some(body),
-            Duration::from_millis(self.timeout_ms),
+            Duration::from_millis(self.request_timeout_ms()),
             65_536,
         )
         .await;
@@ -564,29 +734,50 @@ impl Notifier for WorkerNotifier {
         let Some(url) = watchdog_core::delivery::marmot_sender_url(&row.project_id) else {
             return marmot_unavailable("invalid_project");
         };
-        match post_marmot(
-            namespace,
-            token,
-            &url,
-            marmot_delivery_body(row, admitted),
-            self.timeout_ms,
-        )
-        .await
+        let (_, sender, recipient) = match self.marmot_identity(&row.project_id) {
+            Ok(identity) => identity,
+            Err(error) => return marmot_unavailable(error),
+        };
+        let deadline = now_ms() + self.request_timeout_ms() as i64;
+        let call = |reconcile| {
+            post_marmot(
+                namespace,
+                token,
+                &url,
+                marmot_delivery_body(row, reconcile, &sender, &recipient),
+                remaining_timeout(deadline, self.timeout_ms),
+            )
+        };
+        let mut result = call(admitted).await;
+        if admitted
+            && row.message_event_id.is_none()
+            && row.message_state.as_deref() == Some("completion_unknown")
+            && matches!(&result, MarmotCall::Response(200, value)
+                if value["ok"] == true && value["admission"] == "absent"
+                && value["projectId"].as_str() == Some(row.project_id.as_str())
+                && value["operationId"].as_str() == Some(row.id.as_str()))
+            && remaining_timeout(deadline, self.timeout_ms) > 0
         {
+            result = call(false).await;
+        }
+        match result {
             MarmotCall::Response(status, value) => {
-                cloudflare_outcome(status, &value, &row.project_id, &row.id, admitted)
+                cloudflare_outcome(status, &value, &row.project_id, &row.id)
             }
-            MarmotCall::Timeout => marmot_hold("marmot_timeout", admitted),
-            MarmotCall::Transport => marmot_hold("marmot_transport_error", admitted),
-            MarmotCall::Malformed => marmot_hold("marmot_response_invalid", admitted),
+            MarmotCall::Timeout => marmot_hold("marmot_timeout"),
+            MarmotCall::Transport => marmot_hold("marmot_transport_error"),
+            MarmotCall::Malformed => marmot_hold("marmot_response_invalid"),
         }
     }
 }
 
-fn marmot_delivery_body(row: &OutboxRow, admitted: bool) -> String {
+fn marmot_delivery_body(row: &OutboxRow, admitted: bool, sender: &str, recipient: &str) -> String {
     let mut body = serde_json::json!({
         "op": watchdog_core::delivery::marmot_transport_op(admitted),
         "operationId": row.id,
+        "projectId": row.project_id,
+        "senderPubkey": sender,
+        "recipient": recipient,
         "publish": true
     });
     if !admitted {
@@ -637,26 +828,41 @@ async fn post_marmot(
     let Ok(request) = Request::new_with_init(url, &init) else {
         return MarmotCall::Transport;
     };
-    let fetch = stub.fetch_with_request(request);
-    futures_util::pin_mut!(fetch);
-    let mut response =
-        match futures_util::future::select(fetch, Delay::from(Duration::from_millis(timeout_ms)))
-            .await
-        {
-            Either::Left((Ok(response), _)) => response,
-            Either::Left((Err(_), _)) => return MarmotCall::Transport,
-            Either::Right((_, _)) => return MarmotCall::Timeout,
-        };
-    let status = response.status_code();
-    let Ok(text) = response.text().await else {
-        return MarmotCall::Malformed;
-    };
-    if text.len() > 65_536 {
-        return MarmotCall::Malformed;
+    if timeout_ms == 0 {
+        return MarmotCall::Timeout;
     }
-    match serde_json::from_str::<Value>(&text) {
-        Ok(value) => MarmotCall::Response(status, value),
-        Err(_) => MarmotCall::Malformed,
+    let call = async {
+        let mut response = match stub.fetch_with_request(request).await {
+            Ok(response) => response,
+            Err(_) => return MarmotCall::Transport,
+        };
+        let status = response.status_code();
+        // Error bodies may contain private diagnostic details. Only keep status.
+        if !(200..300).contains(&status) {
+            return MarmotCall::Response(status, Value::Null);
+        }
+        let Ok(mut stream) = response.stream() else {
+            return MarmotCall::Malformed;
+        };
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else {
+                return MarmotCall::Malformed;
+            };
+            if bytes.len().saturating_add(chunk.len()) > 65_536 {
+                return MarmotCall::Malformed;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => MarmotCall::Response(status, value),
+            Err(_) => MarmotCall::Malformed,
+        }
+    };
+    futures_util::pin_mut!(call);
+    match futures_util::future::select(call, Delay::from(Duration::from_millis(timeout_ms))).await {
+        Either::Left((result, _)) => result,
+        Either::Right((_, _)) => MarmotCall::Timeout,
     }
 }
 
@@ -676,7 +882,7 @@ fn marmot_unavailable(error: &str) -> DeliveryOutcome {
     }
 }
 
-fn marmot_hold(error: &str, admitted: bool) -> DeliveryOutcome {
+fn marmot_hold(error: &str) -> DeliveryOutcome {
     DeliveryOutcome {
         accepted: false,
         terminal: false,
@@ -684,16 +890,8 @@ fn marmot_hold(error: &str, admitted: bool) -> DeliveryOutcome {
         error: Some(error.to_string()),
         accepted_relays: Vec::new(),
         failed_relays: Vec::new(),
-        message_phase: if admitted {
-            None
-        } else {
-            Some("not_submitted".to_string())
-        },
-        push_phase: if admitted {
-            None
-        } else {
-            Some("not_attempted".to_string())
-        },
+        message_phase: Some("completion_unknown".to_owned()),
+        push_phase: None,
         message_event_id: None,
         push_envelope: None,
         operation: None,
@@ -705,20 +903,12 @@ fn cloudflare_outcome(
     value: &Value,
     project: &str,
     operation_id: &str,
-    admitted: bool,
 ) -> DeliveryOutcome {
     if status == 401 || value.get("error").and_then(Value::as_str) == Some("unauthorized") {
         return marmot_unavailable("marmot_unauthorized");
     }
-    if status == 400 {
-        let error = value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("invalid_project");
-        return marmot_unavailable(error);
-    }
     if !(200..300).contains(&status) {
-        return marmot_hold("marmot_transport_error", admitted);
+        return marmot_hold("marmot_transport_error");
     }
     if value.get("ok") == Some(&serde_json::Value::Bool(false)) {
         let error = value
@@ -726,16 +916,16 @@ fn cloudflare_outcome(
             .and_then(Value::as_str)
             .unwrap_or("marmot_rejected");
         if error.contains("retired operation") {
-            return marmot_hold("retired_operation_unrecorded", admitted);
+            return marmot_hold("retired_operation_unrecorded");
         }
-        return marmot_hold(error, admitted);
+        return marmot_hold(error);
     }
     let operation = watchdog_core::delivery::operation_from_transport(
         value,
         watchdog_core::delivery::TransportOrigin::CloudflareObject,
     );
     if !watchdog_core::delivery::transport_identity_matches(&operation, project, operation_id) {
-        return marmot_hold("operation_identity_mismatch", admitted);
+        return marmot_hold("operation_identity_mismatch");
     }
     let accepted = operation.message == Some(watchdog_core::delivery::MessageState::RelayAccepted);
     let settled = operation.disposition == watchdog_core::delivery::OperationDisposition::Settled;
@@ -1105,6 +1295,10 @@ async fn bounded_http(
         body,
         too_large: false,
     })
+}
+
+fn encode_body(body: &Value) -> Result<Vec<u8>> {
+    serde_json::to_vec(body).map_err(|error| worker::Error::RustError(error.to_string()))
 }
 
 fn exact_json(response: ApiResponse) -> Result<Response> {

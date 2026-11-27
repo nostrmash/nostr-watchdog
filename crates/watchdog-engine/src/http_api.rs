@@ -505,16 +505,9 @@ async fn ready<S: OperationalStore>(
             .map(|finished| now.saturating_sub(finished))
     });
     let (pending, recent) = store.count_delivery_pressure(now).await.unwrap_or((0, 0));
-    let marmot_requested = settings.marmot_enabled
-        || ["smartflowsocial", "nostrmash"].iter().any(|project| {
-            watchdog_core::settings::route_for(
-                settings,
-                get,
-                project,
-                watchdog_core::domain::Severity::Critical,
-            )
-            .marmot
-        });
+    let marmot_requested = watchdog_core::catalog::PROJECTS
+        .iter()
+        .any(|project| watchdog_core::settings::marmot_enabled_for(settings, get, project.id));
     let identity_ready = ["smartflowsocial", "nostrmash"].iter().any(|project| {
         let Some(definition) = watchdog_core::catalog::project_by_id(project) else {
             return false;
@@ -542,7 +535,7 @@ async fn ready<S: OperationalStore>(
         configuration_ok: settings.enabled || !get("OPERATOR_TOKEN").is_empty(),
         monitors_enabled: settings.enabled,
         scheduler_age_ms: age,
-        scheduler_stale_after_ms: 180_000,
+        scheduler_stale_after_ms: settings.scheduler_stale_seconds * 1_000,
         nip17_enabled: settings.nip17_enabled,
         nip17_ready: !settings.bootstrap.is_empty()
             && !settings.emergency_disable_nip17
@@ -555,7 +548,7 @@ async fn ready<S: OperationalStore>(
         telegram_ready: !settings.emergency_disable_telegram,
         marmot_enabled: marmot_requested,
         marmot_state,
-        push_tokens: if settings.marmot_enabled {
+        push_tokens: if marmot_requested {
             "unknown"
         } else {
             "disabled"

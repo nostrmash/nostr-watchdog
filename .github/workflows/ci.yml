@@ -31,15 +31,15 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --exclude watchdog-worker --all-targets -- -W clippy::all
+        run: cargo clippy --locked --workspace --exclude watchdog-worker --all-targets -- -W clippy::all
 
       - name: Test
         run: |
-          cargo test --workspace --exclude watchdog-worker
-          cargo test -p watchdog-store --features sqlite --lib
+          cargo test --locked --workspace --exclude watchdog-worker
+          cargo test --locked -p watchdog-store --features sqlite --lib
 
       - name: Release binary
-        run: cargo build --release -p watchdog-native
+        run: cargo build --locked --release -p watchdog-native
 
       - name: Install cargo-deny and cargo-audit
         run: |
@@ -67,14 +67,14 @@ jobs:
           components: llvm-tools
 
       - name: Check the staging Worker
-        run: cargo check -p watchdog-worker --target wasm32-unknown-unknown
+        run: cargo check --locked -p watchdog-worker --target wasm32-unknown-unknown
 
       - name: Check the pinned cgka-engine for wasm
-        run: cargo check --manifest-path probes/mdk-engine/Cargo.toml --target wasm32-unknown-unknown
+        run: cargo check --locked --manifest-path probes/mdk-engine/Cargo.toml --target wasm32-unknown-unknown
 
   image:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -84,7 +84,8 @@ jobs:
 
       - name: Boot, health, persistent state, and helper startup
         run: |
-          docker run -d --name watchdog -p 8787:8787 nostr-watchdog:ci
+          docker volume create watchdog-data
+          docker run -d --name watchdog -v watchdog-data:/data -p 127.0.0.1:8787:8787 nostr-watchdog:ci
           for _ in 1 2 3 4 5 6 7 8 9 10; do
             if curl -fsS http://127.0.0.1:8787/healthz; then
               break
@@ -95,6 +96,9 @@ jobs:
           docker exec watchdog test -x /usr/local/bin/nostr-watchdog
           docker exec watchdog test -x /usr/local/bin/watchdog-marmot
           docker exec watchdog test -d /data/marmot
+          docker exec watchdog sh -c 'test "$(id -u)" = 10001 && test "$(stat -c %a /data/marmot)" = 700'
+          docker exec watchdog sh -c 'ldd /usr/local/bin/nostr-watchdog && ldd /usr/local/bin/watchdog-marmot' | tee /tmp/watchdog-ldd
+          if grep -F 'not found' /tmp/watchdog-ldd; then exit 1; fi
           docker exec -d watchdog sh -c '/usr/local/bin/watchdog-marmot --root /data/marmot --socket /data/marmot/helper.sock --allow-loopback --relay ws://127.0.0.1/ >/data/marmot/helper.log 2>&1'
           sleep 2
           if ! docker exec watchdog test -S /data/marmot/helper.sock; then
@@ -103,7 +107,8 @@ jobs:
           fi
           docker exec watchdog sh -c 'echo persisted >/data/marmot/persistence-marker'
           docker exec watchdog test -s /data/watchdog.sqlite
-          docker restart watchdog
+          docker rm -f watchdog
+          docker run -d --name watchdog -v watchdog-data:/data -p 127.0.0.1:8787:8787 nostr-watchdog:ci
           ready=0
           for _ in 1 2 3 4 5 6 7 8 9 10; do
             if curl -fsS http://127.0.0.1:8787/healthz | grep -F '"status":"ok"'; then
@@ -115,8 +120,17 @@ jobs:
           test "$ready" = "1"
           docker exec watchdog test -s /data/watchdog.sqlite
           docker exec watchdog test -s /data/marmot/persistence-marker
-          # A surviving directory is not Marmot conversation recovery. That check
-          # waits until the native helper is wired to this operational store.
+          # This smoke test covers the packaged executables and volume only.
+          # The native conversation test runs separately with the official recipient.
+
+      - name: Verify actual image conversation across container replacement
+        run: |
+          docker build --target image-test-driver -t nostr-watchdog-test-driver:ci .
+          driver=$(docker create nostr-watchdog-test-driver:ci)
+          trap 'docker rm "$driver"' EXIT
+          docker cp "$driver:/out/fixture_exchange" /tmp/watchdog-image-fixture
+          WATCHDOG_TEST_IMAGE=nostr-watchdog:ci WATCHDOG_TEST_REPO_ROOT="$PWD" \
+            /tmp/watchdog-image-fixture packaged_binaries_deliver_monitor_incident_reconcile_and_send_recovery --exact --nocapture
 
   workerd:
     runs-on: ubuntu-latest
@@ -138,7 +152,7 @@ jobs:
           node-version: "22"
 
       - name: Install worker-build
-        run: cargo install worker-build --locked
+        run: cargo install worker-build --version 0.9.0 --locked
 
       - name: Workerd scheduled suite
         run: sh tests/runtime/worker-scheduled.sh
@@ -156,6 +170,11 @@ jobs:
           toolchain: "1.100.0"
           components: llvm-tools
 
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install pinned Odin
         run: |
           curl -fsSL -o /tmp/odin.tar.gz \
@@ -168,9 +187,15 @@ jobs:
 
       - name: Test and build the helper
         run: |
-          cargo test --manifest-path crates/watchdog-marmot/Cargo.toml --lib
-          cargo build --release --manifest-path crates/watchdog-marmot/Cargo.toml
+          cargo test --locked --manifest-path crates/watchdog-marmot/Cargo.toml --lib
+          cargo build --locked --release --manifest-path crates/watchdog-marmot/Cargo.toml
           test -x crates/watchdog-marmot/target/release/watchdog-marmot
+
+      - name: Native executable incident, restart, and independent recipient
+        run: |
+          cargo build --locked -p watchdog-native
+          export WATCHDOG_TEST_BINARY="$PWD/target/debug/nostr-watchdog"
+          cargo test --locked --manifest-path crates/watchdog-marmot/Cargo.toml --test fixture_exchange -- --test-threads=1
 
   cloudflare-marmot:
     runs-on: ubuntu-latest
@@ -185,13 +210,30 @@ jobs:
           toolchain: "1.100.0"
           targets: wasm32-unknown-unknown
           components: llvm-tools
+          components: llvm-tools
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pinned local runtime and build tool
+        run: |
+          npm ci --prefix crates/watchdog-marmot-worker/worker
+          cargo install worker-build --version 0.9.0 --locked
 
       - name: Test the Marmot Worker workspace
-        run: cargo test --manifest-path crates/watchdog-marmot-worker/Cargo.toml --workspace --lib
+        run: cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml --workspace --lib
 
       - name: Check the Durable Object for wasm
-        run: cargo check --manifest-path crates/watchdog-marmot-worker/worker/Cargo.toml --target wasm32-unknown-unknown
+        run: cargo check --locked --manifest-path crates/watchdog-marmot-worker/worker/Cargo.toml --target wasm32-unknown-unknown
 
-  # The SQLCipher WASM compile probe is a known incompatibility and is not a required job.
-  # Public relay tests stay opt-in. The ignored workerd conversation test is not this
-  # workflow's operational two-Worker incident; that path is WorkerNotifier::deliver_marmot.
+      - name: Build both optimized bundles and test actual workerd
+        run: |
+          worker-build --release crates/watchdog-worker -- --locked
+          sh crates/watchdog-marmot-worker/worker/build-release.sh
+          cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml \
+            -p marmot-worker-interop --test workerd_conversation -- --ignored --test-threads=1 --skip public
+
+  # SQLCipher WASM is a separate expected-failure research probe.
+  # The public-network tests remain opt-in.

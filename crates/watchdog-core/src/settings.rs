@@ -197,6 +197,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "SFS_BOT_NSEC",
     "NOSTRMASH_BOT_NSEC",
     "TELEGRAM_BOT_TOKEN",
+    "WATCHDOG_TEST_TELEGRAM_ENDPOINT",
     "TELEGRAM_CHAT_IDS",
     "OPERATOR_TOKEN",
     "MARMOT_OPERATOR_TOKEN",
@@ -248,6 +249,23 @@ pub const CONFIG_KEYS: &[&str] = &[
 ];
 
 /// Older Worker builds loaded these names. They are not a second configuration.
+/// Isolated transport fixture. Production always uses the Telegram origin.
+pub fn telegram_fixture_url(environment: &str, endpoint: &str) -> Option<url::Url> {
+    if environment != "test" {
+        return None;
+    }
+    let url = url::Url::parse(endpoint).ok()?;
+    (url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path() == "/telegram")
+        .then_some(url)
+}
+
 pub fn config_alias(key: &str) -> Option<&'static str> {
     match key {
         "STATUS_READER_TOKEN" => Some("STATUS_READ_TOKEN"),
@@ -301,6 +319,18 @@ pub fn route_for(
             TransportDefault::CriticalOnly,
         ),
     }
+}
+
+pub fn marmot_enabled_for(
+    settings: &Settings,
+    get: &impl Fn(&str) -> String,
+    project_id: &str,
+) -> bool {
+    use crate::domain::Severity;
+    !settings.emergency_disable_marmot
+        && [Severity::Info, Severity::Warning, Severity::Critical]
+            .into_iter()
+            .any(|severity| route_for(settings, get, project_id, severity).marmot)
 }
 
 enum TransportDefault {
@@ -377,7 +407,7 @@ pub fn queued_transport(
         }
         let configured = match destination {
             "nostr" => settings.nip17_enabled,
-            "marmot" => settings.marmot_enabled,
+            "marmot" => marmot_enabled_for(settings, get, project_id),
             "telegram" => availability != TransportAvailability::NotConfigured,
             _ => false,
         };
@@ -481,6 +511,10 @@ pub fn fallback_required(
             None | Some("unknown")
                 | Some("unobservable")
                 | Some("pending")
+                | Some("prepared")
+                | Some("publication_attempted")
+                | Some("rejected")
+                | Some("terminal_failure")
                 | Some("expired")
                 | Some("token_unavailable")
                 | Some("not_attempted")
