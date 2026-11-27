@@ -210,7 +210,6 @@ jobs:
           toolchain: "1.100.0"
           targets: wasm32-unknown-unknown
           components: llvm-tools
-          components: llvm-tools
 
       - name: Install Node
         uses: actions/setup-node@v4

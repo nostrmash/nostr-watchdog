@@ -6,7 +6,8 @@
 //! cargo test -p marmot-worker-interop --test workerd_conversation -- --ignored --nocapture
 //! ```
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -30,11 +31,13 @@ use sha2::Digest;
 
 const SENDER: &str = "workerdtest";
 const TOKEN: &str = "local-test-token";
-const PORT: u16 = 8794;
+static STANDALONE_PORT: AtomicU16 = AtomicU16::new(0);
+static STANDALONE_FIXTURE: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
 #[ignore = "starts wrangler and the loopback relay; requires the built worker bundle"]
 async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
+    let _standalone = choose_standalone_port();
     let worker_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../worker");
     let shim = worker_dir.join("build/worker/shim.mjs");
     assert!(
@@ -47,7 +50,6 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
         .len();
     write_dev_vars(&worker_dir);
 
-    free_port(PORT);
     let mut relay = start_relay(&worker_dir);
     let relay_url = relay.url.clone();
     let persist = worker_dir.join(".wrangler/workerd-conversation");
@@ -60,7 +62,7 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
     let native = OfficialRecipient::generate().expect("official recipient");
     let recipient = native.public_key_hex();
 
-    let denied = post_raw(PORT, SENDER, b"{\"op\":\"status\"}", false);
+    let denied = post_raw(standalone_port(), SENDER, b"{\"op\":\"status\"}", false);
     assert_eq!(denied.0, 401, "{}", denied.1);
     let huge = vec![b' '; 300 * 1024];
     let mut limited = Command::new("curl")
@@ -393,7 +395,7 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
     }
 
     stop_child(&mut workerd);
-    assert!(port_closed(PORT));
+    assert!(port_closed(standalone_port()));
     workerd = start_workerd(&worker_dir, &persist);
     workerd_guard.0 = workerd.id();
     let status = post(json!({"op": "status"}));
@@ -573,6 +575,7 @@ async fn cloudflare_sender_talks_to_official_mdk_across_a_workerd_restart() {
 #[tokio::test]
 #[ignore = "starts wrangler and discovers a real key package and token gossip"]
 async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
+    let _standalone = choose_standalone_port();
     let worker_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../worker");
     let shim = worker_dir.join("build/worker/shim.mjs");
     assert!(
@@ -584,7 +587,6 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
     let persist = worker_dir.join(".wrangler/autonomous");
     let _ = fs::remove_dir_all(&persist);
     fs::create_dir_all(&persist).expect("persist dir");
-    free_port(PORT);
     let mut relay = start_relay(&worker_dir);
     let relay_url = relay.url.clone();
     let relay_guard = KillProcess(relay.child.id());
@@ -627,7 +629,7 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
         "{pending}"
     );
     stop_child(&mut workerd);
-    assert!(port_closed(PORT));
+    assert!(port_closed(standalone_port()));
     workerd = start_workerd(&worker_dir, &persist);
     workerd_guard.0 = workerd.id();
     let established = post_to(
@@ -796,8 +798,12 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
             "op": "deliver", "operationId": format!("fail-{fault}"),
             "text": "must remain unadmitted", "publish": true, "fault": fault,
         });
-        let (status, response) =
-            post_raw(PORT, sender, &serde_json::to_vec(&command).unwrap(), true);
+        let (status, response) = post_raw(
+            standalone_port(),
+            sender,
+            &serde_json::to_vec(&command).unwrap(),
+            true,
+        );
         assert_eq!(status, 400, "{response}");
         assert_eq!(
             post_to(sender, json!({"op": "status"}))["historicalOperations"],
@@ -927,7 +933,7 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
     let stored_message = stored["message"].clone();
 
     stop_child(&mut workerd);
-    assert!(port_closed(PORT));
+    assert!(port_closed(standalone_port()));
     workerd = start_workerd(&worker_dir, &persist);
     workerd_guard.0 = workerd.id();
     let reconciled = post_to(
@@ -971,16 +977,26 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
     assert_ne!(fresh["messageEventId"], failed_event);
 
     stop_child(&mut workerd);
-    assert!(port_closed(PORT));
+    assert!(port_closed(standalone_port()));
     remove_historical_record(&persist, "alert-auto");
     workerd = start_workerd(&worker_dir, &persist);
     workerd_guard.0 = workerd.id();
     let reconcile = json!({"op": "reconcile", "operationId": "alert-auto", "publish": true});
-    let failure = post_raw(PORT, sender, &serde_json::to_vec(&reconcile).unwrap(), true);
+    let failure = post_raw(
+        standalone_port(),
+        sender,
+        &serde_json::to_vec(&reconcile).unwrap(),
+        true,
+    );
     assert_eq!(failure.0, 400, "{failure:?}");
     assert!(failure.1.contains("index is incomplete"), "{failure:?}");
     let new_alert = json!({"op": "deliver", "operationId": "after-integrity-failure", "text": "blocked", "publish": true});
-    let blocked = post_raw(PORT, sender, &serde_json::to_vec(&new_alert).unwrap(), true);
+    let blocked = post_raw(
+        standalone_port(),
+        sender,
+        &serde_json::to_vec(&new_alert).unwrap(),
+        true,
+    );
     assert_eq!(blocked.0, 400, "{blocked:?}");
     assert!(blocked.1.contains("integrity check failed"), "{blocked:?}");
 
@@ -993,6 +1009,7 @@ async fn autonomous_delivery_discovers_tokens_and_publishes_the_trigger() {
 #[tokio::test]
 #[ignore = "publishes a disposable sender and recipient through WhiteNoise relays"]
 async fn public_network_marmot_exchange_survives_restart() {
+    let _standalone = choose_standalone_port();
     let worker_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../worker");
     let shim = worker_dir.join("build/worker/shim.mjs");
     assert!(
@@ -1004,7 +1021,6 @@ async fn public_network_marmot_exchange_survives_restart() {
     let persist = worker_dir.join(".wrangler/public-network");
     let _ = fs::remove_dir_all(&persist);
     fs::create_dir_all(&persist).expect("persist dir");
-    free_port(PORT);
     let relays = [
         "wss://relay.eu.whitenoise.chat",
         "wss://relay.us.whitenoise.chat",
@@ -1138,7 +1154,7 @@ async fn public_network_marmot_exchange_survives_restart() {
     assert_eq!(opened.rumor.kind, Kind::Custom(446));
 
     stop_child(&mut workerd);
-    assert!(port_closed(PORT));
+    assert!(port_closed(standalone_port()));
     workerd = start_workerd(&worker_dir, &persist);
     workerd_guard.0 = workerd.id();
     let reconciled = post_to(
@@ -1200,7 +1216,7 @@ fn retrieve_public_event(worker_dir: &Path, relays: &[&str], filter: Value) -> V
 
 fn post_to(sender: &str, body: Value) -> Value {
     let bytes = serde_json::to_vec(&body).unwrap();
-    let (status, text) = post_raw(PORT, sender, &bytes, true);
+    let (status, text) = post_raw(standalone_port(), sender, &bytes, true);
     assert_eq!(status, 200, "{text}");
     serde_json::from_str(&text).unwrap_or_else(|_| panic!("{text}"))
 }
@@ -1413,7 +1429,7 @@ fn start_workerd(worker_dir: &Path, persist: &Path) -> Child {
             "--config",
             "wrangler.toml",
             "--port",
-            &PORT.to_string(),
+            &standalone_port().to_string(),
             "--ip",
             "127.0.0.1",
             "--persist-to",
@@ -1453,11 +1469,17 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn free_port(port: u16) {
-    assert!(
-        port_closed(port),
-        "the standalone fixture port is already in use"
-    );
+fn choose_standalone_port() -> MutexGuard<'static, ()> {
+    let guard = STANDALONE_FIXTURE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let socket = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    STANDALONE_PORT.store(socket.local_addr().unwrap().port(), Ordering::SeqCst);
+    guard
+}
+
+fn standalone_port() -> u16 {
+    STANDALONE_PORT.load(Ordering::SeqCst)
 }
 
 fn port_closed(port: u16) -> bool {
@@ -1480,7 +1502,10 @@ fn write_dev_vars(worker_dir: &Path) {
 }
 
 fn endpoint() -> String {
-    format!("http://127.0.0.1:{PORT}/marmot?sender={SENDER}")
+    format!(
+        "http://127.0.0.1:{}/marmot?sender={SENDER}",
+        standalone_port()
+    )
 }
 
 fn post(body: Value) -> Value {
@@ -1491,7 +1516,7 @@ fn post(body: Value) -> Value {
 
 fn post_status(body: Value) -> (u16, String) {
     let bytes = serde_json::to_vec(&body).unwrap();
-    post_raw(PORT, SENDER, &bytes, true)
+    post_raw(standalone_port(), SENDER, &bytes, true)
 }
 
 fn post_raw(port: u16, sender: &str, body: &[u8], authorized: bool) -> (u16, String) {
