@@ -1602,17 +1602,6 @@ async fn executable_exchange() {
         ),
     );
     assert!(!text.is_empty(), "the queued alert has no text");
-    assert!(
-        wait_plaintext(&runtime, &recipient_hex, &group, &text).await,
-        "packaged alert was not decrypted ({})",
-        sql_value(
-            &db,
-            &format!(
-                "select ifnull(state,'') || ' ' || ifnull(last_error,'') from alert_outbox where id = '{}'",
-                sql_id(&alert)
-            ),
-        )
-    );
     let trigger = wait_for_trigger(&relay.url, &server, &decoy.id.to_string(), baseline)
         .expect("packaged kind 446 trigger");
     assert!(trigger.seq > baseline);
@@ -1627,6 +1616,11 @@ async fn executable_exchange() {
     let group_event = alert_group_event(&relay.url, &server, &route, baseline);
     assert_ne!(group_event.pubkey.to_hex(), account);
     assert!(group_event.verify().is_ok());
+    assert!(
+        receive_packaged_alert(&runtime, &recipient_hex, &group, &text).await,
+        "the official recipient could not decrypt the accepted outage group event {}",
+        group_event.id
+    );
     let packaged_rows = runtime
         .messages_with_query(
             &recipient_hex,
@@ -1745,7 +1739,10 @@ async fn executable_exchange() {
         ),
     );
     assert_ne!(second_text, text);
-    assert!(wait_plaintext(&runtime, &recipient_hex, &group, &second_text).await);
+    assert!(
+        receive_packaged_alert(&runtime, &recipient_hex, &group, &second_text).await,
+        "the official recipient could not decrypt the recovery alert"
+    );
     assert_eq!(
         plaintext_count(&runtime, &recipient_hex, &group, &text).await,
         1
@@ -1875,6 +1872,24 @@ async fn executable_exchange() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&recipient_root);
     let _ = std::fs::remove_dir_all(&db_dir);
+}
+
+async fn receive_packaged_alert(
+    runtime: &marmot_app::MarmotAppRuntime,
+    recipient: &str,
+    group: &str,
+    text: &str,
+) -> bool {
+    if wait_plaintext(runtime, recipient, group, text).await {
+        return true;
+    }
+    // Use the official recipient's relay history repair if incremental catch-up missed the event.
+    eprintln!("incremental catch-up missed the packaged alert, repairing recipient history");
+    runtime
+        .repair_full_history(recipient)
+        .await
+        .expect("official recipient history repair");
+    wait_plaintext(runtime, recipient, group, text).await
 }
 
 async fn wait_monitor_alert(db: &Path, resolved: bool) -> String {

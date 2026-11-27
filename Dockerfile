@@ -27,13 +27,17 @@ RUN cargo build --release --locked -p watchdog-native \
     && cargo build --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml --bin watchdog-marmot
 
 # Optional build target for the Linux image qualification driver.
-FROM build AS image-test-driver
+FROM build AS image-test-driver-build
 RUN mkdir -p /out \
     && cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
          --test fixture_exchange --no-run --message-format=json > /tmp/test-artifacts.jsonl \
     && driver="$(sed -n 's@.*"executable":"\([^"]*/fixture_exchange-[^"]*\)".*@\1@p' /tmp/test-artifacts.jsonl)" \
     && test -x "$driver" \
     && cp "$driver" /out/fixture_exchange
+
+FROM scratch AS image-test-driver
+COPY --from=image-test-driver-build /out/fixture_exchange /out/fixture_exchange
+ENTRYPOINT ["/out/fixture_exchange"]
 
 FROM --platform=linux/amd64 debian:bookworm-slim
 RUN apt-get update \

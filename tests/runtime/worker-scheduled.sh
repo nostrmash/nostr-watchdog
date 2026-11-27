@@ -58,9 +58,11 @@ cleanup() {
 trap cleanup EXIT
 python3 - "$slow" "$persist/fixture.port" <<'PY' &
 import json, sys, time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 slow = sys.argv[1]
 port_path = sys.argv[2]
+race = Path(port_path).with_name("reminder-race")
 hits = {"n": 0}
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -71,7 +73,12 @@ class Handler(BaseHTTPRequestHandler):
         hits["n"] += 1
         if open(slow).read().strip() == "1" if __import__("os").path.exists(slow) else False:
             time.sleep(5)
-        if hits["n"] <= 2:
+        if race.exists():
+            race.with_suffix(".entered").touch()
+            until = time.monotonic() + 5
+            while race.exists() and time.monotonic() < until:
+                time.sleep(0.01)
+        if hits["n"] <= 2 or race.with_suffix(".entered").exists():
             body = b'{"status":"down"}'
             status = 500
         else:
@@ -197,8 +204,37 @@ print("incident", open_rows[0]["id"])
 open(persist + "/incident", "w").write(open_rows[0]["id"])
 PY
 
-echo "seeding delivery rows"
+echo "acknowledging an incident while a scheduled reminder is in flight"
 incident=$(cat "$persist/incident")
+d1 "UPDATE incidents SET opened_at = opened_at - 60000 WHERE id = '${incident}'; UPDATE monitor_state SET last_check_at = 0 WHERE monitor_id = 'sfs-web';" >/dev/null
+touch "$persist/reminder-race"
+curl -fsS --max-time 25 "http://127.0.0.1:${worker_port}/__scheduled?cron=*+*+*+*+*" >"$persist/reminder-tick.json" &
+reminder_pid=$!
+i=0
+while [ ! -f "$persist/reminder-race.entered" ]; do
+  i=$((i + 1))
+  if [ "$i" -gt 150 ] || ! kill -0 "$reminder_pid" 2>/dev/null; then
+    echo "the reminder probe did not reach the fixture" >&2
+    exit 1
+  fi
+  sleep 0.02
+done
+curl -fsS --max-time 3 -X POST -H "authorization: Bearer runtime-operator-token" \
+  "http://127.0.0.1:${worker_port}/v1/incidents/${incident}/ack" | grep -F '"status":"acked"'
+rm "$persist/reminder-race"
+wait "$reminder_pid"
+rm "$persist/reminder-race.entered"
+d1 "SELECT reminder_count, acked_at, (SELECT COUNT(*) FROM alert_outbox WHERE incident_id = '${incident}' AND alert_class = 'reminder') AS reminders,
+           (SELECT status FROM monitor_state WHERE monitor_id = 'sfs-web') AS monitor_status
+    FROM incidents WHERE id = '${incident}'" >"$persist/reminder-fence.json"
+python3 - "$persist/reminder-fence.json" <<'RACE'
+import json, sys
+row = json.load(open(sys.argv[1]))[0]["results"][0]
+assert row["reminder_count"] == row["reminders"] == 0 and row["acked_at"], row
+assert row["monitor_status"] == "down", row
+RACE
+
+echo "seeding delivery rows"
 now=$(python3 -c 'import time; print(int(time.time()*1000))')
 d1 "INSERT INTO alert_outbox (
   id, alert_class, incident_id, monitor_id, project_id, dedupe_key, destination, severity,
@@ -329,8 +365,9 @@ oversized=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${
 test "$oversized" = "413"
 
 python3 - "$worker_port" <<'PY'
-import hashlib, hmac, json, time, urllib.error, urllib.request
-port = sys.argv[1] if (sys := __import__("sys")) else ""
+import hashlib, hmac, sys, time, urllib.error, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+port = sys.argv[1]
 key = b"0123456789abcdef0123456789abcdef"
 def post(body, ts, nonce):
     raw = body.encode()
@@ -353,12 +390,17 @@ def post(body, ts, nonce):
     except urllib.error.HTTPError as error:
         return error.code, error.read()
 now = str(int(time.time()))
-status, body = post('{"progress":"cursor-b"}', now, "nonce-runtime-0000001")
-assert status == 200, (status, body)
-status, body = post('{"progress":"cursor-b"}', now, "nonce-runtime-0000001")
-assert status == 401 and b"replay" in body, (status, body)
+with ThreadPoolExecutor(max_workers=2) as requests:
+    replies = list(requests.map(
+        lambda _: post('{"progress":"cursor-b"}', now, "nonce-runtime-0000001"),
+        range(2)
+    ))
+assert sorted(code for code, _ in replies) == [200, 401], replies
+assert any(code == 401 and b"replay" in body for code, body in replies), replies
+status, body = post('{"progress":"cursor-equal"}', now, "nonce-runtime-0000002")
+assert status == 409 and b"stale" in body, (status, body)
 older = str(int(time.time()) - 30)
-status, body = post('{"progress":"cursor-a"}', older, "nonce-runtime-0000002")
+status, body = post('{"progress":"cursor-a"}', older, "nonce-runtime-0000003")
 assert status == 409 and b"stale" in body, (status, body)
 PY
 
@@ -396,7 +438,7 @@ started=$(python3 -c 'import time; print(time.time())')
 curl -fsS --max-time 20 "http://127.0.0.1:${worker_port}/__scheduled?cron=*+*+*+*+*" >/dev/null
 python3 - "$started" <<'PY'
 import sys, time
-# The fixture sleeps 5s. A 1s probe budget must return well before that.
+# The fixture sleeps 5s. A 2s probe budget must return well before that.
 assert time.time() - float(sys.argv[1]) < 4, "scheduled probe ignored the timeout"
 PY
 

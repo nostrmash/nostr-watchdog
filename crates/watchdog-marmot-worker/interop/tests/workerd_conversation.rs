@@ -1730,24 +1730,33 @@ async fn scheduled_incident_reaches_official_recipient_via_both_workers() {
     };
 
     publish_key_package(&worker_dir, &relay.url, &scratch.0, &recipient).await;
+    publish_key_package(&worker_dir, &relay.url, &scratch.0, &other_recipient).await;
     let tick = || {
         worker_json(&format!("{worker_url}/__scheduled?cron=*+*+*+*+*"), None);
     };
     tick();
-    let welcomes = query_relay(
-        &worker_dir,
-        &relay.url,
-        &json!({"kinds": [1059], "#p": [recipient.public_key_hex()]}),
-    );
-    assert_eq!(
-        welcomes.len(),
-        1,
-        "recipient did not independently retrieve its Welcome"
-    );
+    let retrieve_welcome = |recipient: &OfficialRecipient| {
+        let mut welcomes = query_relay(
+            &worker_dir,
+            &relay.url,
+            &json!({"kinds": [1059], "#p": [recipient.public_key_hex()]}),
+        );
+        assert_eq!(
+            welcomes.len(),
+            1,
+            "recipient did not independently retrieve its Welcome"
+        );
+        retrieved_transport(welcomes.pop().unwrap())
+    };
     let group = recipient
-        .join_welcome(retrieved_transport(welcomes[0].clone()))
+        .join_welcome(retrieve_welcome(&recipient))
         .await
         .unwrap();
+    let other_group = other_recipient
+        .join_welcome(retrieve_welcome(&other_recipient))
+        .await
+        .unwrap();
+    assert_ne!(group, other_group, "projects share a group");
     let plaintext = b"local-fcm-fixture";
     let server_hex = server.public_key().to_hex();
     let encrypted = push::encrypt_token(Platform::Fcm, plaintext, &server_hex).unwrap();
@@ -1795,21 +1804,46 @@ async fn scheduled_incident_reaches_official_recipient_via_both_workers() {
         .to_string(),
     )
     .await;
+    let other_token = b"nostrmash-local-fixture";
+    let encrypted_other = push::encrypt_token(Platform::Fcm, other_token, &server_hex).unwrap();
+    let mut nostrmash_record = token_record(
+        &hex::encode(other_group.as_slice()),
+        &other_recipient.public_key_hex(),
+        other_recipient.own_leaf(&other_group).unwrap(),
+        &server_hex,
+        &relay.url,
+        other_token,
+        &encrypted_other,
+    );
+    nostrmash_record.owner_sig =
+        push::sign_owner_proof(other_recipient.keys(), &nostrmash_record, false).unwrap();
+    publish_gossip(
+        &worker_dir,
+        &relay.url,
+        &scratch.0,
+        &other_recipient,
+        &other_group,
+        447,
+        &json!({"v": "marmot-push-v1", "tokens": [gossip_entry(&nostrmash_record)]}).to_string(),
+    )
+    .await;
     // Advance the persisted synchronization interval without waiting a minute.
     query("UPDATE scheduler_leases SET lease_until = 0 WHERE job_name LIKE 'marmot-sync:%'");
     tick();
-    let diagnostics = worker_json(
-        &format!("{worker_url}/v1/diagnostics/marmot?project=smartflowsocial"),
-        None,
-    );
-    assert_eq!(
-        diagnostics["authority"]["conversationReady"], true,
-        "{diagnostics}"
-    );
-    assert_eq!(
-        diagnostics["authority"]["recipientTokenReady"], true,
-        "{diagnostics}"
-    );
+    for project in ["smartflowsocial", "nostrmash"] {
+        let diagnostics = worker_json(
+            &format!("{worker_url}/v1/diagnostics/marmot?project={project}"),
+            None,
+        );
+        for field in [
+            "welcomeAccepted",
+            "recipientParticipationObserved",
+            "conversationReady",
+            "recipientTokenReady",
+        ] {
+            assert_eq!(diagnostics["authority"][field], true, "{project}: {diagnostics}");
+        }
+    }
     query("UPDATE monitor_state SET last_check_at = 0");
     tick();
     let read_alerts = || {
