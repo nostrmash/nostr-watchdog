@@ -1,6 +1,6 @@
 # Contributing
 
-Work happens on a branch. Do not push to `main` to try the Rust rewrite. The production Worker is the TypeScript tree on `main`.
+Work happens on a branch. Cloudflare Workers Builds deploys the Rust Worker pair from `main`. Use the local manifests when developing or testing.
 
 ```bash
 cargo fmt --all -- --check
@@ -12,6 +12,6 @@ cargo test --workspace --exclude watchdog-worker
 
 Do not add a homemade MLS, NIP-44, or push-token implementation. If MDK needs a change, keep it as a small patch against the pinned revision and describe it in `docs/mdk-compatibility.md`.
 
-Do not log secrets. Do not commit `.dev.vars`, `.setup-secrets.json`, or a filled-in production Wrangler database id.
+Keep Wrangler secrets, `.dev.vars`, `.setup-secrets.json`, and operational backups out of Git and logs.
 
 The license is the Unlicense. Do not add a dependency whose license `deny.toml` rejects without explaining the exception.

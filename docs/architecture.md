@@ -23,9 +23,9 @@ Incident thresholds, monitor status, alert text, SSRF checks, heartbeat canonica
 
 Transports are independent. One failure does not cancel the others.
 
-| Transport | Role in this branch |
+| Transport | Role |
 | --- | --- |
-| Marmot | Preferred on the native process when `ENABLE_MARMOT=true`. The helper calls `marmot-app` create, send, and catch-up. Membership that is not the sender plus the configured recipient fails closed. The operational Worker calls Durable Object class `MarmotSender` through the `MARMOT_SENDER` binding on the dedicated Marmot Worker. Staging names that script `nostr-watchdog-marmot-staging`. `ENABLE_MARMOT` stays false until a deliberate activation. Production wrangler is untouched. |
+| Marmot | Preferred once the project conversation and recipient token are ready. The native helper calls `marmot-app` create, send, and catch-up. Membership other than the sender and configured recipient fails closed. The operational Worker calls Durable Object class `MarmotSender` through the `MARMOT_SENDER` binding on `nostr-watchdog-marmot`. |
 | NIP-17 | Default compatibility transport. The native process stores the gift wrap and retries that event. The operational Worker also persists the signed gift wrap and retries the original bytes. |
 | Telegram | Optional. `dual` sends it with the Nostr alert for critical open, remind, and close. `nostr_fallback` sends one Telegram after the first critical NIP-17 or Marmot failure. |
 
@@ -47,4 +47,4 @@ The native process wakes about once a minute, runs due monitors with the configu
 
 The operational Worker separates monitoring and delivery from per-project Marmot synchronization and maintenance. The cryptographic Worker runs the official MDK engine with a synchronous storage provider and stores a sealed account per SQLite Durable Object. Each retirement commits the sealed account and authenticated history index in one SQLite transaction. Relay I/O happens after cryptographic admission. The operational Worker keeps only sanitized evidence.
 
-`tests/runtime/worker-scheduled.sh` covers the operational D1 adapter in workerd. The paired workerd suite exercises the private binding from a scheduled incident to an independent MDK recipient, including trigger reconciliation and restart. Staging uses a separate namespace and D1 database. [Local and staging procedures](deployment.md)
+`tests/runtime/worker-scheduled.sh` covers the operational D1 adapter in workerd. The paired workerd suite exercises the private binding from a scheduled incident to an independent MDK recipient, including trigger reconciliation and restart. The [production runbook](deployment.md#cloudflare-production) covers the deployed pair and the existing operational D1 database.

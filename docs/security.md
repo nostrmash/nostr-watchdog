@@ -30,6 +30,6 @@ CI runs `cargo deny` and `cargo audit` across the operational workspace and both
 
 The upstream MDK, binding, and SQLCipher notices are in `LICENSES/` and installed in the native image.
 
-## Cloudflare staging
+## Cloudflare production
 
-`wrangler.staging.toml` leaves the D1 binding for a dedicated staging database. Use the isolated Worker names and separate credentials described in [deployment.md](deployment.md).
+`nostr-watchdog-marmot` has neither a public route nor a preview URL. The operational Worker accesses `MarmotSender` through a cross-script binding authenticated by `MARMOT_OPERATOR_TOKEN`. Keep the distinct 32-byte `MARMOT_STORAGE_KEY` in secure recovery custody and bind it only to the private Worker. See [deployment.md](deployment.md#cloudflare-production) for provisioning, backup, and rollback.

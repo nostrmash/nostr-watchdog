@@ -1,6 +1,6 @@
 # Migration and rollback
 
-Use a dedicated staging database and a dedicated cryptographic namespace. The TypeScript production reference is `a236b35a9dda14aa6f1a96dc37fc2daccc838ed8`. Staging authorization and deployment order are in [deployment.md](deployment.md).
+The TypeScript production reference is `a236b35a9dda14aa6f1a96dc37fc2daccc838ed8`. Use the existing production operational D1 database and a dedicated SQLite Durable Object namespace for Marmot. See [deployment.md](deployment.md#cloudflare-production) for deployment order.
 
 ## Operational migration manifest
 
@@ -21,7 +21,7 @@ Apply the files in order. Track the applied versions in each environment. Take a
 | `0011_delivery_fencing.sql` | Authoritative counters and fallback fences. |
 | `0012_transport_evidence.sql` | Sanitized evidence and timestamps. |
 
-The native migration tests upgrade an older schema and exercise interruption of the last migration. The workerd harness applies all files to an isolated D1 database. It checks both fallback interruption directions through the real adapter. Remote D1 migration and convergence remain part of staging.
+The TypeScript baseline uses `0001` through `0005`. The next seven migrations add columns, tables, and indexes. Verify the live ledger before applying them. On a restored copy, check integrity and compare all pre-existing columns and rows. Record monitor, heartbeat, incident, acknowledgement, silence, outbox, and scheduler counts before and after migration. Accepted legacy outbox rows keep their IDs, destination, and signed event. Review actionable legacy rows before cutover and quarantine ambiguous rows with their original IDs and envelopes intact.
 
 ## Cryptographic state
 
@@ -29,11 +29,11 @@ The private Cloudflare Worker uses the `v1` SQLite Durable Object class migratio
 
 Keep sender secrets, MLS state, and wake capabilities in their designated cryptographic or secret stores. The operational migrations carry only the application data and sanitized transport projection needed by the watchdog.
 
-## Rehearse rollback in staging
+## Production rollback
 
-1. Disable alert delivery and pause monitors for the selected staging project. Record the active Worker versions and retain the staging D1 database and Durable Object namespace.
-2. Roll back the operational Worker to a reviewed version compatible with the applied additive migrations. Leave the migration columns and operation IDs in place.
+1. Suspend automatic deployments during incident recovery. When reverting to TypeScript, pause monitoring and alerts and let in-flight dispatch claims expire or reconcile. Quarantine any actionable Marmot outbox rows, preserving their operation IDs, event IDs, receipts and original dispositions for later Rust reconciliation. TypeScript's outbox predates the Marmot destination and may interpret such rows as NIP-17.
+2. Roll back the operational Worker to the recorded compatible version using `wrangler rollback <version-id> --config wrangler.production.toml`. Leave the additive D1 schema and historical operation IDs in place. Verify the restored TypeScript health, signed status, scheduler, and existing notification route.
 3. Roll back the cryptographic Worker only to a version compatible with the current sealed snapshot and history. Resume using the same namespace after readiness and a controlled alert pass.
 4. Treat restored or incomplete cryptographic storage as a recovery event. Keep affected operations quarantined pending an integrity check. Use a deliberate fresh onboarding and namespace when the original epoch and deduplication state cannot be proven.
 
-A runtime restart uses the current data. A point-in-time restore changes the data and can rewind a whole consistent state. Use separate authorization before touching production, and keep one enabled scheduler per project identity through any cutover.
+A runtime restart uses the current data. A point-in-time restore can rewind a consistent state and requires explicit operator recovery. Keep one enabled scheduler per project identity through the cutover.

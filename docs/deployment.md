@@ -46,9 +46,50 @@ docker run --rm -p 127.0.0.1:8787:8787 -v watchdog-data:/data \
 
 The shipped image supports Linux amd64. It runs as UID 10001 with `/data/watchdog.sqlite`, `/data/marmot`, and the helper at `/usr/local/bin/watchdog-marmot`. Keep the same volume when replacing a container. Keep these paths together for backup and recovery. Odin and the Rust toolchain stay in build stages. The optional `image-test-driver` stage builds the independent MDK qualification driver used in CI.
 
+## Cloudflare production
+
+| Component | Production configuration |
+| --- | --- |
+| Public operational Worker | `nostr-watchdog` at `https://nostr-watchdog.birwix.workers.dev`, managed by `wrangler.production.toml` |
+| Operational storage | The existing `nostr-watchdog` D1 database through `DB` |
+| Scheduled jobs | Checks and dispatch each minute, vendor updates each hour |
+| Private cryptographic Worker | `nostr-watchdog-marmot`, managed by `wrangler.marmot-production.toml` |
+| Private cryptographic storage | The SQLite-backed `MarmotSender` Durable Object class created by migration `v1` |
+
+The operational manifest binds `MARMOT_SENDER` to the private script by name. Leave both `workers.dev` and preview URLs disabled on the private Worker, with no route or domain. Both Workers use the Paid account CPU budget of 30 seconds. Preserve the production monitor and recipient variables already attached to the operational Worker. Set project routing flags on that Worker so they survive subsequent deployments.
+
+### Build and deploy
+
+Cloudflare Workers Builds watches `main`. Use `sh scripts/build-production-workers.sh --install-toolchain` as the build command and `npm run deploy:production` as the deploy command. The deploy command requires both built bundles, deploys the private Worker first, and records the Git commit on each Worker version. Leave branch previews disabled. GitHub Actions runs qualification on the integration branch and `main`.
+
+For an explicitly authorized local deploy, install the pinned Rust toolchain and Wrangler dependencies, then use the same build and deploy scripts.
+
+```bash
+rustup target add wasm32-unknown-unknown
+rustup component add llvm-tools
+cargo install worker-build --version 0.9.0 --locked
+pnpm install --frozen-lockfile
+pnpm build:production
+pnpm deploy:production
+```
+
+`wrangler.jsonc` and the TypeScript tree are retained for rollback reference and development. Their production environment belongs to the legacy deployment.
+
+### First cutover and migrations
+
+1. Record the active Worker version, deployment ID, routes, cron, settings, and D1 migration history. Export the production database to a protected location and verify a local restore. Retain the Time Travel bookmark alongside the export. Follow the compatibility and queue checks in [migration.md](migration.md).
+2. Provision `nostr-watchdog-marmot` using the private manifest and a protected JSON file supplied through Wrangler's `--secrets-file`. Generate a strong `MARMOT_OPERATOR_TOKEN` and an independent 32-byte hex `MARMOT_STORAGE_KEY` once. Save them in the production recovery secret store. Bind the same internal token to the operational Worker and bind the storage key exclusively to the private Worker. Subsequent deployments inherit the secrets.
+3. List the pending D1 migrations with `pnpm exec wrangler d1 migrations list DB --config wrangler.production.toml --remote`. Review the ledger and apply the expected pending files with `pnpm migrate:production`. The TypeScript cutover starts at `0005` and applies `0006` through `0012`. Apply any future schema changes before deploying a Worker that requires them.
+4. Deploy the Rust Worker pair. Verify `/healthz`, `/readyz`, signed `/v1/status`, D1 bindings, scheduler freshness, and existing heartbeat integrations. Confirm the private Worker has no public access.
+5. Onboard each project through the operational API with its existing sender and configured recipient, using a stable project-specific operation ID. Enable the project's Marmot route for scheduled synchronization and preserve working NIP-17 while acceptance is pending. Check Welcome acceptance, canonical member convergence, token readiness, and the last successful sync before relying on Marmot. Leave disabled destinations disabled. [WhiteNoise procedure](acceptance.md#cloudflare)
+
+### Capacity and recovery
+
+Watch `authority.storageCapacity` in the authenticated project diagnostics, including sealed state size, publication journal, retired operations, and the largest history bucket. Watch pending operation age and collect CPU, wall time, exceptions, and Durable Object storage from the production account. Preserve the same namespace and storage key throughout code rollbacks and redeployments. [Rollback procedure](migration.md#production-rollback)
+
 ## Isolated Cloudflare staging
 
-Provisioning and deploying staging requires owner authorization. Use dedicated project identities, a dedicated recipient, and staging-only operator and internal credentials. The existing TypeScript deployment continues to use `wrangler.jsonc`.
+These isolated manifests were used for release qualification and can be used for a separate rehearsal. Use dedicated project identities, a dedicated recipient, and staging-only operator and internal credentials.
 
 ### Build and dry-run
 

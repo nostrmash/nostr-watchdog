@@ -148,7 +148,7 @@ Ubuntu completed the three optimized exchanges in 153.82, 154.44 and 154.69 seco
 
 ### Staging assessment
 
-The implementation is ready for separately authorized isolated Cloudflare staging. The owner can use the staged deployment and WhiteNoise runbooks to check remote CPU, memory, D1 convergence, Durable Object storage, and locked-screen delivery. Native operation requires a dedicated two-account group with stable membership and reports alert-specific push acknowledgement as `unobservable`. The qualification used private fixtures and GitHub Actions. Staging, production and the physical acceptance session are still pending.
+The qualification used private fixtures and GitHub Actions. Use the [production runbook](deployment.md#cloudflare-production) for actual deployed resource measurements and the [acceptance procedure](acceptance.md#cloudflare) for phone delivery. Native operation requires a dedicated two-account group with stable membership and reports alert-specific push acknowledgement as `unobservable`.
 
 ## Previous integration qualification
 

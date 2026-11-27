@@ -72,7 +72,7 @@ jobs:
           targets: wasm32-unknown-unknown
           components: llvm-tools
 
-      - name: Check the staging Worker
+      - name: Check the operational Worker
         run: cargo check --locked -p watchdog-worker --target wasm32-unknown-unknown
 
       - name: Check the pinned cgka-engine for wasm
@@ -254,10 +254,15 @@ jobs:
 
       - name: Build both optimized bundles and test actual workerd
         run: |
-          worker-build --release crates/watchdog-worker -- --locked
-          sh crates/watchdog-marmot-worker/worker/build-release.sh
+          sh scripts/build-production-workers.sh
           cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml \
             -p marmot-worker-interop --test workerd_conversation -- --ignored --test-threads=1 --skip public --show-output
+
+      - name: Package the production Worker pair
+        run: |
+          wrangler=crates/watchdog-marmot-worker/worker/node_modules/.bin/wrangler
+          "$wrangler" deploy --config wrangler.marmot-production.toml --dry-run --outdir "$RUNNER_TEMP/watchdog-marmot"
+          "$wrangler" deploy --config wrangler.production.toml --dry-run --outdir "$RUNNER_TEMP/watchdog-operational"
 
   # SQLCipher WASM is a separate expected-failure research probe.
   # The public-network tests remain opt-in.

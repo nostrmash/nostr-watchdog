@@ -2,11 +2,11 @@
 
 Nostr Watchdog is an open-source infrastructure monitoring service with private, encrypted Nostr notifications. Deploy on Cloudflare or run it on your own infrastructure.
 
-The `feat/rust-integration` branch qualifies the Rust service against the TypeScript production implementation on `main`. Deployment and physical notification acceptance use isolated staging and test identities.
+Cloudflare production uses the Rust `nostr-watchdog` Worker and the private `nostr-watchdog-marmot` Worker. See the [deployment runbook](docs/deployment.md#cloudflare-production) and [WhiteNoise acceptance procedure](docs/acceptance.md#cloudflare).
 
 The project is licensed under the [Unlicense](LICENSE). Third-party crates keep their own licenses. See [deny.toml](deny.toml).
 
-## What works in this branch
+## Capabilities
 
 The native binary (`nostr-watchdog`) runs the shared monitoring core:
 
@@ -26,7 +26,7 @@ On Cloudflare, the operational Worker runs the shared engine and D1 outbox. It c
 
 - Rust 1.100.0, pinned in `rust-toolchain.toml`. The workspace MSRV is 1.91.
 - No Node.js runtime for the native binary.
-- `worker-build` and Wrangler are build and deploy tools for the staging Worker. They are not required to run the native binary.
+- Cloudflare bundles use `worker-build` 0.9.0 and the Wrangler version pinned in the lockfile.
 
 ## Native quick start
 
@@ -98,4 +98,4 @@ The MDK helper and the compile probe are outside the workspace. The helper needs
 
 ## Release status
 
-Release qualification remains open for authorized staging measurements and physical WhiteNoise notification acceptance. See the current CI, runtime evidence, and gate results in [integration.md](docs/integration.md).
+See the [integration evidence](docs/integration.md) for the qualified runtime behavior. The [production and phone procedures](docs/acceptance.md) describe how to verify relay evidence and observe delivery on an iPhone.

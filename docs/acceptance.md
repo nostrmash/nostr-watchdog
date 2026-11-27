@@ -1,6 +1,6 @@
 # WhiteNoise acceptance
 
-Use a dedicated WhiteNoise account on the test iPhone and a dedicated watchdog sender. Open WhiteNoise, enable its notifications, and allow the test account to publish an eligible key package. Leave the test account connected to the same relay set as the watchdog. An existing eligible key package and an active notification registration are prerequisites for the complete sequence.
+On the iPhone, open WhiteNoise with the configured recipient account and enable its notifications. The account needs an eligible key package and an active notification registration. Use dedicated test identities for the native rehearsal and the existing authorized recipient and project senders for the production test.
 
 ## Native
 
@@ -28,26 +28,26 @@ If `conversation` reports an unavailable conversation index, leave the helper ru
 
 ## Cloudflare
 
-Use the isolated Worker pair from [deployment.md](deployment.md) after staging deployment is authorized. Onboard the dedicated sender using `POST /v1/diagnostics/marmot/onboard`. Wait for the authenticated `GET /v1/diagnostics/marmot?project=<id>` response to show Welcome acceptance, recipient participation and token readiness. Enable alerts only for the configured staging project. For each phone state, send one `POST /v1/diagnostics/test-alert` with the same project and `transport=marmot`. Record the outbox ID and observe the phone before moving to the next state. Within the authorized staging rehearsal, redeploy the tested private Marmot Worker from the same staging manifest. Keep the private namespace, storage key and sender, along with the operational Worker's D1 binding. Check readiness for the same group before continuing. Once the test-alert rate window permits another send, repeat the locked-screen alert in the same conversation.
+Use the [production Worker pair](deployment.md#cloudflare-production). Onboard once per project with a stable operation ID. On the phone, accept the SmartFlowSocial and NostrMash invitations where needed and open the conversations. Check Settings → Notifications → WhiteNoise on the iPhone and enable Allow Notifications and Lock Screen. Keep WhiteNoise open until the authenticated project diagnostics show recipient participation, canonical convergence, and `authority.recipientTokenReady: true`.
 
-This example assumes the SmartFlowSocial staging identity and the authorized staging Worker URL. Load the staging operator token into `watchdog_acceptance_token` in the current shell with a hidden prompt or the staging secret manager.
+Send one test alert from the operational API for each state. Observe WhiteNoise in the foreground, then with another app in the foreground, then with the phone locked. Record the alert ID and observation before moving to the next state. For recovery, redeploy the private Worker with the same namespace, storage key, sender, and operational D1 binding. Verify the original group and operation evidence, then repeat a locked-screen alert after the rolling-hour limit allows a fourth send.
 
 ```bash
-# Enter the staging operator token at the hidden prompt.
+# Enter the operator token at the hidden prompt.
 read -r -s watchdog_acceptance_token
-watchdog_staging_url="https://nostr-watchdog-rust-staging.<account>.workers.dev"
-watchdog_staging_request() {
+watchdog_url="https://nostr-watchdog.birwix.workers.dev"
+watchdog_request() {
   printf 'Authorization: Bearer %s\n' "$watchdog_acceptance_token" |
     curl --fail-with-body -sS --header @- "$@"
 }
-watchdog_staging_request "$watchdog_staging_url/v1/diagnostics/marmot/onboard" \
-  --json '{"projectId":"smartflowsocial","operationId":"whitenoise-acceptance-1"}'
-watchdog_staging_request "$watchdog_staging_url/v1/diagnostics/marmot?project=smartflowsocial"
+watchdog_request "$watchdog_url/v1/diagnostics/marmot/onboard" \
+  --json '{"projectId":"smartflowsocial","operationId":"production-smartflowsocial-v1"}'
+watchdog_request "$watchdog_url/v1/diagnostics/marmot?project=smartflowsocial"
 
 # Run one send after setting the phone state.
-watchdog_staging_request "$watchdog_staging_url/v1/diagnostics/test-alert" \
+watchdog_request "$watchdog_url/v1/diagnostics/test-alert" \
   --json '{"projectId":"smartflowsocial","transport":"marmot"}'
-watchdog_staging_request "$watchdog_staging_url/v1/outbox/<alert-id>"
+watchdog_request "$watchdog_url/v1/outbox/<alert-id>"
 ```
 
 ## What to record
