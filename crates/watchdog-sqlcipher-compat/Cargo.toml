@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "libsqlite3-sys"
+version = "0.38.2"
+edition = "2021"
+description = "Compatibility adapter for the pinned Marmot MDK's rusqlite dependency"
+license = "Unlicense"
+publish = false
+
+[features]
+default = ["upstream/default"]
+bundled = ["upstream/bundled"]
+bundled-sqlcipher = ["upstream/bundled-sqlcipher"]
+bundled-sqlcipher-vendored-openssl = ["upstream/bundled-sqlcipher-vendored-openssl"]
+bundled_bindings = ["upstream/bundled_bindings"]
+
+[dependencies]
+upstream = { package = "libsqlite3-sys", version = "=0.40.0", default-features = false }

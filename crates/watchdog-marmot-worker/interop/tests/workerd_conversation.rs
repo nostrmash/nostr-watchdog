@@ -1639,14 +1639,16 @@ async fn scheduled_incident_reaches_official_recipient_via_both_workers() {
         ),
     )
     .unwrap();
-    fs::write(
-        cryptographic_dir.join(".dev.vars"),
-        format!(
-            "MARMOT_OPERATOR_TOKEN={TOKEN}\nMARMOT_STORAGE_KEY={}\n",
-            Keys::generate().secret_key().to_secret_hex()
-        ),
-    )
-    .unwrap();
+    let secret_path = cryptographic_dir.join(".dev.vars");
+    let storage_key = Keys::generate().secret_key().to_secret_hex();
+    let configure_authority = |token: &str| {
+        fs::write(
+            &secret_path,
+            format!("MARMOT_OPERATOR_TOKEN={token}\nMARMOT_STORAGE_KEY={storage_key}\n"),
+        )
+        .unwrap();
+    };
+    configure_authority("deliberately-different-private-fixture-token");
 
     let state = persist.to_str().unwrap();
     let operational = operational.to_str().unwrap();
@@ -1686,13 +1688,39 @@ async fn scheduled_incident_reaches_official_recipient_via_both_workers() {
         &scratch.0,
     );
 
-    let onboard = |project, id| {
-        let reply = worker_json(
+    let request_onboard = |project, id| {
+        worker_json(
             &format!("{worker_url}/v1/diagnostics/marmot/onboard"),
             Some(&json!({
                 "projectId": project, "operationId": id,
             })),
-        );
+        )
+    };
+    let invalid = worker_request(
+        &format!("{worker_url}/v1/diagnostics/marmot/onboard"),
+        Some(&json!({"projectId": "unknown-project", "operationId": "malformed-project"})),
+    );
+    assert!(!invalid.status.success(), "an unknown project was accepted");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&invalid.stdout).unwrap()["error"],
+        "bad_request"
+    );
+    let unauthorized = request_onboard("smartflowsocial", "onboard-sfs");
+    assert_eq!(unauthorized["error"], "marmot_unauthorized", "{unauthorized}");
+    assert_eq!(unauthorized["connected"], false, "{unauthorized}");
+    stop_child(&mut worker.0);
+    assert!(port_closed(port));
+    configure_authority(TOKEN);
+    worker = start_paired_workerd(
+        &wrangler,
+        operational,
+        cryptographic,
+        state,
+        port,
+        &scratch.0,
+    );
+    let onboard = |project, id| {
+        let reply = request_onboard(project, id);
         assert_eq!(reply["connected"], true, "{reply}");
         assert_eq!(reply["engineStatus"], "account_initialized", "{reply}");
         reply
@@ -2038,6 +2066,17 @@ fn start_paired_workerd(
 }
 
 fn worker_json(url: &str, body: Option<&Value>) -> Value {
+    let reply = worker_request(url, body);
+    assert!(
+        reply.status.success(),
+        "{}: {}",
+        url,
+        String::from_utf8_lossy(&reply.stdout)
+    );
+    serde_json::from_slice(&reply.stdout).unwrap_or(Value::Null)
+}
+
+fn worker_request(url: &str, body: Option<&Value>) -> std::process::Output {
     let mut curl = Command::new("curl");
     curl.args([
         "--silent",
@@ -2056,12 +2095,5 @@ fn worker_json(url: &str, body: Option<&Value>) -> Value {
             &body.to_string(),
         ]);
     }
-    let reply = curl.output().unwrap();
-    assert!(
-        reply.status.success(),
-        "{}: {}",
-        url,
-        String::from_utf8_lossy(&reply.stdout)
-    );
-    serde_json::from_slice(&reply.stdout).unwrap_or(Value::Null)
+    curl.output().unwrap()
 }

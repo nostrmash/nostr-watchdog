@@ -361,6 +361,15 @@ missing=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${wo
 test "$missing" = "401"
 invalid=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${worker_port}/v1/diagnostics/marmot/onboard" -H "authorization: Bearer wrong" -H "content-type: application/json" --data '{"projectId":"smartflowsocial","operationId":"op-1"}')
 test "$invalid" = "401"
+unbound=$(curl -sS --max-time 10 -X POST \
+  -H "authorization: Bearer runtime-operator-token" -H "content-type: application/json" \
+  --data '{"projectId":"smartflowsocial","operationId":"missing-binding-fixture"}' \
+  "http://127.0.0.1:${worker_port}/v1/diagnostics/marmot/onboard")
+python3 - "$unbound" <<'UNBOUND'
+import json, sys
+reply = json.loads(sys.argv[1])
+assert reply["error"] == "marmot_engine_unavailable" and reply["connected"] is False, reply
+UNBOUND
 oversized=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${worker_port}/v1/heartbeats/sfs-worker" -H "content-type: application/json" --data "$(python3 -c 'print("{" + "a"*20000 + "}")')")
 test "$oversized" = "413"
 

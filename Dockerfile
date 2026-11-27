@@ -48,6 +48,7 @@ RUN apt-get update \
     && chown -R watchdog:watchdog /data \
     && chmod 0700 /data /data/marmot
 COPY LICENSE /usr/local/share/nostr-watchdog/LICENSE
+COPY LICENSES/ /usr/local/share/nostr-watchdog/licenses/
 COPY --from=build /src/target/release/nostr-watchdog /usr/local/bin/nostr-watchdog
 COPY --from=build /src/crates/watchdog-marmot/target/release/watchdog-marmot /usr/local/bin/watchdog-marmot
 USER watchdog

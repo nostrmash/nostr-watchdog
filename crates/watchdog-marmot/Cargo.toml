@@ -32,3 +32,9 @@ zeroize = "1"
 base64 = "0.22"
 hex = "0.4"
 nostr = { git = "https://github.com/nostrdevkit/nostr", rev = "4904ffb85f60178375a1dda659a61793f36f03b8", features = ["nip59"] }
+rusqlite = { version = "=0.40.2", default-features = false }
+
+# MDK pins rusqlite 0.40, which requires libsqlite3-sys 0.38. Use the current
+# upstream bindings and patched SQLCipher within this workspace.
+[patch.crates-io]
+libsqlite3-sys = { path = "../watchdog-sqlcipher-compat" }

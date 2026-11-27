@@ -1708,12 +1708,20 @@ dependencies = [
 [[package]]
 name = "libsqlite3-sys"
 version = "0.38.2"
+dependencies = [
+ "libsqlite3-sys 0.40.0",
+]
+
+[[package]]
+name = "libsqlite3-sys"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "b06e69070b7e12262b0cd90832f0a7396f142a2b330181255562decf9f0c6215"
 dependencies = [
  "cc",
  "openssl-sys",
  "pkg-config",
+ "sqlcipher-src",
  "vcpkg",
 ]
 
@@ -2486,7 +2494,7 @@ dependencies = [
  "fallible-iterator",
  "fallible-streaming-iterator",
  "hashlink",
- "libsqlite3-sys",
+ "libsqlite3-sys 0.38.2",
  "smallvec",
 ]
 
@@ -2737,6 +2745,12 @@ dependencies = [
  "base64ct",
  "der",
 ]
+
+[[package]]
+name = "sqlcipher-src"
+version = "420.0.0+sqlcipher-4.20.0-sqlite-3.54.1-libtomcrypt-1.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6b5280ed2593d07b2816ec531821c15c306903bcca224716f1fbcc2bbfedfe"
 
 [[package]]
 name = "stable_deref_trait"

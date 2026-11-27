@@ -49,8 +49,8 @@ jobs:
       - name: Dependency policy
         run: |
           cargo deny --locked check
-          cargo deny --locked --manifest-path crates/watchdog-marmot/Cargo.toml check --config deny.toml
-          cargo deny --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml check --config deny.toml
+          cargo deny --locked --manifest-path crates/watchdog-marmot/Cargo.toml --config deny.toml check
+          cargo deny --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml --config deny.toml check
 
       - name: Known vulnerabilities
         run: |
@@ -230,7 +230,10 @@ jobs:
           cargo install worker-build --version 0.9.0 --locked
 
       - name: Test the Marmot Worker workspace
-        run: cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml --workspace --lib
+        run: |
+          cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml --workspace --lib
+          cargo test --locked --manifest-path crates/watchdog-marmot-worker/Cargo.toml \
+            -p marmot-worker-interop --test two_member
 
       - name: Check the Durable Object for wasm
         run: cargo check --locked --manifest-path crates/watchdog-marmot-worker/worker/Cargo.toml --target wasm32-unknown-unknown

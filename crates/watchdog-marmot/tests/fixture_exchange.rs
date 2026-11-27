@@ -72,6 +72,16 @@ fn endpoints(url: &str) -> Vec<cgka_traits::TransportEndpoint> {
     vec![cgka_traits::TransportEndpoint(url.to_string())]
 }
 
+#[test]
+fn native_mdk_storage_uses_the_patched_cipher() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    let sqlcipher: String = connection
+        .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(sqlcipher.split_whitespace().next(), Some("4.20.0"));
+    assert_eq!(rusqlite::version(), "3.54.1");
+}
+
 fn run_exchange<F: Future<Output = ()> + 'static>(exchange: fn() -> F) {
     const STACK_SIZE: usize = 8 * 1024 * 1024;
     // The MDK future also needs this stack when block_on polls it on the calling thread.
