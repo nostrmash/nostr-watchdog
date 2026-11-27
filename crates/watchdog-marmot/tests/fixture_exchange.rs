@@ -12,15 +12,24 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use base64::Engine;
-use cgka_traits::GroupId;
+use cgka_traits::app_components::{
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, PRIVATE_USE_APP_COMPONENT_ID_START,
+};
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
+use cgka_traits::{GroupId, MemberId, TransportMessage};
 use marmot_app::{
     AccountSetupRequest, AppMessageQuery, CursorPersistence, MarmotApp, MarmotAppConfig,
     MarmotDeployment, PushPlatform, PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION,
 };
-use nostr::event::FinalizeEvent;
+use marmot_worker_interop::OfficialRecipient;
+use nostr::event::{EventId, FinalizeEvent};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr::prelude::{Event, EventBuilder, Keys, Kind, Tag, ToBech32};
-use serde_json::Value;
+use serde_json::{json, Value};
+use transport_nostr_adapter::NostrKeyPackagePublication;
+use transport_nostr_peeler::NostrTransportEvent;
 use zeroize::Zeroizing;
 
 fn exclusive_fixture() -> MutexGuard<'static, ()> {
@@ -689,7 +698,11 @@ fn post_json(url: &str, body: &Value) {
 }
 
 fn gift_wraps(url: &str) -> Vec<(u64, Event)> {
-    let value = get_json(&format!("{}/events?kind=1059", http_base(url)));
+    fixture_events(url, 1059)
+}
+
+fn fixture_events(url: &str, kind: u64) -> Vec<(u64, Event)> {
+    let value = get_json(&format!("{}/events?kind={kind}", http_base(url)));
     value
         .as_array()
         .cloned()
@@ -1405,13 +1418,8 @@ async fn executable_exchange() {
     let db = db_dir.join("watchdog.sqlite");
     let socket = root.join("watchdog.sock");
     let log = db_dir.join("watchdog.log");
-    let mut container = DockerFixture::from_environment(&db_dir);
     let helper_bin = PathBuf::from(env!("CARGO_BIN_EXE_watchdog-marmot"));
-    let watchdog_bin = if container.is_some() {
-        PathBuf::from("/usr/local/bin/nostr-watchdog")
-    } else {
-        watchdog_binary()
-    };
+    let watchdog_bin = watchdog_binary();
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");
     let operator = "fixture-operator-token";
@@ -1435,8 +1443,7 @@ async fn executable_exchange() {
         .expect("recipient import");
     assert_eq!(imported.account.account_id_hex, recipient_hex);
 
-    let mut helper =
-        start_fixture_helper(container.as_ref(), &helper_bin, &root, &socket, &relay.url);
+    let mut helper = start_fixture_helper(None, &helper_bin, &root, &socket, &relay.url);
     wait_health(&root.join("health.sock"));
     let mut group = String::new();
     let mut account = String::new();
@@ -1568,7 +1575,7 @@ async fn executable_exchange() {
     );
     let baseline = max_seq(&relay.url);
     let mut watchdog = start_watchdog(
-        container.as_ref(),
+        None,
         &watchdog_bin,
         &listen,
         &db,
@@ -1582,36 +1589,7 @@ async fn executable_exchange() {
         &log,
     );
     wait_http(&format!("http://{listen}/healthz"));
-    let onboard = Command::new("curl")
-        .args([
-            "--fail-with-body",
-            "-sS",
-            "--max-time",
-            "15",
-            "-H",
-            &format!("authorization: Bearer {operator}"),
-            "-H",
-            "content-type: application/json",
-            "--data",
-            r#"{"projectId":"smartflowsocial","idempotencyKey":"initial:smartflowsocial"}"#,
-            &format!("http://{listen}/v1/diagnostics/marmot/onboard"),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        onboard.status.success(),
-        "watchdog onboarding API rejected the established identity"
-    );
-    let onboard: Value = serde_json::from_slice(&onboard.stdout).unwrap();
-    assert_eq!(onboard["connected"], true, "{onboard}");
-    assert_eq!(onboard["group"], group);
-    assert_eq!(
-        sql_value(
-            &db,
-            "SELECT group_id_hex FROM marmot_projects WHERE project_id = 'smartflowsocial'"
-        ),
-        group,
-    );
+    verify_operator_onboarding(&listen, operator, &db, &group);
 
     let alert = wait_monitor_alert(&db, false).await;
     wait_outbox_settled(&db, &alert).await;
@@ -1690,9 +1668,6 @@ async fn executable_exchange() {
 
     watchdog.stop();
     helper.stop();
-    if let Some(container) = &mut container {
-        container.replace();
-    }
     sql_exec(
         &db,
         &format!(
@@ -1705,10 +1680,10 @@ async fn executable_exchange() {
         &format!("{}/control", http_base(&relay.url)),
         &serde_json::json!({"healthReady": true}),
     );
-    helper = start_fixture_helper(container.as_ref(), &helper_bin, &root, &socket, &relay.url);
+    helper = start_fixture_helper(None, &helper_bin, &root, &socket, &relay.url);
     wait_health(&root.join("health.sock"));
     watchdog = start_watchdog(
-        container.as_ref(),
+        None,
         &watchdog_bin,
         &listen,
         &db,
@@ -1772,13 +1747,6 @@ async fn executable_exchange() {
 
     watchdog.stop();
     helper.stop();
-    if container.is_some() {
-        drop(container);
-        let _ = runtime.shutdown_and_close().await;
-        let _ = std::fs::remove_dir_all(&recipient_root);
-        let _ = std::fs::remove_dir_all(&db_dir);
-        return;
-    }
     let crash_text = "process crash boundary";
     let mut crashing = start_crash_helper(&helper_bin, &root, &socket, &relay.url);
     wait_health(&root.join("health.sock"));
@@ -1897,6 +1865,311 @@ async fn executable_exchange() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&recipient_root);
     let _ = std::fs::remove_dir_all(&db_dir);
+}
+
+#[test]
+#[ignore = "qualifies the packaged executables and persistent data volume"]
+fn image_preserves_an_official_mdk_conversation() {
+    run_exchange(image_exchange);
+}
+
+async fn image_exchange() {
+    let _guard = exclusive_fixture();
+    let relay = start_relay();
+    let base = http_base(&relay.url);
+    let mut features = cgka_engine::FeatureRegistry::new();
+    features.register(
+        Feature("self-remove"),
+        CapabilityRequirement {
+            requires: Capability::Proposal(10),
+            level: RequirementLevel::Required,
+            description: "MIP-03 SelfRemove group departure",
+        },
+    );
+    let recipient = OfficialRecipient::generate()
+        .expect("official SQLite recipient")
+        .with_app_capabilities(
+            features,
+            vec![
+                GROUP_AVATAR_URL_COMPONENT_ID,
+                GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+                GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+            ],
+        );
+    let recipient_hex = recipient.public_key_hex();
+    let package = recipient.fresh_key_package().await.expect("key package");
+    let metadata = cgka_engine::key_package_metadata(&package).unwrap();
+    let identifiers = |values: &[u16]| values.iter().map(|id| format!("0x{id:04x}")).collect();
+    let draft = NostrKeyPackagePublication {
+        client_name: Some("nostr-watchdog".to_string()),
+        account_id: MemberId::new(recipient.keys().public_key().to_bytes().to_vec()),
+        key_package: package,
+        key_package_slot_id: "watchdog-image".to_string(),
+        key_package_ref: metadata.key_package_ref_hex,
+        mls_ciphersuite: format!("0x{:04x}", metadata.ciphersuite),
+        mls_extensions: identifiers(&metadata.mls_extensions),
+        mls_proposals: identifiers(&metadata.mls_proposals),
+        app_components: metadata
+            .app_components
+            .iter()
+            .filter(|id| **id >= PRIVATE_USE_APP_COMPONENT_ID_START)
+            .map(|id| format!("0x{id:04x}"))
+            .collect(),
+        publish_endpoints: endpoints(&relay.url),
+    }
+    .to_event()
+    .unwrap();
+    let tags = draft.tags.into_iter().map(|tag| Tag::parse(tag).unwrap());
+    let key_event = EventBuilder::new(Kind::Custom(draft.kind as u16), draft.content)
+        .tags(tags)
+        .custom_created_at(draft.created_at.into())
+        .finalize(recipient.keys())
+        .unwrap();
+    key_event.verify().unwrap();
+    post_json(&format!("{base}/event"), &json!(key_event));
+
+    for (kind, tag) in [(10002, "r"), (10050, "relay")] {
+        let metadata = EventBuilder::new(Kind::Custom(kind), "")
+            .tag(Tag::custom(tag, [relay.url.clone()]))
+            .finalize(recipient.keys())
+            .unwrap();
+        post_json(&format!("{base}/event"), &json!(metadata));
+    }
+
+    let sender = Keys::generate();
+    let nsec = sender.secret_key().to_bech32().unwrap();
+    let directory = Path::new("/tmp").join(temp_root("image-data").file_name().unwrap());
+    let root = directory.join("marmot");
+    let db = directory.join("watchdog.sqlite");
+    let socket = root.join("watchdog.sock");
+    let log = directory.join("watchdog.log");
+    let helper_bin = PathBuf::from(env!("CARGO_BIN_EXE_watchdog-marmot"));
+    let mut container = DockerFixture::from_environment(&directory);
+    let watchdog_bin = if container.is_some() {
+        PathBuf::from("/usr/local/bin/nostr-watchdog")
+    } else {
+        watchdog_binary()
+    };
+    let listen = format!("127.0.0.1:{}", free_port());
+    let operator = "fixture-operator-token";
+    let mut helper =
+        start_fixture_helper(container.as_ref(), &helper_bin, &root, &socket, &relay.url);
+    wait_health(&root.join("health.sock"));
+    let onboard = || {
+        helper_ipc(
+            &socket,
+            json!({
+                "op": "onboard", "operation_id": "initial:smartflowsocial",
+                "nsec": nsec, "relays": [relay.url], "recipient": recipient_hex, "replace": false
+            }),
+        )
+    };
+    let mut response = onboard();
+    for _ in 0..20 {
+        if response["ok"] == true {
+            break;
+        }
+        assert_eq!(
+            response["error"], "conversation_index_not_ready",
+            "{response}"
+        );
+        let _ = helper_ipc(&socket, json!({"op": "sync"}));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        response = onboard();
+    }
+    assert_eq!(
+        response["account"],
+        sender.public_key().to_hex(),
+        "{response}"
+    );
+    let group = response["group"]
+        .as_str()
+        .expect("helper established a group");
+    let welcome = loopback_welcome(&relay.url, &recipient_hex).await;
+    let joined = recipient
+        .join_welcome(peel_relay_event(&welcome))
+        .await
+        .unwrap();
+    assert_eq!(hex::encode(joined.as_slice()), group);
+    let log_seq = max_seq(&relay.url);
+
+    // Both processes write to the same mounted directory in the image run.
+    let start = |container: Option<&DockerFixture>| {
+        start_watchdog(
+            container,
+            &watchdog_bin,
+            &listen,
+            &db,
+            &root,
+            &socket,
+            &helper_bin,
+            &relay.url,
+            &nsec,
+            &recipient_hex,
+            operator,
+            &log,
+        )
+    };
+    let mut watchdog = start(container.as_ref());
+    wait_http(&format!("http://{listen}/healthz"));
+    verify_operator_onboarding(&listen, operator, &db, group);
+
+    let alert = wait_monitor_alert(&db, false).await;
+    wait_image_message_receipt(&db, &alert).await;
+    let read = |id: &str, column: &str| {
+        sql_value(
+            &db,
+            &format!(
+                "SELECT {column} FROM alert_outbox WHERE id = '{}'",
+                sql_id(id)
+            ),
+        )
+    };
+    let first_id = read(&alert, "message_event_id");
+    let first_text = read(&alert, "payload_text");
+    assert_eq!(journal_ids(&root, &alert), [first_id.clone()]);
+    assert!(!first_text.is_empty());
+    let (first_seq, first) = single_group_event(&relay.url, log_seq, None);
+    assert_eq!(
+        recipient.ingest(peel_relay_event(&first)).await.unwrap(),
+        [first_text]
+    );
+
+    watchdog.stop();
+    helper.stop();
+    if let Some(container) = &mut container {
+        container.replace();
+    }
+    sql_exec(
+        &db,
+        &format!(
+            "UPDATE alert_outbox SET state = 'retrying', settled_at = NULL, next_attempt_at = 0, updated_at = 0 WHERE id = '{}';
+             UPDATE monitor_state SET last_check_at = 0 WHERE monitor_id = 'sfs-web'",
+            sql_id(&alert)
+        ),
+    );
+    post_json(&format!("{base}/control"), &json!({"healthReady": true}));
+    helper = start_fixture_helper(container.as_ref(), &helper_bin, &root, &socket, &relay.url);
+    wait_health(&root.join("health.sock"));
+    watchdog = start(container.as_ref());
+    wait_http(&format!("http://{listen}/healthz"));
+    wait_image_message_receipt(&db, &alert).await;
+    assert_eq!(read(&alert, "message_event_id"), first_id);
+    assert_eq!(journal_ids(&root, &alert), [first_id]);
+
+    let recovery = wait_monitor_alert(&db, true).await;
+    wait_image_message_receipt(&db, &recovery).await;
+    let recovery_text = read(&recovery, "payload_text");
+    let (_, recovered) = single_group_event(&relay.url, first_seq, Some(first.id));
+    assert_eq!(
+        recipient
+            .ingest(peel_relay_event(&recovered))
+            .await
+            .unwrap(),
+        [recovery_text]
+    );
+    assert_ne!(recovered.id, first.id);
+    assert_eq!(
+        fixture_events(&relay.url, 445)
+            .iter()
+            .filter(|(_, event)| event.id == first.id)
+            .count(),
+        1
+    );
+
+    watchdog.stop();
+    helper.stop();
+    drop(container);
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+async fn wait_image_message_receipt(db: &Path, id: &str) {
+    // This recipient has no notification registration. Wait for the fenced
+    // application-message receipt independently of the push retry state.
+    let sql = format!(
+        "SELECT message_event_id FROM alert_outbox
+         WHERE id = '{}' AND message_state = 'relay_accepted' AND updated_at > 0
+           AND claim_token IS NULL",
+        sql_id(id)
+    );
+    for _ in 0..240 {
+        if !sql_value(db, &sql).is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("the image did not record the application-message receipt");
+}
+
+async fn loopback_welcome(relay: &str, recipient: &str) -> Event {
+    for _ in 0..30 {
+        if let Some((_, event)) = gift_wraps(relay)
+            .into_iter()
+            .find(|(_, event)| p_tag(event) == recipient)
+        {
+            event.verify().unwrap();
+            return event;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    panic!("no Welcome for the official recipient on the isolated relay");
+}
+
+fn single_group_event(relay: &str, after: u64, already_decrypted: Option<EventId>) -> (u64, Event) {
+    let mut events = fixture_events(relay, 445)
+        .into_iter()
+        .filter(|(seq, event)| *seq > after && Some(event.id) != already_decrypted);
+    let (seq, event) = events
+        .next()
+        .expect("accepted group event on the fixture relay");
+    assert!(
+        events.next().is_none(),
+        "a second group event was encrypted"
+    );
+    event.verify().unwrap();
+    (seq, event)
+}
+
+fn peel_relay_event(event: &Event) -> TransportMessage {
+    serde_json::from_value::<NostrTransportEvent>(json!(event))
+        .unwrap()
+        .to_transport_message()
+        .unwrap()
+}
+
+fn verify_operator_onboarding(listen: &str, operator: &str, db: &Path, group: &str) {
+    let onboard = Command::new("curl")
+        .args([
+            "--fail-with-body",
+            "-sS",
+            "--max-time",
+            "15",
+            "-H",
+            &format!("authorization: Bearer {operator}"),
+            "-H",
+            "content-type: application/json",
+            "--data",
+            r#"{"projectId":"smartflowsocial","idempotencyKey":"initial:smartflowsocial"}"#,
+            &format!("http://{listen}/v1/diagnostics/marmot/onboard"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        onboard.status.success(),
+        "watchdog onboarding API rejected the established identity"
+    );
+    let onboard: Value = serde_json::from_slice(&onboard.stdout).unwrap();
+    assert_eq!(onboard["connected"], true, "{onboard}");
+    assert_eq!(onboard["group"], group);
+    assert_eq!(
+        sql_value(
+            db,
+            "SELECT group_id_hex FROM marmot_projects WHERE project_id = 'smartflowsocial'"
+        ),
+        group,
+    );
 }
 
 async fn receive_packaged_alert(
@@ -2128,7 +2401,7 @@ fn spawn_helper(
         .arg(relay)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("helper");
     OwnedProc(child)

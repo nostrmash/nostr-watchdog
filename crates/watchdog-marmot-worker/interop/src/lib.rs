@@ -25,6 +25,8 @@ pub struct OfficialRecipient {
     storage: SqliteAccountStorage,
     keys: Keys,
     proof: Arc<ProofSigner>,
+    extra_components: Vec<u16>,
+    features: FeatureRegistry,
 }
 
 impl OfficialRecipient {
@@ -42,10 +44,22 @@ impl OfficialRecipient {
                         .map_err(|error| error.to_string())?,
                     keys,
                     proof: Arc::new(proof),
+                    extra_components: Vec::new(),
+                    features: FeatureRegistry::new(),
                 });
             }
         }
         Err("could not derive a Nostr identity".into())
+    }
+
+    pub fn with_app_capabilities(
+        mut self,
+        features: FeatureRegistry,
+        extra_components: Vec<u16>,
+    ) -> Self {
+        self.features = features;
+        self.extra_components = extra_components;
+        self
     }
 
     pub fn storage(&self) -> &SqliteAccountStorage {
@@ -176,10 +190,11 @@ impl OfficialRecipient {
         let mut engine = EngineBuilder::new(self.storage.clone())
             .identity(self.keys.public_key().to_bytes().to_vec())
             .account_identity_proof_signer(self.proof.clone())
-            .feature_registry(FeatureRegistry::new())
+            .feature_registry(self.features.clone())
             .supported_app_components({
                 let mut components = default_group_components();
                 components.insert(NOSTR_ROUTING_COMPONENT_ID);
+                components.extend(self.extra_components.iter().copied());
                 components
             })
             .protocol_profile(ProtocolProfile::Current)

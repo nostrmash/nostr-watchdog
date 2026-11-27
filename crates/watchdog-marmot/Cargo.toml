@@ -30,9 +30,13 @@ zeroize = "1"
 
 [dev-dependencies]
 base64 = "0.22"
+cgka-engine = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182" }
 hex = "0.4"
+marmot-worker-interop = { path = "../watchdog-marmot-worker/interop" }
 nostr = { git = "https://github.com/nostrdevkit/nostr", rev = "4904ffb85f60178375a1dda659a61793f36f03b8", features = ["nip59"] }
 rusqlite = { version = "=0.40.2", default-features = false }
+transport-nostr-adapter = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182" }
+transport-nostr-peeler = { git = "https://github.com/marmot-protocol/mdk", rev = "ca52a04718628f08ed76b777df9c444594074182" }
 
 # MDK pins rusqlite 0.40, which requires libsqlite3-sys 0.38. Use the current
 # upstream bindings and patched SQLCipher within this workspace.

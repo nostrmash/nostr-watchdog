@@ -1,4 +1,5 @@
 [package]
+workspace = ".."
 name = "marmot-worker-interop"
 version = "0.1.0"
 description = "Official SQLite MDK recipient used to test the Cloudflare storage provider."

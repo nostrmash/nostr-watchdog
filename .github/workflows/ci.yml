@@ -136,7 +136,7 @@ jobs:
           trap 'docker rm "$driver"' EXIT
           docker cp "$driver:/out/fixture_exchange" /tmp/watchdog-image-fixture
           WATCHDOG_TEST_IMAGE=nostr-watchdog:ci WATCHDOG_TEST_REPO_ROOT="$PWD" \
-            /tmp/watchdog-image-fixture packaged_binaries_deliver_monitor_incident_reconcile_and_send_recovery --exact --nocapture
+            /tmp/watchdog-image-fixture image_preserves_an_official_mdk_conversation --ignored --exact --nocapture
 
   workerd:
     runs-on: ubuntu-latest
@@ -199,10 +199,10 @@ jobs:
 
       - name: Native executable incident, restart, and independent recipient
         run: |
-          cargo build --locked -p watchdog-native
-          export WATCHDOG_TEST_BINARY="$PWD/target/debug/nostr-watchdog"
-          cargo test --locked --manifest-path crates/watchdog-marmot/Cargo.toml --test fixture_exchange -- --test-threads=1
-          cargo test --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
+          cargo build --release --locked -p watchdog-native
+          export WATCHDOG_TEST_BINARY="$PWD/target/release/nostr-watchdog"
+          cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml --test fixture_exchange -- --test-threads=1
+          cargo test --release --locked --manifest-path crates/watchdog-marmot/Cargo.toml \
             --test fixture_exchange whitenoise_script_onboards_and_reuses_the_conversation -- --ignored --exact
 
   cloudflare-marmot:
