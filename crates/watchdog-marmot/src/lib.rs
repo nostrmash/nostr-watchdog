@@ -11,9 +11,12 @@
 //! projection is refreshed from MDK on every retry. It is not a terminal result.
 //! `operations.log` is a write-ahead log. Per-alert files keep every operation id.
 
+mod egress;
 mod journal;
 mod push_trace;
 mod relays;
+
+pub use egress::install_egress;
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -59,6 +62,7 @@ pub struct Session {
 }
 
 pub fn open(root: &Path, relays: &[String], allow_loopback: bool) -> Result<Session, String> {
+    install_egress(allow_loopback)?;
     push_trace::install();
     relays::validate_configured_relays(relays, allow_loopback)?;
     fs::create_dir_all(root).map_err(|error| format!("marmot_root: {error}"))?;
@@ -629,8 +633,10 @@ impl Session {
             .filter(|(_, devices)| *devices > 0)
             .map(|(id, _)| id)
             .collect();
-        // This read is not held across submit_text. A later membership change
-        // can still land. A failed or unusable roster refuses the send.
+        // This read is not held across submit_text. MDK has no API that admits
+        // the kind-9 message and the current member set in one transaction.
+        // A failed or unusable roster refuses the send. A roster that passes
+        // can still change before the worker encrypts.
         authorize_group_members(&ids, account, recipient)?;
         match self.lookup_direct(account, recipient).await? {
             (ConversationLookup::Reusable, Some(found))
@@ -803,15 +809,20 @@ impl Session {
                 .and_then(Value::as_str)
                 .map(transport_evidence)
                 .unwrap_or("not_observed");
-            let retry_after_ms = if decision.hold {
-                json!(decision.delay_ms)
-            } else {
-                Value::Null
-            };
-            let admitted = matches!(
-                message.as_str(),
-                "relay_accepted" | "accepted_pending" | "rejected"
-            );
+            let project = object
+                .get("project")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let operation_id = object
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let message_event_id = object
+                .get("message_event_id")
+                .cloned()
+                .unwrap_or(Value::Null);
             let detail = object
                 .get("status_detail")
                 .and_then(Value::as_str)
@@ -821,49 +832,23 @@ impl Session {
                         && value
                             .chars()
                             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-                });
-            object.insert(
-                "operation".to_string(),
-                json!({
-                    "projectId": object.get("project").and_then(Value::as_str).unwrap_or(""),
-                    "operationId": object.get("operation_id").and_then(Value::as_str).unwrap_or(""),
-                    "messageState": message,
-                    "messageEventId": object.get("message_event_id").cloned().unwrap_or(Value::Null),
-                    "pushState": decision.push_phase,
-                    "pushEventId": Value::Null,
-                    "evidence": evidence,
-                    "error": detail,
-                    "disposition": if decision.hold { "reconcile" } else { "settled" },
-                    "retryAtMs": retry_after_ms.clone(),
-                    "retryAfterMs": retry_after_ms,
-                    "phoneDelivery": false,
-                    "startedAtMs": attempts.started_at_ms,
-                    "updatedAtMs": updated_at_ms,
-                    "messageSubmissions": if admitted { json!(1) } else { Value::Null },
-                    "messagePublications": Value::Null,
-                    "messageReconciles": if message == "accepted_pending" {
-                        json!(attempts.message)
-                    } else {
-                        Value::Null
-                    },
-                    "ambiguousReconciles": if matches!(message.as_str(), "completion_unknown" | "prepared") {
-                        json!(attempts.unknown)
-                    } else {
-                        Value::Null
-                    },
-                    "tokenWaits": if decision.push_phase == "token_unavailable" {
-                        json!(attempts.token_wait)
-                    } else {
-                        Value::Null
-                    },
-                    "pushPublications": Value::Null,
-                    "pushReconciles": if decision.push_phase == "unobservable" {
-                        json!(attempts.unobservable)
-                    } else {
-                        Value::Null
-                    }
-                }),
+                })
+                .map(str::to_string);
+            let contract = operation_contract(
+                &project,
+                &operation_id,
+                &message,
+                message_event_id,
+                decision.push_phase,
+                evidence,
+                detail.as_deref(),
+                decision.hold,
+                decision.delay_ms,
+                attempts.started_at_ms,
+                updated_at_ms,
+                attempts,
             );
+            object.insert("operation".to_string(), contract);
         }
         Ok(value)
     }
@@ -1296,6 +1281,63 @@ enum ConversationState {
     Established(String),
 }
 
+fn operation_contract(
+    project: &str,
+    operation_id: &str,
+    message: &str,
+    message_event_id: Value,
+    push_phase: &str,
+    evidence: &str,
+    error: Option<&str>,
+    hold: bool,
+    delay_ms: i64,
+    started_at_ms: i64,
+    updated_at_ms: i64,
+    attempts: PhaseAttempts,
+) -> Value {
+    let retry_after_ms = if hold { json!(delay_ms) } else { Value::Null };
+    let admitted = matches!(message, "relay_accepted" | "accepted_pending" | "rejected");
+    json!({
+        "projectId": project,
+        "operationId": operation_id,
+        "messageState": message,
+        "messageEventId": message_event_id,
+        "pushState": push_phase,
+        "pushEventId": Value::Null,
+        "evidence": evidence,
+        "error": error,
+        "disposition": if hold { "reconcile" } else { "settled" },
+        "retryAtMs": retry_after_ms.clone(),
+        "retryAfterMs": retry_after_ms,
+        "phoneDelivery": false,
+        "startedAtMs": started_at_ms,
+        "updatedAtMs": updated_at_ms,
+        "messageSubmissions": if admitted { json!(1) } else { Value::Null },
+        "messagePublications": Value::Null,
+        "messageReconciles": if message == "accepted_pending" {
+            json!(attempts.message)
+        } else {
+            Value::Null
+        },
+        "ambiguousReconciles": if matches!(message, "completion_unknown" | "prepared") {
+            json!(attempts.unknown)
+        } else {
+            Value::Null
+        },
+        "tokenWaits": if push_phase == "token_unavailable" {
+            json!(attempts.token_wait)
+        } else {
+            Value::Null
+        },
+        "pushPublications": Value::Null,
+        "pushReconciles": if push_phase == "unobservable" {
+            json!(attempts.unobservable)
+        } else {
+            Value::Null
+        }
+    })
+}
+
 fn upstream_of(status: Option<&LocalSendStatus>) -> UpstreamSend {
     match status {
         None => UpstreamSend::Absent,
@@ -1660,6 +1702,30 @@ mod admission_tests {
         assert_eq!(classify_submit_error(&panicked), SubmitFailure::Ambiguous);
         assert_eq!(classify_submit_error(&disk), SubmitFailure::Ambiguous);
         assert_eq!(
+            classify_submit_error(&AppError::GroupRemoved("member left".into())),
+            SubmitFailure::ProvenNonAdmission
+        );
+        assert_eq!(
+            classify_submit_error(&AppError::UnknownGroup("missing".into())),
+            SubmitFailure::ProvenNonAdmission
+        );
+        assert_eq!(
+            classify_submit_error(&AppError::Publish("relay timeout".into())),
+            SubmitFailure::Ambiguous
+        );
+        assert_eq!(
+            classify_submit_error(&AppError::TransportClosed),
+            SubmitFailure::Ambiguous
+        );
+        assert_eq!(
+            failed_submit_decision(SubmitFailure::ProvenNonAdmission, None),
+            FailedSubmit::KeepUnknown
+        );
+        assert_eq!(
+            failed_submit_decision(SubmitFailure::Ambiguous, Some(false)),
+            FailedSubmit::KeepUnknown
+        );
+        assert_eq!(
             failed_submit_decision(SubmitFailure::ProvenNonAdmission, Some(false)),
             FailedSubmit::Resubmit
         );
@@ -1744,5 +1810,181 @@ mod admission_tests {
             !journal_identity_matches(&legacy, "smartflowsocial", "aa", "cc", "bb", "payload"),
             "a legacy row was bound to a newly configured recipient"
         );
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::operation_contract;
+    use serde_json::{json, Value};
+    use watchdog_core::marmot_recovery::{advance_phase, PhaseAttempts};
+
+    const NOW: i64 = 1_700_000_000_000;
+    const EVENT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn view(
+        message: &str,
+        event: Option<&str>,
+        push: &str,
+        evidence: &str,
+        attempts: PhaseAttempts,
+        hold: bool,
+        delay_ms: i64,
+    ) -> Value {
+        operation_contract(
+            "smartflowsocial",
+            "alert-1",
+            message,
+            event.map(|value| json!(value)).unwrap_or(Value::Null),
+            push,
+            evidence,
+            None,
+            hold,
+            delay_ms,
+            attempts.started_at_ms,
+            NOW,
+            attempts,
+        )
+    }
+
+    fn fixtures() -> Value {
+        let (unobservable, unobservable_decision) = advance_phase(
+            "relay_accepted",
+            "unobservable",
+            PhaseAttempts::default(),
+            NOW,
+        );
+        let (pending, pending_decision) = advance_phase(
+            "accepted_pending",
+            "not_attempted",
+            PhaseAttempts::default(),
+            NOW,
+        );
+        let (unknown, unknown_decision) = advance_phase(
+            "completion_unknown",
+            "not_attempted",
+            PhaseAttempts::default(),
+            NOW,
+        );
+        let (waiting, waiting_decision) = advance_phase(
+            "relay_accepted",
+            "token_unavailable",
+            PhaseAttempts::default(),
+            NOW,
+        );
+        let (settled_wait, settled_decision) =
+            advance_phase("relay_accepted", "token_unavailable", waiting, NOW);
+        json!({
+            "permanentUnobservablePush": view(
+                "relay_accepted",
+                Some(EVENT),
+                unobservable_decision.push_phase,
+                "not_observed",
+                unobservable,
+                unobservable_decision.hold,
+                unobservable_decision.delay_ms,
+            ),
+            "messagePublicationUncertain": view(
+                "accepted_pending",
+                None,
+                pending_decision.push_phase,
+                "not_observed",
+                pending,
+                pending_decision.hold,
+                pending_decision.delay_ms,
+            ),
+            "completionUnknown": view(
+                "completion_unknown",
+                None,
+                unknown_decision.push_phase,
+                "not_observed",
+                unknown,
+                unknown_decision.hold,
+                unknown_decision.delay_ms,
+            ),
+            "missingRecipientToken": view(
+                "relay_accepted",
+                Some(EVENT),
+                waiting_decision.push_phase,
+                "token_availability_only",
+                waiting,
+                waiting_decision.hold,
+                waiting_decision.delay_ms,
+            ),
+            "missingRecipientTokenSettled": view(
+                "relay_accepted",
+                Some(EVENT),
+                settled_decision.push_phase,
+                "token_availability_only",
+                settled_wait,
+                settled_decision.hold,
+                settled_decision.delay_ms,
+            )
+        })
+    }
+
+    #[test]
+    fn native_operation_fixtures_match_the_helper() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/native-operation-fixtures.json");
+        let file: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture file")).unwrap();
+        let built = fixtures();
+        assert_eq!(file, built);
+        for value in built.as_object().unwrap().values() {
+            assert_eq!(value["projectId"], "smartflowsocial");
+            assert_eq!(value["operationId"], "alert-1");
+            assert!(value["messagePublications"].is_null());
+            assert!(value["pushPublications"].is_null());
+            assert!(value.get("messageAttempts").is_none());
+            assert!(value["pushEventId"].is_null());
+            assert_eq!(value["phoneDelivery"], false);
+        }
+        assert_eq!(built["permanentUnobservablePush"]["disposition"], "settled");
+        assert_eq!(
+            built["permanentUnobservablePush"]["messageState"],
+            "relay_accepted"
+        );
+        assert_eq!(
+            built["permanentUnobservablePush"]["pushState"],
+            "unobservable"
+        );
+        assert_eq!(built["permanentUnobservablePush"]["messageSubmissions"], 1);
+        assert!(built["permanentUnobservablePush"]["messageReconciles"].is_null());
+        assert_eq!(built["permanentUnobservablePush"]["pushReconciles"], 1);
+        assert!(built["permanentUnobservablePush"]["retryAfterMs"].is_null());
+        assert_eq!(
+            built["messagePublicationUncertain"]["disposition"],
+            "reconcile"
+        );
+        assert_eq!(
+            built["messagePublicationUncertain"]["messageState"],
+            "accepted_pending"
+        );
+        assert_eq!(
+            built["messagePublicationUncertain"]["messageSubmissions"],
+            1
+        );
+        assert_eq!(built["messagePublicationUncertain"]["messageReconciles"], 1);
+        assert_eq!(built["messagePublicationUncertain"]["retryAfterMs"], 15000);
+        assert!(built["completionUnknown"]["messageSubmissions"].is_null());
+        assert_eq!(built["completionUnknown"]["ambiguousReconciles"], 1);
+        assert_eq!(built["completionUnknown"]["disposition"], "reconcile");
+        assert_eq!(
+            built["missingRecipientToken"]["messageState"],
+            "relay_accepted"
+        );
+        assert_eq!(built["missingRecipientToken"]["disposition"], "reconcile");
+        assert_eq!(built["missingRecipientToken"]["tokenWaits"], 1);
+        assert_eq!(
+            built["missingRecipientTokenSettled"]["disposition"],
+            "settled"
+        );
+        assert_eq!(
+            built["missingRecipientTokenSettled"]["messageState"],
+            "relay_accepted"
+        );
+        assert_eq!(built["missingRecipientTokenSettled"]["tokenWaits"], 2);
+        assert!(built["missingRecipientTokenSettled"]["retryAfterMs"].is_null());
     }
 }

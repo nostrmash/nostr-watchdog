@@ -579,6 +579,46 @@ mod tests {
     }
 
     #[test]
+    fn reonboard_and_a_late_upstream_row_do_not_authorize_another_encryption() {
+        assert_eq!(
+            reconcile_send(Some(StoredSend::Published), false, UpstreamSend::Absent),
+            SendStep::IdentityMismatch
+        );
+        assert_eq!(
+            reconcile_send(Some(StoredSend::Published), false, UpstreamSend::Published),
+            SendStep::IdentityMismatch
+        );
+        assert_eq!(
+            reconcile_send(
+                Some(StoredSend::Submitting),
+                true,
+                UpstreamSend::EngineOwned
+            ),
+            SendStep::ProjectUpstream
+        );
+        assert_ne!(
+            reconcile_send(
+                Some(StoredSend::CompletionUnknown),
+                true,
+                UpstreamSend::Absent
+            ),
+            SendStep::Submit
+        );
+        assert!(!dead_letter_may_resubmit(Some(StoredSend::Published)));
+        assert_eq!(
+            bind_identity(
+                Some("aa"),
+                Some("bb"),
+                Some("cc"),
+                Some("group"),
+                "dd",
+                true
+            ),
+            IdentityStep::ExplicitOnboard
+        );
+    }
+
+    #[test]
     fn a_missing_status_stays_unknown_until_the_same_operation_becomes_visible() {
         assert_eq!(
             reconcile_send(

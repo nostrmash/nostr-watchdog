@@ -144,13 +144,19 @@ Safe re-onboarding for Agent C:
 
 `outbox-boundary/operations.log` is a write-ahead log of updates since the last checkpoint. Each line is fsynced with its directory before the per-id file is replaced. On open, a torn final line — incomplete JSON or incomplete UTF-8 after the last newline — is truncated to that newline, and the file and directory are synced, before another append is allowed. A complete line that is not valid UTF-8 or JSON is `boundary_corrupt` and is not discarded. A symlink at the journal directory or the log is `boundary_symlink`.
 
-Checkpoint runs when the log exceeds 64 KiB, or when superseded lines are at least eight and more than twice the number of operation ids. It writes any missing per-id file, then atomically replaces the log with an empty file. It does not copy historical ids back into the log, so the next operation is one append. A crash after the empty temporary file is synced and before the rename leaves the previous log in place.
+A commit does five steps in order. It appends and syncs the WAL line. It atomically replaces and syncs the per-id file. It updates the in-memory map. It checkpoints only from that updated map, and only when the log exceeds 64 KiB or superseded lines are at least eight and more than twice the number of operation ids. It replaces the log with an empty file only after those per-id files match the map. Checkpointing does not copy historical ids back into the log.
+
+An earlier order checkpointed before the memory update. `materialize_files` then wrote the previous record over the new per-id file and deleted the WAL that held the new record. An update of an existing operation could be reverted. That sequence is gone.
+
+A checkpoint error after the per-id file is durable is not evidence that the operation never existed. The helper reloads the directory. If the reload shows the record, the journal stays usable and a later send sees it. If the reload fails, or the reloaded record is not the one just written, the journal is poisoned and later sends return `boundary_durable_failure` instead of calling `submit_text`. A failed WAL append does not leave the new record in memory. An unpersisted intent does not authorize encryption.
 
 `released` means MDK returned a pre-admission validation error and `local_send_status` was empty. The id stays, with its project, sender, recipient, group, operation type, and payload hash. The same identity may be submitted again only in that case. Any other `submit_text` error, including a timeout, a storage error, a panicked admission task, or an empty status after a successful return, stays `completion_unknown` and is not encrypted again. When a later `local_send_status` appears, the same operation id is projected. A different recipient, sender, group, or payload returns `alert_identity_mismatch`.
 
-A journal write updates memory only after the log line and the per-id file are synced. If that write fails, the helper reloads the directory before it returns. If the reload fails, the journal is poisoned and later sends return `boundary_durable_failure` instead of calling `submit_text`. A symlink is `boundary_symlink`. A directory owned by another user is `boundary_owner`.
+A symlink is `boundary_symlink`. A directory owned by another user is `boundary_owner`.
 
-Checkpoint still reads the per-id files. That is acceptable at the current volume. A local run of 1,500 operations took about 21 seconds, almost all of it `fsync`, left `operations.log` at 42,120 bytes, and reopened in 95 milliseconds. An ordinary write does not copy those historical records back into the log.
+Checkpoint still reads the per-id files. That is acceptable at the current volume. A local run of 1,500 operations took 20,018 ms, almost all of it `fsync`, left `operations.log` at 42,120 bytes, and reopened in 83 ms. An ordinary write does not copy those historical records back into the log.
+
+Regression coverage for an update that crosses the checkpoint threshold: a pending operation becomes published and the published message id survives restart; a released operation becomes submitting and keeps its recipient and payload hash; an injected failure after the WAL append, after the per-id replacement, and before WAL truncation each leaves the published record; a process exit at those same three boundaries leaves the published record after reopen; a torn tail is still truncated before the next append. The published record keeps its message id, so the reverted-to-pending state that would allow another encryption does not occur.
 
 Manual retry of a completed cryptographic operation returns the stored record. A dead-letter reset of the scheduler counter does not authorize `SendStep::Submit` while a journal or MDK record exists.
 
@@ -197,7 +203,9 @@ Until those routes exist, `scripts/whitenoise-acceptance.sh` starts the helper i
 
 Startup takes `helper.lock` before removing a socket. A socket is removed only when that lock is free and the socket is not accepting. Command handling is one request at a time, with a 64 KiB line limit. Health responses are capped at four concurrent connections and do not enter the command path. The helper sets umask `077`. Production spawn uses `env_clear` and does not pass `--allow-loopback`.
 
-Configured relays are checked, including one DNS lookup, before MDK opens. MDK resolves names again and accepts domains without a lookup. That includes discovered group relays, key-package relays, notification-server hints, and inbox relays. This helper does not constrain those later connections and does not claim DNS-rebinding protection for them. Loopback is allowed only for the fixture flag.
+Before MDK builds a client, the helper binds `127.0.0.1` on an ephemeral port, points `WN_SOCKS5_PROXY` at it, and clears `WN_SOCKS5_USERNAME` and `WN_SOCKS5_PASSWORD`. Pinned MDK sends every nostr-sdk relay connection through that proxy and does not fall back to a direct dial. The filter resolves the target, refuses the connection when any answer is private, loopback, link-local, multicast, or a metadata name (`.local`, `.internal`, `.home.arpa`, `metadata.google.internal`), and opens TCP only to an address that passed. A later DNS change cannot move that connection. Bootstrap, group, key-package, inbox, and notification-server relay hints share this client, so they share the filter. `--allow-loopback` allows loopback targets only, for the fixture. It does not allow RFC1918 or link-local addresses. Production spawn does not pass that flag.
+
+The DNS lookup in `relays.rs` is a preflight for the operator's configured URLs. It is not the pin. This is not an application firewall and it is not a `pf` rule. The enforced boundary is the SOCKS filter MDK already consults.
 
 `stop` in the acceptance script signals a pid only when `ps` reports `nostr-watchdog` or `watchdog-marmot` and `lsof` shows that process listening on the configured acceptance port or holding a socket under the acceptance state directory. A stale pid file is removed without a signal. If `lsof` is missing, the script does not signal. The default listen address is `127.0.0.1:8791`. Set `WATCHDOG_ACCEPTANCE_ADDR` when that port is taken. The script generates its own sender, operator token, database, and MDK directory. It does not read `WATCHDOG_CONFIG`, Telegram credentials, or a production sender secret.
 
@@ -211,11 +219,15 @@ Do not add a second push publisher. If a shared encoder is extracted, it has to 
 
 `decrypt_push_token_for_test` and owner-proof verification are `pub(crate)`. The fixture unwraps the kind-1059 gift with the temporary server key and checks the kind-446 rumor against this revision. It does not decrypt the token and it does not prove APNs or FCM delivery.
 
-Membership is checked with fresh `group_members` immediately before `submit_text`. A failed roster query refuses the send. Official MDK at this revision does not expose a guarded text send that holds membership across admission. `submit_custom_event_to_members` checks a member list later, and it is not the kind-9 path this helper uses. `submit_text` does not return `RefusedNewMembers`. A member can be removed, or a stale group can change, after the check returns and before the worker encrypts. That race is still open. After admission, the local-send status stays the publication record. A historical operation stays bound to its stored recipient and group and is not rerouted. A missing or replaced account or device store fails closed. An ambiguous onboarding operation does not create a second conversation. Extra devices of an authorized account are allowed by the membership rule. `active_recipient_tokens` counts two active leaves of the authorized recipient. This fixture does not pair a second live device. Out-of-order token records are not reordered by this helper.
+Membership is checked with fresh `group_members` immediately before `submit_text`. A failed or empty roster refuses the send. A roster that passes is not held across admission. Official MDK at this revision has no API that checks the member set and admits the kind-9 message in one transaction. `submit_custom_event_to_members` checks a member list later, and it is not the kind-9 path this helper uses. `submit_text` does not return `RefusedNewMembers`.
 
-`RelaySafetyPolicy` already drops discovered group, inbox, key-package, and notification endpoints that are private literals, localhost, or plaintext public URLs. Production does not pass `--allow-loopback`. The same policy accepts a `wss` domain without resolving it. nostr-sdk resolves that name when it dials. MDK's own dial-safety note calls this an accepted residual. There is no public connector in this revision that replaces that resolver. A one-time DNS lookup in this helper is not protection.
+The remaining race is the interval after `group_members` returns and before the worker encrypts. A recipient can be removed, or another account can be added, in that interval. The ciphertext can then include a member the pre-send check did not see, or omit a recipient the check required. This matters for any deployment where membership can change while an alert is being submitted. A single sender and one recipient, with no concurrent MLS commit, is the restricted case this helper can actually enforce. A group that accepts invites or removals during send is outside that case.
 
-Native deployment is blocked until the host prevents `watchdog-marmot` from opening WebSockets except to the configured relay allowlist. On a Mac that is an application firewall or a `pf` rule scoped to that binary. Without it, a discovered relay name can be rebound to a private address after the URL check.
+The smallest upstream change that would remove the race is one public function that, in the same storage transaction as `insert_local_submission`, reads the current member set and returns a pre-admission error when the sender or recipient is absent or an unexpected account is present, and then encrypts from that same member set. A later read is not enough. This branch does not fork MDK to invent that function, and the pre-send query is not atomic authorization.
+
+After admission, the local-send status stays the publication record. A historical operation stays bound to its stored recipient and group and is not rerouted when onboarding is repeated. A missing or replaced account or device store fails closed. An ambiguous onboarding operation does not create a second conversation. Extra devices of an authorized account are allowed. `active_recipient_tokens` counts two active leaves of the authorized recipient. This fixture does not pair a second live device. Out-of-order token records are not reordered by this helper. A unit test shows that a later roster which drops the recipient returns `recipient_absent` and does not keep the earlier allowance. That test is not a live competing MLS commit.
+
+`RelaySafetyPolicy` still drops discovered private literals, localhost, and plaintext public URLs before the dial. It accepts a `wss` domain without resolving it. The SOCKS filter above is what checks the address MDK actually connects to. MDK's dial-safety note still calls unresolved domains an accepted residual inside nostr-sdk. This helper does not rely on that residual for the connection.
 
 A physical locked-screen notification on the WhiteNoise relays has not been observed. Relay acceptance of the group message, gift-wrap acceptance, and a notification on the phone are three different results.
 
@@ -223,14 +235,20 @@ A physical locked-screen notification on the WhiteNoise relays has not been obse
 
 This branch does not edit Agent C's store, scheduler, or `DeliveryOutcome`. The native adapter in `crates/watchdog-native/src/marmot.rs` still maps the flat helper fields onto the current `DeliveryOutcome`. That struct has no counter or retry-delay field, so the engine's own fallback delay is what the scheduler sees until the integration branch reads the helper JSON.
 
+Exact fixtures are in `docs/native-operation-fixtures.json`. The helper test `native_operation_fixtures_match_the_helper` builds those objects from `advance_phase` and `operation_contract`. `projectId` and `operationId` are required. Reject a response whose `projectId` is not the claimed project or whose `operationId` is not the claimed alert id. An empty id is invalid. Do not open a new submission to repair a mismatch.
+
+`feat/rust-integration` at `84b2640a583d7d1224d160561452af57c7b8c6d0` still maps flat `message_attempts` onto `message_submissions` and does not read `messageSubmissions`, `messageReconciles`, `ambiguousReconciles`, `tokenWaits`, `pushPublications`, or `pushReconciles`. That mapping is not this contract. Copy the nested fields. Leave null as null. `message_attempts` counts `accepted_pending` reconciliations. It is not a submission count.
+
+`retryAfterMs` and `retryAtMs` are the same relative delay, or null when settled. `operation_from_transport` already keeps a value in 1–300000 ms and ignores a Unix timestamp. Pass that relative value to the scheduler. The scheduler adds it to now when it arms the timer, clamped to 15 seconds through 5 minutes. Do not add now before the parser.
+
 On `feat/rust-integration`, copy from the helper `send` response's `operation` object:
 
 - `operationId` stays the alert id. Marmot dead-letter mode stays `Reconcile`.
 - `messageState` and `pushState` through the existing parsers.
 - `messageEventId`. Leave `pushEventId` null.
-- `disposition` `settled` or `reconcile`.
-- `retryAfterMs` as a relative delay: `now + retryAfterMs`, clamped to 15 seconds through 5 minutes. `retryAtMs` is the same relative value.
-- `messageSubmissions`, `messagePublications`, `messageReconciles`, `ambiguousReconciles`, `tokenWaits`, `pushPublications`, and `pushReconciles` onto the nullable `auth_*` columns. Copy null as null. Do not map the flat `message_attempts` field onto `auth_message_submissions`.
+- `disposition` `settled` or `reconcile`. A settled `unobservable` push is permanent for this MDK revision and stops polling. `accepted_pending` and `completion_unknown` stay `reconcile`. `relay_accepted` stays `relay_accepted` while push is `token_unavailable` or `unobservable`.
+- `messageSubmissions` is `1` once MDK has admitted the message, and null while admission is unknown. `messagePublications` and `pushPublications` stay null.
+- `messageReconciles` is the `accepted_pending` count. `ambiguousReconciles` is the `completion_unknown` or `prepared` count. `tokenWaits` is the missing-token count and stops at 2. `pushReconciles` is the unobservable observation count.
 - `startedAtMs` into `operation_started_at` once. Do not move it on later responses. `updatedAtMs` is not an age.
 
 `onboard` request: `operation_id`, `nsec`, `relays`, `recipient`, `replace`. `onboard_status` returns `phase` `absent`, `importing`, `intending`, or `established`. `readiness` returns `identity.step`, `recipient_devices`, and `active_recipient_tokens`, and no token bytes. `MARMOT_REONBOARD=<project>` remains `reonboard:<project>` with `replace: true`.
@@ -247,4 +265,64 @@ cargo test --manifest-path crates/watchdog-marmot/Cargo.toml --offline --lib
 cargo test --manifest-path crates/watchdog-marmot/Cargo.toml --offline --test fixture_exchange -- --test-threads=1 --skip whitenoise_relays
 ```
 
-Results on this handoff: `marmot_recovery` 15 passed. Helper lib tests passed, including torn-tail recovery, a read-only log that did not keep an unpersisted record, and 1,500 historical operations. `fixture_exchange` passed in 33.48 seconds with the public-relay test skipped. `whitenoise_relays_deliver_one_alert` then passed in 13.00 seconds against `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat` using generated identities. The phone procedure is `docs/acceptance.md`. It is not passed until the owner sees the notification.
+Results on this handoff, after the checkpoint reorder and the SOCKS filter:
+
+- `marmot_recovery`: 16 passed, including delayed upstream visibility, ambiguous completion, and re-onboard identity mismatch.
+- `group_auth`: 2 passed, including a later roster that removes the recipient.
+- Helper lib: 23 passed. That includes the checkpoint-update regressions, process exits at `after_wal`, `after_record`, and `checkpoint`, torn-tail repair, the read-only log, the egress filter, the operation fixtures, and 1,500 historical operations (20,018 ms, log 42,120 bytes, reopen 83 ms).
+- `fixture_exchange`: 2 passed in 37.64 seconds. The public-relay test was skipped in that run.
+- `whitenoise_relays_deliver_one_alert`: passed in 12.73 seconds against `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat` with generated identities. Those dials went through the helper filter.
+- Release binaries: `target/release/nostr-watchdog` and `crates/watchdog-marmot/target/release/watchdog-marmot`.
+- `scripts/whitenoise-acceptance.sh` on `127.0.0.1:62069` with a fresh directory and a generated recipient that has no key package: prepare, start, init, a second init, conversation, status (`intending`, account prefix `bf47a45c9619`), restart, status, and stop all completed. Both inits returned `no_eligible_member`. No alert was sent. The state directory was removed afterward.
+
+## Owner commands for a phone notification
+
+Build once, from this branch:
+
+```bash
+export ODIN="$HOME/.local/odin-dev-2026-10/odin"
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_INCREMENTAL=false
+cargo build --manifest-path crates/watchdog-marmot/Cargo.toml --release
+cargo build --release -p watchdog-native
+```
+
+Use a test phone's public key. If `127.0.0.1:8791` is already taken, set `WATCHDOG_ACCEPTANCE_ADDR` to another loopback port before every command. Do not use a production sender or the operator's daily WhiteNoise account.
+
+```bash
+scripts/whitenoise-acceptance.sh prepare <test phone hex or npub>
+scripts/whitenoise-acceptance.sh start
+scripts/whitenoise-acceptance.sh init
+scripts/whitenoise-acceptance.sh conversation
+scripts/whitenoise-acceptance.sh status
+```
+
+Continue only when status shows a group and `active_recipient_tokens` greater than 0. Then, with the phone unlocked:
+
+```bash
+scripts/whitenoise-acceptance.sh alert-foreground
+```
+
+Restart, lock the phone, and confirm the locked-screen alert. `alert-locked` reads from the terminal and sends only when the typed line is `send`:
+
+```bash
+scripts/whitenoise-acceptance.sh restart
+scripts/whitenoise-acceptance.sh alert-locked
+scripts/whitenoise-acceptance.sh stop
+```
+
+A physical notification is unverified until the phone owner sees it. Relay acceptance is not that observation.
+
+## Gates
+
+| Gate | Result |
+| --- | --- |
+| Journal checkpoint order and update regressions | verified |
+| Fail-closed ambiguous admission, including re-onboard and delayed visibility | verified |
+| Relay dial filter for private, loopback, link-local, and metadata targets | verified |
+| Atomic membership with kind-9 send | partial. The pre-send roster check remains, and the race after it is documented above. |
+| Nested operation contract and fixtures | verified on this branch. Agent C's parser at `84b2640` still reads the flat counters and has not been changed here. |
+| Locked builds, recovery tests, fixture exchange, public WhiteNoise exchange | verified |
+| Acceptance script prepare, start, onboard, status, restart, stop | verified |
+| Acceptance-script alert to a phone, and a locked-screen notification | untested. The generated recipient had no key package, so no alert was sent. |
+
+Handoff commit: the tip of `feat/rust-marmot-native` after this file is committed.

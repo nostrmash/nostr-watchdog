@@ -3,8 +3,12 @@
 //! Each operation id has one durable file. `operations.log` is a write-ahead
 //! log of updates since the last checkpoint. A torn final line is truncated
 //! back to the last complete record before another append is allowed.
-//! Checkpointing replaces that log with an empty file once the per-id files
-//! are durable. It does not rewrite every historical id into the log.
+//!
+//! A commit appends and syncs the log, atomically replaces the per-id file,
+//! and only then updates the in-memory map. Checkpointing runs against that
+//! updated map and clears the log only after those files match it. A checkpoint
+//! error leaves the durable record in place. It is not evidence the operation
+//! was never written.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -92,38 +96,57 @@ impl Journal {
         self.commit(id, &value)
     }
 
-    /// Memory changes only after the write-ahead line and the per-id file are durable.
-    /// A failed write reloads disk, or refuses every later mutation if reload fails.
+    /// Durable order: WAL, per-id file, memory, then checkpoint.
+    /// A failed write reloads disk. Reload failure refuses every later mutation.
+    /// A checkpoint failure after a durable file is not treated as a missing operation.
     fn commit(&mut self, id: &str, value: &Value) -> Result<(), String> {
         if self.poisoned {
             return Err("boundary_durable_failure".to_string());
         }
-        if let Err(error) = self.persist(id, value) {
-            match Self::open(&self.root) {
-                Ok(fresh) => {
-                    self.records = fresh.records;
-                    self.wal_lines = fresh.wal_lines;
-                }
-                Err(_) => self.poisoned = true,
-            }
+        if let Err(error) = append_log(&self.root, &json!({"operation_id": id, "record": value})) {
+            self.reload_after_failure();
+            return Err(error);
+        }
+        self.wal_lines = self.wal_lines.saturating_add(1);
+        if let Err(error) = durability_point("after_wal") {
+            self.reload_after_failure();
+            return Err(error);
+        }
+        if let Err(error) = atomic_json(&self.root.join(format!("{id}.json")), value) {
+            self.reload_after_failure();
+            return Err(error);
+        }
+        if let Err(error) = durability_point("after_record") {
+            self.reload_after_failure();
             return Err(error);
         }
         self.records.insert(id.to_string(), value.clone());
-        Ok(())
-    }
-
-    fn persist(&mut self, id: &str, value: &Value) -> Result<(), String> {
-        append_log(&self.root, &json!({"operation_id": id, "record": value}))?;
-        self.wal_lines = self.wal_lines.saturating_add(1);
-        atomic_json(&self.root.join(format!("{id}.json")), value)?;
         let log = self.root.join(LOG_NAME);
         let length = fs::metadata(&log)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         if self.should_checkpoint(length) {
-            self.checkpoint()?;
+            if let Err(error) = self.checkpoint() {
+                let expected = value.clone();
+                self.reload_after_failure();
+                if !self.poisoned && self.records.get(id) != Some(&expected) {
+                    self.poisoned = true;
+                }
+                return Err(error);
+            }
         }
         Ok(())
+    }
+
+    fn reload_after_failure(&mut self) {
+        match Self::open(&self.root) {
+            Ok(fresh) => {
+                self.records = fresh.records;
+                self.wal_lines = fresh.wal_lines;
+                self.poisoned = false;
+            }
+            Err(_) => self.poisoned = true,
+        }
     }
 
     fn should_checkpoint(&self, wal_len: u64) -> bool {
@@ -132,13 +155,28 @@ impl Journal {
                 && self.wal_lines > (self.records.len() as u64).saturating_mul(2))
     }
 
-    /// Drops superseded log lines. Per-id files already hold the latest record.
+    /// Drops superseded log lines after the in-memory map has been updated.
+    /// The WAL is replaced only once those per-id files match that map.
     fn checkpoint(&mut self) -> Result<(), String> {
         materialize_files(&self.root, &self.records)?;
         replace_wal_empty(&self.root)?;
         self.wal_lines = 0;
         Ok(())
     }
+}
+
+fn durability_point(name: &str) -> Result<(), String> {
+    if std::env::var("WATCHDOG_MARMOT_CRASH_AT").ok().as_deref() != Some(name) {
+        return Ok(());
+    }
+    if std::env::var("WATCHDOG_MARMOT_CRASH_EXIT").ok().as_deref() == Some("1") {
+        eprintln!("watchdog-marmot stopped at {name}");
+        std::process::exit(75);
+    }
+    if std::env::var("WATCHDOG_JOURNAL_FAIL").ok().as_deref() == Some("1") {
+        return Err(format!("boundary_injected:{name}"));
+    }
+    Ok(())
 }
 
 pub fn atomic_json(path: &Path, value: &Value) -> Result<(), String> {
@@ -212,12 +250,7 @@ fn replace_wal_empty(root: &Path) -> Result<(), String> {
         file.sync_all()
             .map_err(|error| format!("boundary_write: {error}"))?;
     }
-    if std::env::var("WATCHDOG_MARMOT_CRASH_AT").ok().as_deref() == Some("checkpoint")
-        && std::env::var("WATCHDOG_MARMOT_CRASH_EXIT").ok().as_deref() == Some("1")
-    {
-        eprintln!("watchdog-marmot stopped at checkpoint");
-        std::process::exit(75);
-    }
+    durability_point("checkpoint")?;
     let path = root.join(LOG_NAME);
     fs::rename(&tmp, &path).map_err(|error| format!("boundary_write: {error}"))?;
     sync_dir(root)?;
@@ -647,6 +680,155 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn pending_becomes_published_when_checkpoint_runs() {
+        let root = fresh_root("publish-checkpoint");
+        let mut journal = Journal::open(&root).unwrap();
+        write_prior(&mut journal, "accepted_pending");
+        journal
+            .record("op_update", &crossing("published", json!(["m-admitted"])))
+            .unwrap();
+        let log = fs::read(root.join(LOG_NAME)).unwrap();
+        assert!(
+            log.len() < 4_096,
+            "checkpoint left the superseded pending line in the log"
+        );
+        drop(journal);
+        let reopened = Journal::open(&root).unwrap();
+        assert_published(&reopened);
+        assert!(!reopened.poisoned());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn released_becomes_submitting_across_the_checkpoint() {
+        let root = fresh_root("release-checkpoint");
+        let mut journal = Journal::open(&root).unwrap();
+        write_prior(&mut journal, "submitting");
+        journal.release("op_update").unwrap();
+        journal
+            .record("op_update", &crossing("submitting", json!([])))
+            .unwrap();
+        drop(journal);
+        let reopened = Journal::open(&root).unwrap();
+        let saved = reopened.get("op_update").unwrap();
+        assert_eq!(saved["disposition"], json!("submitting"));
+        assert_eq!(saved["recipient"], json!("cc"));
+        assert_eq!(saved["payload_sha256"], json!("same"));
+        assert_ne!(saved["disposition"], json!("released"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn finish_if_boundary_child() -> bool {
+        if std::env::var_os("WATCHDOG_JOURNAL_BOUNDARY_CHILD").is_some() {
+            super::boundary_child();
+            true
+        } else {
+            false
+        }
+    }
+
+    #[test]
+    fn failure_after_wal_append_keeps_the_updated_operation() {
+        if finish_if_boundary_child() {
+            return;
+        }
+        let root = spawn_boundary(
+            "failure_after_wal_append_keeps_the_updated_operation",
+            "after_wal",
+            false,
+        );
+        let journal = Journal::open(&root).unwrap();
+        assert_published(&journal);
+        assert!(!journal.poisoned());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failure_after_record_replacement_keeps_the_updated_operation() {
+        if finish_if_boundary_child() {
+            return;
+        }
+        let root = spawn_boundary(
+            "failure_after_record_replacement_keeps_the_updated_operation",
+            "after_record",
+            false,
+        );
+        let journal = Journal::open(&root).unwrap();
+        assert_published(&journal);
+        let log = fs::read(root.join(LOG_NAME)).unwrap();
+        assert!(
+            log.windows(10).any(|window| window == b"m-admitted"),
+            "the WAL was cleared before the failure point"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failure_before_wal_truncation_keeps_the_updated_operation() {
+        if finish_if_boundary_child() {
+            return;
+        }
+        let root = spawn_boundary(
+            "failure_before_wal_truncation_keeps_the_updated_operation",
+            "checkpoint",
+            false,
+        );
+        let journal = Journal::open(&root).unwrap();
+        assert_published(&journal);
+        let log = fs::read(root.join(LOG_NAME)).unwrap();
+        assert!(
+            log.windows(10).any(|window| window == b"m-admitted"),
+            "the WAL was truncated even though the checkpoint did not finish"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn process_stop_after_wal_append_keeps_the_updated_operation() {
+        if finish_if_boundary_child() {
+            return;
+        }
+        let root = spawn_boundary(
+            "process_stop_after_wal_append_keeps_the_updated_operation",
+            "after_wal",
+            true,
+        );
+        let journal = Journal::open(&root).unwrap();
+        assert_published(&journal);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn process_stop_after_record_replacement_keeps_the_updated_operation() {
+        if finish_if_boundary_child() {
+            return;
+        }
+        let root = spawn_boundary(
+            "process_stop_after_record_replacement_keeps_the_updated_operation",
+            "after_record",
+            true,
+        );
+        let journal = Journal::open(&root).unwrap();
+        assert_published(&journal);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn process_stop_during_checkpoint_keeps_the_updated_operation() {
+        if finish_if_boundary_child() {
+            return;
+        }
+        let root = spawn_boundary(
+            "process_stop_during_checkpoint_keeps_the_updated_operation",
+            "checkpoint",
+            true,
+        );
+        let journal = Journal::open(&root).unwrap();
+        assert_published(&journal);
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]
@@ -672,6 +854,122 @@ fn torn_child() {
     file.sync_all().unwrap();
     fs::write(root.join("torn"), b"1").unwrap();
     std::thread::sleep(std::time::Duration::from_secs(30));
+}
+
+#[cfg(test)]
+fn fresh_root(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "watchdog-journal-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = fs::remove_dir_all(&root);
+    root
+}
+
+#[cfg(test)]
+fn write_prior(journal: &mut Journal, disposition: &str) {
+    journal
+        .record(
+            "op_update",
+            &json!({
+                "operation_id": "op_update",
+                "disposition": disposition,
+                "recipient": "cc",
+                "payload_sha256": "same",
+                "message_ids": []
+            }),
+        )
+        .unwrap();
+}
+
+#[cfg(test)]
+fn crossing(disposition: &str, message_ids: Value) -> Value {
+    json!({
+        "operation_id": "op_update",
+        "disposition": disposition,
+        "recipient": "cc",
+        "payload_sha256": "same",
+        "message_ids": message_ids,
+        "note": "n".repeat((CHECKPOINT_AT as usize) + 128)
+    })
+}
+
+#[cfg(test)]
+fn assert_published(journal: &Journal) {
+    let saved = journal.get("op_update").expect("updated operation missing");
+    assert_eq!(saved["disposition"], json!("published"));
+    assert_eq!(saved["message_ids"][0], json!("m-admitted"));
+    assert_eq!(saved["payload_sha256"], json!("same"));
+    assert_ne!(
+        saved["disposition"],
+        json!("accepted_pending"),
+        "checkpoint restored the previous state"
+    );
+}
+
+#[cfg(test)]
+fn spawn_boundary(test_name: &str, point: &str, exit_process: bool) -> PathBuf {
+    let root = fresh_root(point);
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .arg(test_name)
+        .env("WATCHDOG_JOURNAL_BOUNDARY_CHILD", "1")
+        .env("WATCHDOG_JOURNAL_ROOT", &root)
+        .env("WATCHDOG_MARMOT_CRASH_AT", point)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if exit_process {
+        command.env("WATCHDOG_MARMOT_CRASH_EXIT", "1");
+    } else {
+        command.env("WATCHDOG_JOURNAL_FAIL", "1");
+    }
+    let child = command.spawn().unwrap();
+    let output = child.wait_with_output().unwrap();
+    if exit_process {
+        assert_eq!(
+            output.status.code(),
+            Some(75),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    } else {
+        assert!(
+            output.status.success(),
+            "injected failure child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    root
+}
+
+#[cfg(test)]
+fn boundary_child() {
+    let root = PathBuf::from(std::env::var("WATCHDOG_JOURNAL_ROOT").unwrap());
+    let point = std::env::var("WATCHDOG_MARMOT_CRASH_AT").unwrap();
+    // The prior record has to land. The injected failure applies to the update.
+    unsafe {
+        std::env::remove_var("WATCHDOG_MARMOT_CRASH_AT");
+    }
+    let mut journal = Journal::open(&root).unwrap();
+    write_prior(&mut journal, "accepted_pending");
+    unsafe {
+        std::env::set_var("WATCHDOG_MARMOT_CRASH_AT", &point);
+    }
+    let updated = crossing("published", json!(["m-admitted"]));
+    let result = journal.record("op_update", &updated);
+    if std::env::var("WATCHDOG_JOURNAL_FAIL").ok().as_deref() == Some("1") {
+        let error = result.expect_err("the injected failure did not fail the commit");
+        assert!(error.starts_with("boundary_injected:"));
+        assert_published(&journal);
+        assert!(!journal.poisoned());
+        return;
+    }
+    result.expect("boundary child commit");
 }
 
 #[cfg(test)]
