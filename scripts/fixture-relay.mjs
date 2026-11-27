@@ -11,6 +11,12 @@ const events = new Map();
 const clients = new Set();
 const rejectKinds = new Set();
 let seq = 0;
+let connection = 0;
+const trace = [];
+function remember(entry) {
+  if (trace.length === 512) trace.shift();
+  trace.push(entry);
+}
 
 function address(event) {
   const d = (event.tags || []).find((tag) => tag[0] === "d");
@@ -86,6 +92,7 @@ function broadcast(stored) {
   for (const client of clients) {
     for (const [sub, filters] of client.subs) {
       if (matching(filters, event)) {
+        remember({ type: "live", connection: client.id, kind: event.kind, seq: stored.seq });
         client.send(JSON.stringify(["EVENT", sub, event]));
       }
     }
@@ -110,6 +117,7 @@ function acceptEvent(event) {
   seq += 1;
   const stored = { seq, event };
   events.set(event.id, stored);
+  remember({ type: "publish", kind: event.kind, seq, createdAt: event.created_at });
   broadcast(stored);
   return { ok: true, message: "" };
 }
@@ -136,6 +144,8 @@ function encodeFrame(opcode, payload) {
 class Client {
   constructor(socket) {
     this.socket = socket;
+    this.id = ++connection;
+    remember({ type: "connect", connection: this.id });
     this.buffer = Buffer.alloc(0);
     this.subs = new Map();
     this.fragments = [];
@@ -237,11 +247,24 @@ class Client {
       const sub = rest[0];
       const filters = rest.slice(1).filter((item) => item && typeof item === "object");
       this.subs.set(sub, filters);
-      for (const stored of backlog(filters)) {
+      const storedEvents = backlog(filters);
+      remember({
+        type: "eose",
+        connection: this.id,
+        filters: filters.map(({ kinds, since, until, limit, ...rest }) => ({
+          kinds, since, until, limit,
+          selectors: Object.keys(rest).sort(),
+        })),
+        replay: storedEvents.map(({ seq, event }) => [seq, event.kind]),
+      });
+      for (const stored of storedEvents) {
         this.send(JSON.stringify(["EVENT", sub, stored.event]));
       }
       this.send(JSON.stringify(["EOSE", sub]));
       return;
+    }
+    if (type === "NEG-OPEN") {
+      remember({ type: "negentropy-open", connection: this.id });
     }
     if (type === "CLOSE" && typeof rest[0] === "string") {
       this.subs.delete(rest[0]);
@@ -298,6 +321,11 @@ const server = createServer(async (request, response) => {
     }
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify({ counts, giftWraps }));
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/trace") {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify(trace));
     return;
   }
   if (request.method === "GET" && url.pathname === "/order") {

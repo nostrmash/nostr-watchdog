@@ -51,6 +51,24 @@ struct Relay {
 
 impl Drop for Relay {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            if let Ok(trace) = Command::new("curl")
+                .args([
+                    "-fsS",
+                    "--max-time",
+                    "3",
+                    &format!("{}/trace", http_base(&self.url)),
+                ])
+                .output()
+            {
+                if trace.status.success() {
+                    eprintln!(
+                        "fixture relay trace: {}",
+                        String::from_utf8_lossy(&trace.stdout)
+                    );
+                }
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -86,6 +104,40 @@ fn isolated_recipient_config(relay: &str) -> MarmotAppConfig {
         .with_deployment(deployment)
         .with_directory_relay_urls(vec![relay.to_string()])
         .with_allow_loopback_relay_endpoints(true)
+}
+
+fn sync_error_kind(error: &marmot_app::AppError) -> &'static str {
+    use marmot_app::AppError;
+    match error {
+        AppError::AccountCatchUp(error) => {
+            let message = error.to_string();
+            [
+                "full_history_coverage_unproven",
+                "backfill_drain_eose_timeout",
+                "backfill_drain_no_relay_eose",
+                "account_delivery_queue_overflow",
+            ]
+            .into_iter()
+            .find(|code| message.contains(code))
+            .unwrap_or("account_catch_up_failed")
+        }
+        AppError::UnknownGroup(_) => "unknown_group",
+        AppError::GroupCatchingUp(_) => "group_catching_up",
+        AppError::Transport(_) => "transport",
+        AppError::Storage(_) | AppError::Sqlite(_) => "storage",
+        AppError::Session(_) => "session",
+        _ => "app_error",
+    }
+}
+
+async fn sync_recipient(runtime: &marmot_app::MarmotAppRuntime) {
+    match runtime.catch_up_accounts_reporting().await {
+        Ok(summary) if summary.accounts_considered == 0 => {
+            eprintln!("recipient catch-up considered no account workers");
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("recipient catch-up: {}", sync_error_kind(&error)),
+    }
 }
 
 fn endpoints(url: &str) -> Vec<cgka_traits::TransportEndpoint> {
@@ -185,7 +237,7 @@ async fn exchange() {
             }
             Err(error) if error == "conversation_index_not_ready" => {
                 let _ = session.sync().await;
-                let _ = runtime.catch_up_accounts().await;
+                sync_recipient(&runtime).await;
                 tokio::time::sleep(Duration::from_millis(400)).await;
             }
             Err(error) => panic!("group: {error}"),
@@ -205,13 +257,13 @@ async fn exchange() {
     let mut welcomed = false;
     let mut last_welcome = String::from("no_attempt");
     for _ in 0..20 {
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         match runtime.group_members(&recipient_hex, &group_id).await {
             Ok(_) => {
                 welcomed = true;
                 break;
             }
-            Err(error) => last_welcome = error.to_string(),
+            Err(error) => last_welcome = sync_error_kind(&error).to_string(),
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -235,7 +287,7 @@ async fn exchange() {
         .expect("push registration");
     let mut tokens_ready = false;
     for _ in 0..40 {
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         let _ = session.sync().await;
         let ready = session
             .readiness(&account, &recipient_hex, &group)
@@ -305,7 +357,7 @@ async fn exchange() {
 
     let mut decrypted = false;
     for _ in 0..15 {
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         let rows = runtime
             .messages_with_query(
                 &recipient_hex,
@@ -446,7 +498,7 @@ async fn exchange() {
         if share.succeeded_groups > 0 && share.pending_groups == 0 && share.failed_groups == 0 {
             break;
         }
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
         share = runtime
             .share_push_registration(&recipient_hex)
@@ -972,7 +1024,7 @@ async fn wait_for_fingerprint(
             let _ = session.repair_history(account).await;
         }
         let _ = session.sync().await;
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(runtime).await;
         match session
             .sees_recipient_token(account, group_hex, recipient, expected)
             .await
@@ -1021,7 +1073,7 @@ async fn wait_until_tokens(
 ) {
     for _ in 0..40 {
         let _ = session.sync().await;
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(runtime).await;
         let ready = session
             .readiness(account, recipient, group)
             .await
@@ -1041,7 +1093,7 @@ async fn wait_plaintext(
     text: &str,
 ) -> bool {
     for _ in 0..20 {
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(runtime).await;
         let rows = runtime
             .messages_with_query(
                 recipient,
@@ -1172,7 +1224,7 @@ async fn public_import() {
             }
             Err(error) if error == "conversation_index_not_ready" => {
                 let _ = session.sync().await;
-                let _ = runtime.catch_up_accounts().await;
+                sync_recipient(&runtime).await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Err(error) => panic!("group: {error}"),
@@ -1183,13 +1235,13 @@ async fn public_import() {
     let mut welcomed = false;
     let mut last_welcome = String::from("no_attempt");
     for _ in 0..20 {
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         match runtime.group_members(&recipient_hex, &group_id).await {
             Ok(_) => {
                 welcomed = true;
                 break;
             }
-            Err(error) => last_welcome = error.to_string(),
+            Err(error) => last_welcome = sync_error_kind(&error).to_string(),
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -1207,7 +1259,7 @@ async fn public_import() {
         .expect("public send");
     let mut decrypted = false;
     for _ in 0..20 {
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         let rows = runtime
             .messages_with_query(
                 &recipient_hex,
@@ -1285,7 +1337,7 @@ async fn acceptance_script_exchange() {
     let group = onboarding["group"].as_str().expect("test conversation");
     let group_id = GroupId::new(hex::decode(group).unwrap());
     for _ in 0..20 {
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         if runtime
             .group_members(&recipient_hex, &group_id)
             .await
@@ -1311,7 +1363,7 @@ async fn acceptance_script_exchange() {
         .unwrap();
     let mut ready = false;
     for _ in 0..75 {
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         let status = fixture.run(&["status"]);
         let readiness: Value = serde_json::from_str(status.lines().last().unwrap()).unwrap();
         if readiness["active_recipient_tokens"]
@@ -1481,7 +1533,7 @@ async fn executable_exchange() {
             }
         }
         let _ = helper_ipc(&socket, serde_json::json!({"op": "sync"}));
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
     assert_eq!(
@@ -1511,7 +1563,7 @@ async fn executable_exchange() {
     let group_id = GroupId::new(hex::decode(&group).expect("group hex"));
     let mut welcomed = false;
     for _ in 0..20 {
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         if runtime
             .group_members(&recipient_hex, &group_id)
             .await
@@ -1542,7 +1594,7 @@ async fn executable_exchange() {
         .expect("push registration");
     let mut ready = false;
     for _ in 0..40 {
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         let _ = helper_ipc(&socket, serde_json::json!({"op": "sync"}));
         let status = helper_ipc(
             &socket,
@@ -1701,7 +1753,7 @@ async fn executable_exchange() {
     wait_outbox_settled(&db, &alert).await;
     let mut reconciled = false;
     for _ in 0..40 {
-        let _ = runtime.catch_up_accounts().await;
+        sync_recipient(&runtime).await;
         let count = plaintext_count(&runtime, &recipient_hex, &group, &text).await;
         let same = journal_ids(&root, &alert) == ids;
         if count == 1 && same {
@@ -2189,7 +2241,10 @@ async fn receive_packaged_alert(
     let repair = runtime.repair_full_history(recipient).await;
     let received = wait_plaintext(runtime, recipient, group, text).await;
     if !received {
-        eprintln!("recipient history repair result: {repair:?}");
+        match repair {
+            Ok(()) => eprintln!("recipient history repair completed"),
+            Err(error) => eprintln!("recipient history repair: {}", sync_error_kind(&error)),
+        }
     }
     received
 }
@@ -2738,7 +2793,7 @@ async fn plaintext_count(
     group: &str,
     text: &str,
 ) -> usize {
-    let _ = runtime.catch_up_accounts().await;
+    sync_recipient(runtime).await;
     runtime
         .messages_with_query(
             recipient,
