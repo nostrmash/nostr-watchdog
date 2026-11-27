@@ -9,13 +9,22 @@
 //! fixture. It does not allow RFC1918, link-local, or metadata addresses.
 
 use std::io::{self, ErrorKind};
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 use watchdog_core::url_policy::is_blocked_address;
+
+const MAX_CONNECTIONS: usize = 64;
+const MAX_DNS_LOOKUPS: usize = 16;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 static INSTALLED: Mutex<Option<SocketAddr>> = Mutex::new(None);
 
@@ -54,84 +63,99 @@ fn serve_forever(listener: std::net::TcpListener, allow_loopback: bool) {
         .build()
         .expect("egress runtime");
     runtime.block_on(async move {
-        let listener = match TcpListener::from_std(listener) {
-            Ok(listener) => listener,
-            Err(_) => return,
-        };
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    tokio::spawn(async move {
-                        let _ = handle(stream, allow_loopback).await;
-                    });
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
+        if let Ok(listener) = TcpListener::from_std(listener) {
+            serve(listener, allow_loopback, MAX_CONNECTIONS, HANDSHAKE_TIMEOUT).await;
         }
     });
 }
 
-async fn handle(mut client: TcpStream, allow_loopback: bool) -> io::Result<()> {
-    let handshake = async {
-        let mut header = [0u8; 2];
-        client.read_exact(&mut header).await?;
-        if header[0] != 5 {
-            return Err(io::Error::new(ErrorKind::InvalidData, "socks version"));
-        }
-        let mut methods = vec![0u8; header[1] as usize];
-        if !methods.is_empty() {
-            client.read_exact(&mut methods).await?;
-        }
-        if !methods.contains(&0) {
-            client.write_all(&[5, 0xff]).await?;
-            return Err(io::Error::new(ErrorKind::PermissionDenied, "socks auth"));
-        }
-        client.write_all(&[5, 0]).await?;
-        let mut request = [0u8; 4];
-        client.read_exact(&mut request).await?;
-        if request[0] != 5 || request[1] != 1 {
-            reject(&mut client, 7).await?;
-            return Err(io::Error::new(ErrorKind::InvalidData, "socks command"));
-        }
-        let target = match read_target(&mut client, request[3]).await {
-            Ok(target) => target,
-            Err(_) => {
-                reject(&mut client, 8).await?;
-                return Err(io::Error::new(ErrorKind::InvalidData, "socks address"));
-            }
-        };
-        let addresses = match resolve_target(&target, allow_loopback).await {
-            Ok(addresses) => addresses,
-            Err(code) => {
-                reject(&mut client, code).await?;
-                return Err(io::Error::new(ErrorKind::PermissionDenied, "socks policy"));
-            }
-        };
-        let mut upstream = None;
-        for address in addresses.into_iter().take(4) {
-            if let Ok(stream) =
-                tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address)).await
-            {
-                if let Ok(stream) = stream {
-                    upstream = Some(stream);
-                    break;
+async fn serve(
+    listener: TcpListener,
+    allow_loopback: bool,
+    max_connections: usize,
+    handshake_timeout: Duration,
+) {
+    let dns_slots = Arc::new(Semaphore::new(MAX_DNS_LOOKUPS));
+    let mut sessions = JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = sessions.join_next(), if !sessions.is_empty() => {}
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) if sessions.len() < max_connections => {
+                    let dns_slots = dns_slots.clone();
+                    sessions.spawn(async move {
+                        let _ = handle(stream, allow_loopback, dns_slots, handshake_timeout).await;
+                    });
                 }
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
             }
         }
-        let Some(mut upstream) = upstream else {
-            reject(&mut client, 5).await?;
-            return Err(io::Error::new(
-                ErrorKind::ConnectionRefused,
-                "socks connect",
-            ));
-        };
-        client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
-        Ok(())
+    }
+}
+
+async fn handle(
+    mut client: TcpStream,
+    allow_loopback: bool,
+    dns_slots: Arc<Semaphore>,
+    handshake_timeout: Duration,
+) -> io::Result<()> {
+    let target = timeout(handshake_timeout, handshake(&mut client)).await??;
+    let addresses = match resolve_target(&target, allow_loopback, dns_slots).await {
+        Ok(addresses) => addresses,
+        Err(code) => {
+            timeout(handshake_timeout, reject(&mut client, code)).await??;
+            return Err(io::Error::new(ErrorKind::PermissionDenied, "socks policy"));
+        }
     };
-    match tokio::time::timeout(Duration::from_secs(20), handshake).await {
-        Ok(result) => result,
-        Err(_) => Ok(()),
+    let mut upstream =
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(addresses.as_slice())).await {
+            Ok(Ok(stream)) => stream,
+            _ => {
+                timeout(handshake_timeout, reject(&mut client, 5)).await??;
+                return Err(io::Error::new(
+                    ErrorKind::ConnectionRefused,
+                    "socks connect",
+                ));
+            }
+        };
+    timeout(
+        handshake_timeout,
+        client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]),
+    )
+    .await??;
+    // Established relays use protocol keepalives and stay open until either peer closes.
+    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    Ok(())
+}
+
+async fn handshake(client: &mut TcpStream) -> io::Result<Target> {
+    let mut header = [0u8; 2];
+    client.read_exact(&mut header).await?;
+    if header[0] != 5 {
+        return Err(io::Error::new(ErrorKind::InvalidData, "socks version"));
+    }
+    let mut methods = [0u8; 255];
+    let methods = &mut methods[..header[1] as usize];
+    client.read_exact(methods).await?;
+    if !methods.contains(&0) {
+        client.write_all(&[5, 0xff]).await?;
+        return Err(io::Error::new(ErrorKind::PermissionDenied, "socks auth"));
+    }
+    client.write_all(&[5, 0]).await?;
+    let mut request = [0u8; 4];
+    client.read_exact(&mut request).await?;
+    if request[0] != 5 || request[1] != 1 || request[2] != 0 {
+        reject(client, 7).await?;
+        return Err(io::Error::new(ErrorKind::InvalidData, "socks command"));
+    }
+    match read_target(client, request[3]).await {
+        Ok(target) => Ok(target),
+        Err(error) => {
+            reject(client, 8).await?;
+            Err(error)
+        }
     }
 }
 
@@ -181,7 +205,11 @@ enum Target {
     Name(String, u16),
 }
 
-async fn resolve_target(target: &Target, allow_loopback: bool) -> Result<Vec<SocketAddr>, u8> {
+async fn resolve_target(
+    target: &Target,
+    allow_loopback: bool,
+    dns_slots: Arc<Semaphore>,
+) -> Result<Vec<SocketAddr>, u8> {
     match target {
         Target::Ip(address, port) => {
             if !address_allowed(*address, allow_loopback) {
@@ -199,20 +227,28 @@ async fn resolve_target(target: &Target, allow_loopback: bool) -> Result<Vec<Soc
                 }
                 return Ok(vec![SocketAddr::new(address, *port)]);
             }
-            let looked = tokio::time::timeout(
-                Duration::from_secs(5),
-                tokio::net::lookup_host((host.as_str(), *port)),
-            )
-            .await
-            .map_err(|_| 4u8)?
-            .map_err(|_| 4u8)?;
-            let addresses: Vec<IpAddr> = looked.map(|address| address.ip()).collect();
-            if addresses.is_empty() || !destinations_allowed(host, &addresses, allow_loopback) {
+            let slot = dns_slots.try_acquire_owned().map_err(|_| 4u8)?;
+            let host_to_resolve = host.clone();
+            let port = *port;
+            let lookup = tokio::task::spawn_blocking(move || {
+                // Keep the permit while the OS resolver is running, even after a timeout.
+                let _slot = slot;
+                (host_to_resolve.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.map(|address| address.ip()).collect::<Vec<_>>())
+            });
+            let addresses = timeout(DNS_TIMEOUT, lookup)
+                .await
+                .map_err(|_| 4u8)?
+                .map_err(|_| 4u8)?
+                .map_err(|_| 4u8)?;
+            if !destinations_allowed(host, &addresses, allow_loopback) {
                 return Err(2);
             }
             Ok(addresses
                 .into_iter()
-                .map(|address| SocketAddr::new(address, *port))
+                .take(4)
+                .map(|address| SocketAddr::new(address, port))
                 .collect())
         }
     }
@@ -332,6 +368,68 @@ mod tests {
         assert_eq!(link, 2);
     }
 
+    #[tokio::test]
+    async fn session_survives_handshake_deadline_and_shutdown_closes_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let handshake_timeout = Duration::from_millis(200);
+        let task = tokio::spawn(serve(listener, true, 2, handshake_timeout));
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let (mut stream, _) = echo.accept().await.unwrap();
+            let mut buf = [0; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            stream.write_all(&buf).await.unwrap();
+            stream.read(&mut buf).await.unwrap()
+        });
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        socks_connect(&mut client, "127.0.0.1", echo_addr.port())
+            .await
+            .unwrap();
+        tokio::time::sleep(handshake_timeout + Duration::from_millis(25)).await;
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0; 4];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        let mut stalled = TcpStream::connect(proxy).await.unwrap();
+        stalled.write_all(&[5, 1, 0]).await.unwrap();
+        stalled.read_exact(&mut buf[..2]).await.unwrap();
+        let mut excess = TcpStream::connect(proxy).await.unwrap();
+        assert_eq!(
+            timeout(handshake_timeout, excess.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(1), stalled.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            timeout(Duration::from_secs(1), client.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(1), echo_task)
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
     async fn connect_ready(addr: SocketAddr) -> TcpStream {
         for _ in 0..50 {
             if let Ok(stream) = TcpStream::connect(addr).await {
@@ -362,10 +460,6 @@ mod tests {
         stream.write_all(&request).await.unwrap();
         let mut reply = [0u8; 10];
         stream.read_exact(&mut reply).await.unwrap();
-        if reply[1] == 0 {
-            Ok(())
-        } else {
-            Err(reply[1])
-        }
+        if reply[1] == 0 { Ok(()) } else { Err(reply[1]) }
     }
 }
